@@ -1185,7 +1185,7 @@ pub const MAX_GUARDED_ROOT_SET_CERTIFICATES: usize = 32;
 ///
 /// CUSTODY IS NOT WIDENED BY THIS SEAM, and that is why it can be public.
 /// Answers returned here are not trusted: every address is fenced downstream
-/// by `guarded_select_address`, which canonicalizes it, rejects an empty set,
+/// by `guarded_admit_addresses`, which canonicalizes it, rejects an empty set,
 /// rejects more than `MAX_GUARDED_RESOLVED_ADDRESSES`, and requires
 /// `is_public_guarded_ip`. TLS then verifies the certificate against the
 /// ORIGINAL request host, not against whatever address was returned. A
@@ -1641,7 +1641,7 @@ pub enum GuardedHttpFetchError {
     Cancelled,
     /// The finite fetch deadline elapsed.
     DeadlineExceeded,
-    /// TCP connection to the selected address failed.
+    /// TCP connection failed for every admitted address attempted in the budget.
     Connect(String),
     /// TLS authentication or handshake failed.
     Tls(String),
@@ -1795,7 +1795,7 @@ impl GuardedHttpFetcher {
     /// Build a fetcher that resolves through a caller-supplied resolver.
     ///
     /// SHIPPED PUBLIC SEAM (bd-ho7of). Every other guarantee is unchanged: the
-    /// supplied resolver's answers are fenced by `guarded_select_address`
+    /// supplied resolver's answers are fenced by `guarded_admit_addresses`
     /// exactly as the native resolver's are, so a resolver cannot reach a
     /// private or loopback peer, cannot exceed
     /// `MAX_GUARDED_RESOLVED_ADDRESSES`, and cannot return an empty set that
@@ -1867,10 +1867,12 @@ impl GuardedHttpFetcher {
 
     /// Fetch one HTTPS resource over a fresh connection.
     ///
-    /// The resolver's complete answer set is admitted before `TcpStream::connect`
-    /// receives exactly one selected `SocketAddr`. TLS uses the original DNS host
-    /// for SNI and certificate validation. Redirects, cookies, credentials,
-    /// proxies, and connection reuse are deliberately absent.
+    /// The resolver's complete answer set is admitted before any TCP connection.
+    /// Admitted addresses are tried in deterministic order within the original
+    /// fetch deadline, stopping at the first TCP success. TLS uses the original
+    /// DNS host for SNI and certificate validation. A TLS or HTTP failure is
+    /// terminal: request bytes are never replayed onto another address.
+    /// Redirects, cookies, credentials, proxies, and connection reuse are absent.
     pub async fn fetch(
         &self,
         cx: &Cx,
@@ -1906,13 +1908,13 @@ impl GuardedHttpFetcher {
             .resolve_all_with_lifetime(cx, fetch_deadline, url.host.clone(), lifetime.clone())
             .await?;
         #[cfg(test)]
-        let selected_address = guarded_select_address_with_test_loopback(
+        let addresses = guarded_admit_addresses_with_test_loopback(
             answers,
             url.port(),
             self.test_loopback_authority,
         )?;
         #[cfg(not(test))]
-        let selected_address = guarded_select_address(answers, url.port())?;
+        let addresses = guarded_admit_addresses(answers, url.port())?;
         guarded_fetch_checkpoint(cx)?;
 
         #[cfg(test)]
@@ -1922,7 +1924,7 @@ impl GuardedHttpFetcher {
                 host: url.host.clone(),
                 authority: url.authority(),
                 target: url.target.clone(),
-                selected_address,
+                selected_address: addresses[0],
             };
             let body_limit = self.policy.response_body_bytes;
             let response = guarded_await_phase(cx, fetch_deadline, move |phase_cx| async move {
@@ -1953,9 +1955,13 @@ impl GuardedHttpFetcher {
             // Keep capacity until this child and all of its I/O resources drop.
             let lifetime_guard = lifetime;
             guarded_fetch_checkpoint(&phase_cx)?;
-            let tcp = NativeTcpStream::connect(selected_address)
-                .await
-                .map_err(|error| GuardedHttpFetchError::Connect(error.to_string()))?;
+            let (tcp, selected_address) = guarded_connect_addresses(
+                &phase_cx,
+                addresses,
+                fetch_deadline,
+                NativeTcpStream::connect,
+            )
+            .await?;
             tcp.set_nodelay(true)
                 .map_err(|error| GuardedHttpFetchError::Connect(error.to_string()))?;
             guarded_fetch_checkpoint(&phase_cx)?;
@@ -2006,7 +2012,7 @@ impl GuardedHttpFetcher {
         lifetime: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Vec<IpAddr>, GuardedHttpFetchError> {
         // ONE resolution path. Production and any caller-supplied resolver both
-        // arrive here, and both are fenced by `guarded_select_address` after.
+        // arrive here, and both are fenced by `guarded_admit_addresses` after.
         let resolver = Arc::clone(&self.resolver);
         guarded_await_phase(cx, deadline, move |phase_cx| async move {
             // This clone belongs to the phase child, not merely its joiner.
@@ -2365,8 +2371,10 @@ impl GuardedHttpFetcher {
     /// through [`guarded_admit_native_response`], the admission `fetch` uses.
     /// The request bytes are exactly [`guarded_encode_post_request`]'s output.
     ///
-    /// A redirect is never followed or replayed. This method sends one request
-    /// and returns; a 3xx comes back as [`GuardedHttpRedirect`] data.
+    /// TCP failures may select another admitted address before TLS or request
+    /// transmission. TLS and HTTP failures never retry. A redirect is never
+    /// followed or replayed: this method sends one request and returns, and a
+    /// 3xx comes back as [`GuardedHttpRedirect`] data.
     pub async fn post(
         &self,
         cx: &Cx,
@@ -2449,13 +2457,13 @@ impl GuardedHttpFetcher {
             .resolve_all_with_lifetime(cx, fetch_deadline, url.host.clone(), lifetime.clone())
             .await?;
         #[cfg(test)]
-        let selected_address = guarded_select_address_with_test_loopback(
+        let addresses = guarded_admit_addresses_with_test_loopback(
             answers,
             url.port(),
             self.test_loopback_authority,
         )?;
         #[cfg(not(test))]
-        let selected_address = guarded_select_address(answers, url.port())?;
+        let addresses = guarded_admit_addresses(answers, url.port())?;
         guarded_fetch_checkpoint(cx)?;
 
         let connector = self.connector.clone();
@@ -2469,9 +2477,13 @@ impl GuardedHttpFetcher {
             let lifetime_guard = lifetime;
             let request = request;
             guarded_fetch_checkpoint(&phase_cx)?;
-            let tcp = NativeTcpStream::connect(selected_address)
-                .await
-                .map_err(|error| GuardedHttpFetchError::Connect(error.to_string()))?;
+            let (tcp, selected_address) = guarded_connect_addresses(
+                &phase_cx,
+                addresses,
+                fetch_deadline,
+                NativeTcpStream::connect,
+            )
+            .await?;
             tcp.set_nodelay(true)
                 .map_err(|error| GuardedHttpFetchError::Connect(error.to_string()))?;
             guarded_fetch_checkpoint(&phase_cx)?;
@@ -2889,27 +2901,27 @@ fn is_guarded_dns_label(label: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
-fn guarded_select_address(
+fn guarded_admit_addresses(
     answers: Vec<IpAddr>,
     port: u16,
-) -> Result<SocketAddr, GuardedHttpFetchError> {
-    guarded_select_address_inner(answers, port, None)
+) -> Result<Vec<SocketAddr>, GuardedHttpFetchError> {
+    guarded_admit_addresses_inner(answers, port, None)
 }
 
 #[cfg(test)]
-fn guarded_select_address_with_test_loopback(
+fn guarded_admit_addresses_with_test_loopback(
     answers: Vec<IpAddr>,
     port: u16,
     allowed_loopback: Option<SocketAddr>,
-) -> Result<SocketAddr, GuardedHttpFetchError> {
-    guarded_select_address_inner(answers, port, allowed_loopback)
+) -> Result<Vec<SocketAddr>, GuardedHttpFetchError> {
+    guarded_admit_addresses_inner(answers, port, allowed_loopback)
 }
 
-fn guarded_select_address_inner(
+fn guarded_admit_addresses_inner(
     answers: Vec<IpAddr>,
     port: u16,
     #[cfg_attr(not(test), allow(unused_variables))] allowed_loopback: Option<SocketAddr>,
-) -> Result<SocketAddr, GuardedHttpFetchError> {
+) -> Result<Vec<SocketAddr>, GuardedHttpFetchError> {
     if answers.is_empty() {
         return Err(GuardedHttpFetchError::ResolutionEmpty);
     }
@@ -2931,10 +2943,61 @@ fn guarded_select_address_inner(
     }
     addresses.sort_unstable();
     addresses.dedup();
-    addresses
-        .into_iter()
-        .next()
-        .ok_or(GuardedHttpFetchError::ResolutionEmpty)
+    Ok(addresses)
+}
+
+/// Connects only to the already admitted DNS answer set. Each TCP attempt gets
+/// an equal share of the remaining absolute budget, so an unresponsive first
+/// address cannot consume the time reserved for every other address. The timed
+/// future is dropped before the next attempt; there is never more than one
+/// pending socket. TLS and HTTP deliberately live outside this loop.
+///
+/// The private connector parameter lets tests hold a TCP attempt pending and
+/// observe its destruction without relying on an external blackholed network.
+async fn guarded_connect_addresses<F, Fut, T>(
+    cx: &Cx,
+    addresses: Vec<SocketAddr>,
+    deadline: asupersync::Time,
+    mut connect: F,
+) -> Result<(T, SocketAddr), GuardedHttpFetchError>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: Future<Output = std::io::Result<T>>,
+{
+    let count = addresses.len();
+    if count == 0 {
+        return Err(GuardedHttpFetchError::ResolutionEmpty);
+    }
+    if count > MAX_GUARDED_RESOLVED_ADDRESSES {
+        return Err(GuardedHttpFetchError::ResolutionTooMany);
+    }
+    let mut last_error = GuardedHttpFetchError::DeadlineExceeded;
+    for (index, address) in addresses.into_iter().enumerate() {
+        guarded_fetch_checkpoint(cx)?;
+        let now = time::wall_now();
+        if now >= deadline {
+            return Err(GuardedHttpFetchError::DeadlineExceeded);
+        }
+        let remaining_attempts = u32::try_from(count - index)
+            .map_err(|_| GuardedHttpFetchError::ResolutionTooMany)?;
+        let remaining = Duration::from_nanos(deadline.duration_since(now));
+        let attempt_deadline = now + remaining / remaining_attempts;
+        let result = time::timeout_at(attempt_deadline, connect(address)).await;
+        guarded_fetch_checkpoint(cx)?;
+        if time::wall_now() >= deadline {
+            return Err(GuardedHttpFetchError::DeadlineExceeded);
+        }
+        match result {
+            Ok(Ok(stream)) => return Ok((stream, address)),
+            Ok(Err(error)) => {
+                // Keep only the last bounded OS failure, never accumulate an
+                // error per DNS answer or attach request/credential bytes.
+                last_error = GuardedHttpFetchError::Connect(error.to_string());
+            }
+            Err(_) => last_error = GuardedHttpFetchError::DeadlineExceeded,
+        }
+    }
+    Err(last_error)
 }
 
 fn canonical_guarded_ip(address: IpAddr) -> IpAddr {
@@ -10241,10 +10304,11 @@ X/aCEJ5+hA==
     fn guarded_https_url_public_address_selects_deterministically() {
         let url =
             GuardedHttpsUrl::parse("https://PUBLIC.example:8443/a?b=c").expect("bounded HTTPS URL");
-        let selected = guarded_select_address(
+        let addresses = guarded_admit_addresses(
             vec![
                 IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35)),
                 IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x5db8, 0xd822)),
             ],
             url.port(),
         )
@@ -10252,7 +10316,13 @@ X/aCEJ5+hA==
 
         assert_eq!(url.host(), "public.example");
         assert_eq!(url.target(), "/a?b=c");
-        assert_eq!(selected, SocketAddr::from(([93, 184, 216, 34], 8443)));
+        assert_eq!(
+            addresses,
+            vec![
+                SocketAddr::from(([93, 184, 216, 34], 8443)),
+                SocketAddr::from(([93, 184, 216, 35], 8443)),
+            ]
+        );
     }
 
     #[test]
@@ -10268,7 +10338,7 @@ X/aCEJ5+hA==
             let input_snapshot = answers.clone();
 
             assert_eq!(
-                guarded_select_address(answers.clone(), 443),
+                guarded_admit_addresses(answers.clone(), 443),
                 Err(GuardedHttpFetchError::DisallowedResolvedAddress(
                     canonical_guarded_ip(prohibited)
                 ))
@@ -10276,8 +10346,8 @@ X/aCEJ5+hA==
             assert_eq!(answers, input_snapshot);
         }
         assert_eq!(
-            guarded_select_address(vec![public], 443),
-            Ok(SocketAddr::from(([93, 184, 216, 34], 443)))
+            guarded_admit_addresses(vec![public], 443),
+            Ok(vec![SocketAddr::from(([93, 184, 216, 34], 443))])
         );
         assert!(is_public_guarded_ip(adjacent_public));
     }
@@ -10288,13 +10358,222 @@ X/aCEJ5+hA==
         let allowed = SocketAddr::from((Ipv4Addr::LOCALHOST, 9443));
 
         assert_eq!(
-            guarded_select_address_with_test_loopback(vec![loopback], 9443, Some(allowed)),
-            Ok(allowed)
+            guarded_admit_addresses_with_test_loopback(vec![loopback], 9443, Some(allowed)),
+            Ok(vec![allowed])
         );
         assert_eq!(
-            guarded_select_address_with_test_loopback(vec![loopback], 9444, Some(allowed)),
+            guarded_admit_addresses_with_test_loopback(vec![loopback], 9444, Some(allowed)),
             Err(GuardedHttpFetchError::DisallowedResolvedAddress(loopback))
         );
+    }
+
+    #[test]
+    fn guarded_connect_live_failure_falls_through_to_a_working_socket() {
+        fastmcp_core::block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("loopback listener");
+            let live = listener.local_addr().expect("listener address");
+            // Port zero cannot name a listening peer. The private connector
+            // test uses it to induce an OS connect error without a racy
+            // reserve/drop of another process's ephemeral port.
+            let refused = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+            let mut attempted = Vec::new();
+            let deadline = time::wall_now() + Duration::from_secs(10);
+            let (mut stream, selected) = guarded_connect_addresses(
+                &cx,
+                vec![refused, live],
+                deadline,
+                |address| {
+                    attempted.push(address);
+                    NativeTcpStream::connect(address)
+                },
+            )
+            .await
+            .expect("second admitted socket connects");
+            assert_eq!(selected, live);
+            assert_eq!(attempted, vec![refused, live]);
+
+            let (mut peer, _) = time::timeout_at(deadline, listener.accept())
+                .await
+                .expect("accept bound")
+                .expect("winning connection");
+            time::timeout_at(deadline, stream.write_all(b"selected-peer"))
+                .await
+                .expect("write bound")
+                .expect("write winning socket");
+            let mut received = [0_u8; 13];
+            time::timeout_at(deadline, peer.read_exact(&mut received))
+                .await
+                .expect("read bound")
+                .expect("read winning socket");
+            assert_eq!(&received, b"selected-peer");
+        });
+    }
+
+    #[test]
+    fn guarded_connect_live_success_never_opens_a_second_socket() {
+        fastmcp_core::block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let first = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("first loopback listener");
+            let second = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("second loopback listener");
+            let addresses = vec![
+                first.local_addr().expect("first listener address"),
+                second.local_addr().expect("second listener address"),
+            ];
+            let mut attempted = Vec::new();
+            let deadline = time::wall_now() + Duration::from_secs(10);
+            let (mut stream, selected) = guarded_connect_addresses(
+                &cx,
+                addresses.clone(),
+                deadline,
+                |address| {
+                    attempted.push(address);
+                    NativeTcpStream::connect(address)
+                },
+            )
+            .await
+            .expect("first socket connects");
+            assert_eq!(selected, addresses[0]);
+            assert_eq!(attempted, vec![addresses[0]]);
+            let (peer, _) = time::timeout_at(deadline, first.accept())
+                .await
+                .expect("accept bound")
+                .expect("first accepted socket");
+            drop(peer);
+            let mut byte = [0_u8; 1];
+            assert_eq!(
+                time::timeout_at(deadline, stream.read(&mut byte))
+                    .await
+                    .expect("peer-close bound")
+                    .expect("peer closes after TCP success"),
+                0
+            );
+            // The connection owner observes the terminal failure; it does not
+            // re-enter address selection or send anything to the second peer.
+            assert_eq!(attempted, vec![addresses[0]]);
+        });
+    }
+
+    #[test]
+    fn guarded_connect_timed_out_attempt_drops_before_next_candidate() {
+        struct PendingSocket(Arc<AtomicUsize>);
+        impl Drop for PendingSocket {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fastmcp_core::block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let addresses = vec![
+                SocketAddr::from(([93, 184, 216, 34], 443)),
+                SocketAddr::from(([93, 184, 216, 35], 443)),
+            ];
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let mut attempted = Vec::new();
+            let first = addresses[0];
+            let second = addresses[1];
+            let result = guarded_connect_addresses(
+                &cx,
+                addresses.clone(),
+                time::wall_now() + Duration::from_secs(2),
+                |address| {
+                    attempted.push(address);
+                    let dropped = Arc::clone(&dropped);
+                    async move {
+                        if address == first {
+                            let _pending = PendingSocket(dropped);
+                            std::future::pending::<std::io::Result<()>>().await
+                        } else {
+                            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .await;
+            assert_eq!(result, Ok(((), second)));
+            assert_eq!(attempted, addresses);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn guarded_connect_cancellation_and_expired_deadline_stop_candidate_attempts() {
+        fastmcp_core::block_on(async {
+            let addresses = vec![
+                SocketAddr::from(([93, 184, 216, 34], 443)),
+                SocketAddr::from(([93, 184, 216, 35], 443)),
+            ];
+            let cx = Cx::for_testing();
+            let mut attempts = 0;
+            let expired = guarded_connect_addresses(
+                &cx,
+                addresses.clone(),
+                time::wall_now(),
+                |_| {
+                    attempts += 1;
+                    std::future::ready(Ok(()))
+                },
+            )
+            .await;
+            assert_eq!(expired, Err(GuardedHttpFetchError::DeadlineExceeded));
+            assert_eq!(attempts, 0);
+
+            let cancelled = guarded_connect_addresses(
+                &cx,
+                addresses,
+                time::wall_now() + Duration::from_secs(10),
+                |_| {
+                    attempts += 1;
+                    cx.set_cancel_requested(true);
+                    std::future::ready(Err::<(), _>(std::io::Error::from(
+                        std::io::ErrorKind::ConnectionRefused,
+                    )))
+                },
+            )
+            .await;
+            assert_eq!(cancelled, Err(GuardedHttpFetchError::Cancelled));
+            assert_eq!(attempts, 1);
+        });
+    }
+
+    #[test]
+    fn guarded_connect_exhaustion_keeps_only_the_final_failure() {
+        fastmcp_core::block_on(async {
+            let cx = Cx::current().expect("runtime context");
+            let first = SocketAddr::from(([93, 184, 216, 34], 443));
+            let last = SocketAddr::from(([93, 184, 216, 35], 443));
+            let mut attempted = Vec::new();
+            let result = guarded_connect_addresses(
+                &cx,
+                vec![first, last],
+                time::wall_now() + Duration::from_secs(10),
+                |address| {
+                    attempted.push(address);
+                    let message = if address == first {
+                        "first connect failure"
+                    } else {
+                        "last connect failure"
+                    };
+                    std::future::ready(Err::<(), _>(std::io::Error::other(message)))
+                },
+            )
+            .await;
+            assert_eq!(
+                result,
+                Err(GuardedHttpFetchError::Connect(
+                    "last connect failure".to_owned()
+                ))
+            );
+            assert_eq!(attempted, vec![first, last]);
+        });
     }
 
     #[test]
