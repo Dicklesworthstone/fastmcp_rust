@@ -40,16 +40,32 @@ async fn await_recovery_store<T>(
     operation: impl Future<Output = McpResult<T>>,
     committed_receipt: bool,
 ) -> McpResult<T> {
+    await_recovery_store_while(cx, operation, committed_receipt, || Ok(())).await
+}
+
+/// Dispatch admission has a service-owned stop signal in addition to caller
+/// cancellation. Preserve the same receipt-before-checkpoint rule while making
+/// that stop observable even when a storage provider never wakes.
+async fn await_recovery_store_while<T>(
+    cx: &Cx,
+    operation: impl Future<Output = McpResult<T>>,
+    committed_receipt: bool,
+    additional_checkpoint: impl Fn() -> McpResult<()>,
+) -> McpResult<T> {
+    let checkpoint = || {
+        final_task_service_caller(cx)?;
+        additional_checkpoint()
+    };
     let mut operation = std::pin::pin!(operation);
     let mut wake = None;
     std::future::poll_fn(|task| {
-        if let Err(error) = final_task_service_caller(cx) {
+        if let Err(error) = checkpoint() {
             return Poll::Ready(Err(error));
         }
         match operation.as_mut().poll(task) {
             Poll::Ready(result) => {
                 if !committed_receipt {
-                    if let Err(error) = final_task_service_caller(cx) {
+                    if let Err(error) = checkpoint() {
                         return Poll::Ready(Err(error));
                     }
                 }
@@ -59,7 +75,7 @@ async fn await_recovery_store<T>(
                 // A provider may neither wake nor cooperate with cancellation.
                 // Keep cancellation, deadline and effect checks independent of
                 // its wakeups, using only the admitted caller's timer driver.
-                if let Err(error) = final_task_service_caller(cx) {
+                if let Err(error) = checkpoint() {
                     return Poll::Ready(Err(error));
                 }
                 let wake = wake.get_or_insert_with(|| {
@@ -533,6 +549,163 @@ impl FinalTaskRuntime {
                 }
             }
             Ok(())
+        })
+    }
+}
+
+impl FinalTaskExecutionGuard {
+    /// Keeps a claimed handoff in restoration custody while its dispatch
+    /// preflight awaits storage. An uncertain election instead retains the
+    /// backend's finite lease; only an actual receipt supplies a restore fence.
+    pub(super) fn elect_with_cx<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        stop: &'a AtomicBool,
+    ) -> impl Future<Output = McpResult<bool>> + Send + 'a {
+        CallerContextFuture::new(cx, async move {
+            let checkpoint = || {
+                if stop.load(TaskServiceOrdering::Acquire) {
+                    Err(McpError::request_cancelled())
+                } else {
+                    Ok(())
+                }
+            };
+            final_task_service_caller(cx)?;
+            checkpoint()?;
+            if self.execution_admission_lost {
+                return Ok(false);
+            }
+            let Some(current) = await_recovery_store_while(
+                cx,
+                self.runtime.store.get_task_snapshot_with_cx(cx, &self.task_id),
+                false,
+                &checkpoint,
+            )
+            .await?
+            else {
+                return Ok(false);
+            };
+            let current = self
+                .runtime
+                .validate_loaded_task_snapshot(current, Some(&self.task_id))?;
+            final_task_service_caller(cx)?;
+            checkpoint()?;
+            let current = await_recovery_store_while(
+                cx,
+                self.runtime.expire_execution_snapshot_with_cx(cx, &current),
+                true,
+                &checkpoint,
+            )
+            .await?
+            .unwrap_or(current);
+            if current.generation() != self.generation
+                || !matches!(current.task(), FinalTask::Working(_))
+                || self
+                    .execution_authorization
+                    .as_ref()
+                    .is_none_or(|expected| !expected.admits_snapshot(&current))
+            {
+                return Ok(false);
+            }
+            final_task_service_caller(cx)?;
+            checkpoint()?;
+            let Some(budget) = await_recovery_store_while(
+                cx,
+                self.runtime
+                    .store
+                    .task_execution_budget_if_current_with_cx(cx, &current),
+                false,
+                &checkpoint,
+            )
+            .await?
+            else {
+                return Ok(false);
+            };
+            let Some(attempt_deadline) = budget.attempt_deadline else {
+                return Err(McpError::internal_error(
+                    "Final task store did not bound the claimed execution attempt",
+                ));
+            };
+            if budget.attempts == 0 {
+                return Err(McpError::internal_error(
+                    "Final task store did not bound the claimed execution attempt",
+                ));
+            }
+            self.execution_budget = Some(budget);
+            final_task_service_caller(cx)?;
+            checkpoint()?;
+            let Some(deadline) = await_recovery_store_while(
+                cx,
+                self.runtime
+                    .store
+                    .task_retention_deadline_if_current_with_cx(
+                        cx,
+                        &self.task_id,
+                        self.generation,
+                    ),
+                false,
+                &checkpoint,
+            )
+            .await?
+            else {
+                return Ok(false);
+            };
+            let expired = |now| {
+                now >= budget.total_deadline
+                    || now >= attempt_deadline
+                    || matches!(
+                        deadline,
+                        FinalTaskRetentionDeadline::Finite(retention) if now >= retention
+                    )
+            };
+            final_task_service_caller(cx)?;
+            checkpoint()?;
+            if expired(self.runtime.retention_clock_now()) {
+                return Ok(false);
+            }
+
+            // Set this before constructing the provider future: even its
+            // factory may perform admission or commit work. If its outcome is
+            // lost, Drop must not restore a pre-dispatch claim over a possible
+            // elected owner or replay the original application invocation.
+            self.dispatch_election_uncertain = true;
+            let elected = await_recovery_store_while(
+                cx,
+                self.runtime
+                    .store
+                    .begin_handoff_dispatch_for_owner_if_current_with_cx(
+                        cx,
+                        &self.task_id,
+                        self.generation,
+                        &self.owner_id,
+                    ),
+                true,
+                &checkpoint,
+            )
+            .await?;
+            let Some(fence) = elected else {
+                self.dispatch_election_uncertain = false;
+                return Ok(false);
+            };
+            if fence == 0 {
+                // A malformed receipt cannot authorize restoration. Retain
+                // uncertainty rather than passing an invented fence to Drop.
+                return Err(McpError::internal_error(
+                    "Final task store returned a zero dispatch fencing token",
+                ));
+            }
+            // Adopt the exact committed fence before any subsequent check.
+            // Late cancellation or a sibling service error can now restore
+            // only this known election; it cannot invent an unelected claim.
+            self.retention_deadline = Some(deadline);
+            self.dispatch_fence = Some(fence);
+            self.dispatch_election_uncertain = false;
+            final_task_service_caller(cx)?;
+            checkpoint()?;
+            if expired(self.runtime.retention_clock_now()) {
+                return Err(McpError::request_cancelled());
+            }
+            Ok(true)
         })
     }
 }

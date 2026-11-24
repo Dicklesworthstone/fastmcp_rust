@@ -1606,10 +1606,10 @@ pub trait FinalTaskStore: Send + Sync {
     /// `ctx.request_cancelled()` when a pending operation must settle after
     /// request-local cancellation. A write that may have committed must report
     /// that uncertainty instead of treating cancellation as proof of rollback.
-    /// Worker mutations and service recovery also have asynchronous entrypoints.
-    /// Dispatch election, lease maintenance, and drop-time restoration remain
-    /// bounded synchronous operations; these hooks do not establish a persistent
-    /// or completely asynchronous Task backend.
+    /// Worker mutations, service recovery, and dispatch election also have
+    /// asynchronous entrypoints. Lease maintenance and drop-time restoration
+    /// remain bounded synchronous operations; these hooks do not establish a
+    /// persistent or completely asynchronous Task backend.
     fn get_task_access_metadata_with_context<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -1829,6 +1829,63 @@ pub trait FinalTaskStore: Send + Sync {
         Box::pin(async move {
             cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
             self.take_input_handoff_for_owner_if_current(expected, owner_id)
+        })
+    }
+
+    /// Reads execution accounting for an exact claimed generation on the
+    /// service caller. Preserve the authoritative clock domain, original total
+    /// deadline, attempt deadline and spent attempt count; waiting cannot reset
+    /// or extend them. The default delegates to bounded synchronous storage.
+    fn task_execution_budget_if_current_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        expected: &'a FinalTaskSnapshot,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskExecutionBudget>> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.task_execution_budget_if_current(expected)
+        })
+    }
+
+    /// Reads the original retention deadline for an exact claimed generation
+    /// without blocking the service's runtime. A missing or replaced record
+    /// returns None; storage waiting must never renew retention.
+    fn task_retention_deadline_if_current_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+        generation: u64,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskRetentionDeadline>> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.task_retention_deadline_if_current(task_id, generation)
+        })
+    }
+
+    /// Atomically elects this claimed owner through caller-owned storage I/O.
+    ///
+    /// Preserve the exact generation, owner, finite lease and cancellation
+    /// comparison of the synchronous election, and independently reject expired
+    /// retention or execution budgets at the write boundary. Check caller
+    /// cancellation immediately before the first write after any suspension.
+    /// Return the original nonzero fencing receipt even if cancellation arrives
+    /// while that committed receipt is being delivered. None proves a lost
+    /// comparison and no election by this operation.
+    ///
+    /// A dropped future or error can leave an unknown election outcome. Retain
+    /// the original payload and finite owner lease for backend expiry recovery;
+    /// neither abandonment nor cancellation authorizes replay, an invented
+    /// fencing token, or restoration as though no election committed.
+    fn begin_handoff_dispatch_for_owner_if_current_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+        generation: u64,
+        owner_id: &'a str,
+    ) -> FinalTaskStoreFuture<'a, Option<u64>> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.begin_handoff_dispatch_for_owner_if_current(task_id, generation, owner_id)
         })
     }
 
@@ -10106,6 +10163,7 @@ impl FinalTaskRuntime {
         )
     }
 
+    #[cfg(test)]
     fn begin_handoff_dispatch(
         &self,
         task_id: &FinalTaskId,
@@ -10156,6 +10214,7 @@ impl FinalTaskRuntime {
         self.store.retention_clock_now()
     }
 
+    #[cfg(test)]
     fn task_retention_deadline(
         &self,
         task_id: &FinalTaskId,
@@ -11072,7 +11131,7 @@ impl FinalTaskHandoffExecutor {
         }
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
-        if !guard.elect()? {
+        if !guard.elect_with_cx(cx, &stop).await? {
             // Cancellation or another service won the atomic election before
             // this handoff could begin. That winner owns the handoff outcome;
             // do not let this losing caller restore over its durable state.
@@ -11894,6 +11953,9 @@ struct FinalTaskExecutionGuard {
     generation: u64,
     owner_id: String,
     dispatch_fence: Option<u64>,
+    // An abandoned election cannot be restored with an invented pre-dispatch
+    // fence. The backend's finite lease retains recovery custody until expiry.
+    dispatch_election_uncertain: bool,
     transition_committed: Arc<AtomicBool>,
     retention_deadline: Option<FinalTaskRetentionDeadline>,
     execution_budget: Option<FinalTaskExecutionBudget>,
@@ -11973,6 +12035,7 @@ impl FinalTaskExecutionGuard {
             generation,
             owner_id: owner_id.to_owned(),
             dispatch_fence: None,
+            dispatch_election_uncertain: false,
             transition_committed: Arc::new(AtomicBool::new(false)),
             retention_deadline: None,
             execution_budget: None,
@@ -11992,6 +12055,7 @@ impl FinalTaskExecutionGuard {
         }
     }
 
+    #[cfg(test)]
     fn elect(&mut self) -> McpResult<bool> {
         if self.execution_admission_lost {
             return Ok(false);
@@ -12325,9 +12389,13 @@ impl FinalTaskExecutionGuard {
 
 impl Drop for FinalTaskExecutionGuard {
     fn drop(&mut self) {
-        if self.pending_write.admitted_pending() || self.pending_write.outcome_uncertain() {
-            // The caller-owned custodian retains admitted storage work. An
-            // uncertain operation must not replay the original invocation.
+        if self.dispatch_election_uncertain
+            || self.pending_write.admitted_pending()
+            || self.pending_write.outcome_uncertain()
+        {
+            // An unknown election retains its finite backend lease. The
+            // caller-owned custodian retains admitted worker storage writes.
+            // Neither uncertainty permits replay or an invented restoration.
             return;
         }
         // A stale weak receipt may name the same generation/owner as a new
@@ -27434,6 +27502,7 @@ mod tests {
             generation: stale_generation,
             owner_id: "test-owner".to_owned(),
             dispatch_fence: None,
+            dispatch_election_uncertain: false,
             transition_committed: Arc::new(AtomicBool::new(false)),
             retention_deadline: None,
             execution_budget: None,
@@ -27473,6 +27542,7 @@ mod tests {
             generation: retained.generation(),
             owner_id: "test-owner".to_owned(),
             dispatch_fence: None,
+            dispatch_election_uncertain: false,
             transition_committed: Arc::new(AtomicBool::new(false)),
             retention_deadline: None,
             execution_budget: None,
