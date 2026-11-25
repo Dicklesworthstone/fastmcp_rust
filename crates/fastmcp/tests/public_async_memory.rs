@@ -2572,3 +2572,180 @@ mod retention_administration {
         assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 }
+
+
+#[cfg(feature = "testing")]
+mod testing_catalog_pagination {
+    use super::*;
+    use std::collections::HashMap;
+
+    use fastmcp_rust::testing::{TestClient, TestClientPaginationLimits, TestClientProtocolMode};
+    use fastmcp_rust::{
+        Content, McpErrorCode, Prompt, PromptHandler, PromptMessage, Resource, ResourceContent,
+        ResourceHandler, Role, Tool, ToolHandler,
+    };
+
+    struct CatalogEntry(&'static str);
+
+    impl ToolHandler for CatalogEntry {
+        fn definition(&self) -> Tool {
+            serde_json::from_value(json!({
+                "name": self.0,
+                "inputSchema": {"type": "object"},
+            }))
+            .unwrap()
+        }
+
+        fn call(&self, _ctx: &McpContext, _arguments: JsonValue) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text(self.0)])
+        }
+    }
+
+    impl ResourceHandler for CatalogEntry {
+        fn definition(&self) -> Resource {
+            serde_json::from_value(json!({
+                "name": self.0,
+                "uri": format!("catalog://{}", self.0),
+            }))
+            .unwrap()
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![ResourceContent {
+                uri: format!("catalog://{}", self.0),
+                mime_type: Some("text/plain".to_owned()),
+                text: Some(self.0.to_owned()),
+                blob: None,
+            }])
+        }
+    }
+
+    impl PromptHandler for CatalogEntry {
+        fn definition(&self) -> Prompt {
+            serde_json::from_value(json!({"name": self.0, "arguments": []})).unwrap()
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _arguments: HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            Ok(vec![PromptMessage {
+                role: Role::User,
+                content: Content::text(self.0),
+            }])
+        }
+    }
+
+    fn exercise_real_catalogs(mode: TestClientProtocolMode, max_pages: usize) {
+        std::thread::scope(|scope| {
+            let (transport, peer) = create_memory_transport_pair_with_capacity(4);
+            let stopped = Arc::new(AtomicBool::new(false));
+            let server_stopped = Arc::clone(&stopped);
+            let serving = scope.spawn(move || {
+                let runtime = RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 0)
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let cx = Cx::current().unwrap();
+                    #[cfg(feature = "legacy-2024-11-05")]
+                    let mut builder = fastmcp_rust::auto::ServerBuilder::new("catalog-pages", "1");
+                    #[cfg(not(feature = "legacy-2024-11-05"))]
+                    let mut builder = modern::ServerBuilder::new("catalog-pages", "1");
+                    builder = builder.list_page_size(1);
+                    for name in ["alpha", "beta", "gamma"] {
+                        builder = builder
+                            .tool(CatalogEntry(name))
+                            .resource(CatalogEntry(name))
+                            .prompt(CatalogEntry(name))
+                            .resource_template(
+                                serde_json::from_value(json!({
+                                    "name": name,
+                                    "uriTemplate": format!("catalog://{name}/{{key}}"),
+                                }))
+                                .unwrap(),
+                            );
+                    }
+                    builder
+                        .on_shutdown(move || server_stopped.store(true, Ordering::Release))
+                        .build()
+                        .serve_memory(&cx, peer)
+                        .await
+                        .unwrap();
+                });
+                assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            });
+            let clock = Cx::for_testing();
+            let cx =
+                Cx::for_testing_with_budget(clock.budget_for_timeout(Duration::from_secs(10)));
+            let mut client = TestClient::new(transport, cx)
+                .with_protocol_mode(mode)
+                .with_pagination_limits(TestClientPaginationLimits {
+                    max_pages,
+                    ..TestClientPaginationLimits::default()
+                })
+                .unwrap();
+            client.initialize_core().unwrap();
+            let tools = client.list_tools();
+            let resources = client.list_resources();
+            let templates = client.list_resource_templates();
+            let prompts = client.list_prompts();
+            client.close();
+            serving.join().expect("the real server must settle after client close");
+            assert!(stopped.load(Ordering::Acquire));
+
+            if max_pages == 3 {
+                let expected = ["alpha", "beta", "gamma"];
+                assert_eq!(
+                    tools.unwrap().into_iter().map(|item| item.name).collect::<Vec<_>>(),
+                    expected,
+                );
+                assert_eq!(
+                    resources.unwrap().into_iter().map(|item| item.name).collect::<Vec<_>>(),
+                    expected,
+                );
+                assert_eq!(
+                    templates.unwrap().into_iter().map(|item| item.name).collect::<Vec<_>>(),
+                    expected,
+                );
+                assert_eq!(
+                    prompts.unwrap().into_iter().map(|item| item.name).collect::<Vec<_>>(),
+                    expected,
+                );
+            } else {
+                for error in [
+                    tools.unwrap_err(),
+                    resources.unwrap_err(),
+                    templates.unwrap_err(),
+                    prompts.unwrap_err(),
+                ] {
+                    assert_eq!(error.code, McpErrorCode::InternalError);
+                    assert_eq!(error.message, "Automatic pagination page limit exceeded");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_client_catalogs_collect_all_real_server_pages() {
+        for mode in [TestClientProtocolMode::Modern2026, TestClientProtocolMode::Auto]
+            .into_iter()
+            .chain(cfg!(feature = "legacy-2024-11-05").then_some(TestClientProtocolMode::Legacy2024))
+        {
+            exercise_real_catalogs(mode, 3);
+        }
+    }
+
+    #[test]
+    fn test_client_catalog_page_limit_never_returns_real_server_prefix_as_success() {
+        for mode in [TestClientProtocolMode::Modern2026, TestClientProtocolMode::Auto]
+            .into_iter()
+            .chain(cfg!(feature = "legacy-2024-11-05").then_some(TestClientProtocolMode::Legacy2024))
+        {
+            // Only the page allowance differs from the positive; all four
+            // catalogs and the real transport/dispatch pipeline are identical.
+            exercise_real_catalogs(mode, 2);
+        }
+    }
+}

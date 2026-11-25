@@ -16,15 +16,58 @@ use fastmcp_protocol::{
     FINAL_PROTOCOL_VERSION_META_KEY, FinalCoreResult, GetPromptParams, GetPromptResult,
     InitializeParams, InitializeResult, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, LegacyContent, LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent,
-    ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
-    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION,
-    Prompt, ReadResourceParams, ReadResourceResult, RequestId, Resource, ResourceTemplate,
-    ServerCapabilities, ServerDiscoverResult, ServerInfo, Tool,
+    PROTOCOL_VERSION, Prompt, ReadResourceParams, ReadResourceResult, RequestId, Resource,
+    ResourceTemplate, ServerCapabilities, ServerDiscoverResult, ServerInfo, Tool,
 };
 use fastmcp_transport::memory::MemoryTransport;
 use fastmcp_transport::{Transport, TransportError};
 
 const MAX_INTERLEAVED_MESSAGES: usize = 128;
+const MAX_CATALOG_CURSOR_BYTES: usize = 4 * 1024;
+
+/// Limits for a complete catalog traversal by [`TestClient`].
+///
+/// These limits apply independently to each tools, resources, resource-template,
+/// or prompts list operation. A refused traversal returns no partial catalog.
+/// Defaults match the production client's page, item, and byte ceilings; a
+/// test may lower them with [`TestClient::with_pagination_limits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TestClientPaginationLimits {
+    /// Maximum requests in one traversal (1 through 1,024).
+    pub max_pages: usize,
+    /// Maximum total catalog entries (1 through 100,000).
+    pub max_items: usize,
+    /// Maximum total received result bytes (2 through 64 MiB).
+    ///
+    /// Complete admitted result pages are charged, including metadata and open
+    /// members, before entries are retained in the returned vector.
+    pub max_serialized_bytes: usize,
+}
+
+impl Default for TestClientPaginationLimits {
+    fn default() -> Self {
+        Self {
+            max_pages: 1_024,
+            max_items: 100_000,
+            max_serialized_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl TestClientPaginationLimits {
+    fn validate(self) -> McpResult<Self> {
+        let maximum = Self::default();
+        if !(1..=maximum.max_pages).contains(&self.max_pages)
+            || !(1..=maximum.max_items).contains(&self.max_items)
+            || !(2..=maximum.max_serialized_bytes).contains(&self.max_serialized_bytes)
+        {
+            return Err(McpError::invalid_params(
+                "TestClient pagination limits must be positive and within the production ceilings",
+            ));
+        }
+        Ok(self)
+    }
+}
 
 type LegacyTransportFactory = Box<dyn FnOnce(&Cx) -> McpResult<MemoryTransport> + Send>;
 
@@ -121,6 +164,8 @@ pub struct TestClient {
     next_id: AtomicU64,
     /// Whether client has been initialized.
     initialized: bool,
+    /// Bounds one complete catalog traversal without changing caller authority.
+    pagination_limits: TestClientPaginationLimits,
 }
 
 impl TestClient {
@@ -159,6 +204,7 @@ impl TestClient {
             legacy_transport_factory: None,
             next_id: AtomicU64::new(1),
             initialized: false,
+            pagination_limits: TestClientPaginationLimits::default(),
         }
     }
 
@@ -256,6 +302,20 @@ impl TestClient {
     pub fn with_capabilities(mut self, capabilities: ClientCapabilities) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    /// Lowers the finite limits of the catalog convenience methods.
+    ///
+    /// Every continuation preserves the peer's cursor verbatim, including empty
+    /// or repeated cursors. Page/item/byte limits bound a nonterminating peer;
+    /// cancellation and deadlines continue to come from the caller's `Cx`.
+    /// This does not change [`Self::request_core`]'s single-page behavior.
+    pub fn with_pagination_limits(
+        mut self,
+        limits: TestClientPaginationLimits,
+    ) -> McpResult<Self> {
+        self.pagination_limits = limits.validate()?;
+        Ok(self)
     }
 
     /// Performs the MCP initialization or modern `server/discover` handshake
@@ -528,6 +588,15 @@ impl TestClient {
         method: &str,
         params: serde_json::Value,
     ) -> McpResult<CoreResult> {
+        self.request_core_with_source_len(method, params)
+            .map(|(result, _)| result)
+    }
+
+    fn request_core_with_source_len(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> McpResult<(CoreResult, usize)> {
         self.ensure_initialized()?;
         if method == "subscriptions/listen" {
             return Err(McpError::invalid_request(
@@ -547,7 +616,15 @@ impl TestClient {
         let request = CoreRequest::decode(era, method, Some(&params))
             .map_err(|_| McpError::invalid_params("Invalid TestClient core request"))?;
         let received = self.exchange(method, params)?;
+        // Measure the received source before exact-2024 compatibility types
+        // can discard metadata or open members. Admission below rejects a
+        // missing result source, so zero cannot mask a successful missing page.
+        let source_len = received
+            .result_source
+            .as_ref()
+            .map_or(0, |source| source.get().len());
         self.decode_core_response(&request, received)
+            .map(|result| (result, source_len))
     }
 
     /// Returns whether the client has been initialized.
@@ -574,26 +651,90 @@ impl TestClient {
         self.protocol_version.as_deref()
     }
 
-    /// Lists available tools.
+    fn collect_catalog<T: serde::de::DeserializeOwned>(
+        &mut self,
+        method: &str,
+        field: &str,
+    ) -> McpResult<Vec<T>> {
+        self.ensure_initialized()?;
+        let mut entries = Vec::new();
+        let mut cursor = None;
+        let mut serialized_bytes = 0_usize;
+
+        for _ in 0..self.pagination_limits.max_pages {
+            let mut params = serde_json::json!({});
+            if let Some(cursor) = cursor {
+                params["cursor"] = serde_json::Value::String(cursor);
+            }
+            // Every page uses the same core admission, negotiated metadata,
+            // and caller-owned context. Charge its complete received source
+            // before projecting the admitted result into compatibility types.
+            let (result, source_len) = self.request_core_with_source_len(method, params)?;
+            serialized_bytes = serialized_bytes
+                .checked_add(source_len)
+                .filter(|bytes| *bytes <= self.pagination_limits.max_serialized_bytes)
+                .ok_or_else(|| {
+                    McpError::internal_error("Automatic pagination serialized-byte limit exceeded")
+                })?;
+            let source = result.encode().map_err(|_| {
+                McpError::internal_error("Automatic pagination response could not be projected safely")
+            })?;
+            let mut page: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&source).map_err(|_| {
+                    McpError::invalid_request("Invalid admitted TestClient catalog result")
+                })?;
+            cursor = serde_json::from_value(
+                page.remove("nextCursor").unwrap_or(serde_json::Value::Null),
+            )
+            .map_err(|_| McpError::invalid_request("Invalid admitted catalog cursor"))?;
+            if cursor
+                .as_ref()
+                .is_some_and(|cursor: &String| cursor.len() > MAX_CATALOG_CURSOR_BYTES)
+            {
+                return Err(McpError::internal_error(
+                    "Automatic pagination cursor byte limit exceeded",
+                ));
+            }
+            let values = page.remove(field).ok_or_else(|| {
+                McpError::invalid_request("Admitted catalog result omitted its entries")
+            })?;
+            let page_items = values.as_array().ok_or_else(|| {
+                McpError::invalid_request("Admitted catalog entries must be an array")
+            })?;
+            if entries
+                .len()
+                .checked_add(page_items.len())
+                .is_none_or(|items| items > self.pagination_limits.max_items)
+            {
+                return Err(McpError::internal_error(
+                    "Automatic pagination item limit exceeded",
+                ));
+            }
+            let page_entries: Vec<T> = serde_json::from_value(values).map_err(|_| {
+                McpError::invalid_request("Failed to project admitted TestClient catalog entries")
+            })?;
+            entries.extend(page_entries);
+            if cursor.is_none() {
+                return Ok(entries);
+            }
+        }
+
+        Err(McpError::internal_error(
+            "Automatic pagination page limit exceeded",
+        ))
+    }
+
+    /// Lists all available tools, following bounded opaque-cursor pagination.
+    ///
+    /// Use [`Self::request_core`] to retain one complete typed page, including
+    /// modern metadata and open members. This convenience method returns a
+    /// flattened catalog only when the peer omits its next cursor.
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails.
     pub fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
-        self.ensure_initialized()?;
-        if self.is_modern() {
-            let raw = self.send_modern_request("tools/list", serde_json::json!({}))?;
-            let tools = raw
-                .get("tools")
-                .cloned()
-                .ok_or_else(|| McpError::internal_error("Modern tools/list missing tools array"))?;
-            return serde_json::from_value(tools).map_err(|e| {
-                McpError::internal_error(format!("Failed to deserialize modern tools: {e}"))
-            });
-        }
-        let params = ListToolsParams::default();
-        let result: ListToolsResult = self.send_request("tools/list", params)?;
-        Ok(result.tools)
+        self.collect_catalog("tools/list", "tools")
     }
 
     /// Calls a tool with the given arguments.
@@ -653,52 +794,22 @@ impl TestClient {
         Ok(content)
     }
 
-    /// Lists available resources.
+    /// Lists all available resources, following bounded opaque-cursor pagination.
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails.
     pub fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
-        self.ensure_initialized()?;
-        if self.is_modern() {
-            let raw = self.send_modern_request("resources/list", serde_json::json!({}))?;
-            let resources = raw.get("resources").cloned().ok_or_else(|| {
-                McpError::internal_error("Modern resources/list missing resources array")
-            })?;
-            return serde_json::from_value(resources).map_err(|e| {
-                McpError::internal_error(format!("Failed to deserialize modern resources: {e}"))
-            });
-        }
-        let params = ListResourcesParams::default();
-        let result: ListResourcesResult = self.send_request("resources/list", params)?;
-        Ok(result.resources)
+        self.collect_catalog("resources/list", "resources")
     }
 
-    /// Lists available resource templates.
+    /// Lists all resource templates, following bounded opaque-cursor pagination.
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails.
     pub fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
-        self.ensure_initialized()?;
-        if self.is_modern() {
-            let raw =
-                self.send_modern_request("resources/templates/list", serde_json::json!({}))?;
-            let templates = raw.get("resourceTemplates").cloned().ok_or_else(|| {
-                McpError::internal_error(
-                    "Modern resources/templates/list missing resourceTemplates array",
-                )
-            })?;
-            return serde_json::from_value(templates).map_err(|e| {
-                McpError::internal_error(format!(
-                    "Failed to deserialize modern resource templates: {e}"
-                ))
-            });
-        }
-        let params = ListResourceTemplatesParams::default();
-        let result: ListResourceTemplatesResult =
-            self.send_request("resources/templates/list", params)?;
-        Ok(result.resource_templates)
+        self.collect_catalog("resources/templates/list", "resourceTemplates")
     }
 
     /// Reads a resource by URI.
@@ -728,25 +839,13 @@ impl TestClient {
         Ok(result.contents)
     }
 
-    /// Lists available prompts.
+    /// Lists all available prompts, following bounded opaque-cursor pagination.
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails.
     pub fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
-        self.ensure_initialized()?;
-        if self.is_modern() {
-            let raw = self.send_modern_request("prompts/list", serde_json::json!({}))?;
-            let prompts = raw.get("prompts").cloned().ok_or_else(|| {
-                McpError::internal_error("Modern prompts/list missing prompts array")
-            })?;
-            return serde_json::from_value(prompts).map_err(|e| {
-                McpError::internal_error(format!("Failed to deserialize modern prompts: {e}"))
-            });
-        }
-        let params = ListPromptsParams::default();
-        let result: ListPromptsResult = self.send_request("prompts/list", params)?;
-        Ok(result.prompts)
+        self.collect_catalog("prompts/list", "prompts")
     }
 
     /// Gets a prompt with the given arguments.
@@ -1800,6 +1899,291 @@ mod tests {
             assert!(!client.is_initialized());
             assert!(client.negotiated_mode().is_none());
             assert!(client.protocol_version().is_none());
+        }
+    }
+
+
+    fn catalog_fixture(mode: TestClientProtocolMode) -> (TestClient, MemoryTransport) {
+        let (transport, mut peer) = create_memory_transport_pair();
+        let cx = Cx::for_testing();
+        let discovery = if mode == TestClientProtocolMode::Legacy2024 {
+            serde_json::json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "serverInfo": {"name": "catalog-peer", "version": "1"},
+            })
+        } else {
+            discovery_fixture()
+        };
+        peer.send(
+            &cx,
+            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(1),
+                discovery,
+            )),
+        )
+        .unwrap();
+        let mut client = TestClient::new(transport, cx.clone()).with_protocol_mode(mode);
+        client.initialize_core().unwrap();
+        assert!(matches!(peer.recv(&cx).unwrap(), JsonRpcMessage::Request(_)));
+        if mode == TestClientProtocolMode::Legacy2024 {
+            let JsonRpcMessage::Request(initialized) = peer.recv(&cx).unwrap() else {
+                panic!("legacy initialization requires its notification");
+            };
+            assert_eq!(initialized.method, "notifications/initialized");
+        }
+        (client, peer)
+    }
+
+    fn catalog_result(
+        mode: TestClientProtocolMode,
+        field: &str,
+        name: &str,
+        cursor: Option<&str>,
+    ) -> serde_json::Value {
+        let item = match field {
+            "tools" => serde_json::json!({"name": name, "inputSchema": {"type": "object"}}),
+            "resources" => serde_json::json!({"name": name, "uri": format!("catalog://{name}")}),
+            "resourceTemplates" => serde_json::json!({
+                "name": name, "uriTemplate": format!("catalog://{name}/{{key}}"),
+            }),
+            "prompts" => serde_json::json!({"name": name, "arguments": []}),
+            _ => panic!("unknown catalog fixture"),
+        };
+        let mut result = serde_json::json!({});
+        result[field] = serde_json::json!([item]);
+        if mode != TestClientProtocolMode::Legacy2024 {
+            result["resultType"] = serde_json::json!("complete");
+            result["ttlMs"] = serde_json::json!(0);
+            result["cacheScope"] = serde_json::json!("private");
+        }
+        if let Some(cursor) = cursor {
+            result["nextCursor"] = serde_json::json!(cursor);
+        }
+        result
+    }
+
+    fn queue_catalog_result(peer: &mut MemoryTransport, id: i64, result: serde_json::Value) {
+        peer.send(
+            &Cx::for_testing(),
+            &JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::Number(id), result)),
+        )
+        .unwrap();
+    }
+
+    fn catalog_names(client: &mut TestClient, field: &str) -> McpResult<Vec<String>> {
+        match field {
+            "tools" => client.list_tools().map(|items| items.into_iter().map(|item| item.name).collect()),
+            "resources" => client
+                .list_resources()
+                .map(|items| items.into_iter().map(|item| item.name).collect()),
+            "resourceTemplates" => client
+                .list_resource_templates()
+                .map(|items| items.into_iter().map(|item| item.name).collect()),
+            "prompts" => client
+                .list_prompts()
+                .map(|items| items.into_iter().map(|item| item.name).collect()),
+            _ => panic!("unknown catalog fixture"),
+        }
+    }
+
+    #[test]
+    fn test_client_catalogs_preserve_empty_and_repeated_cursors_in_both_eras() {
+        let modes = [TestClientProtocolMode::Modern2026, TestClientProtocolMode::Auto]
+            .into_iter()
+            .chain(cfg!(feature = "legacy-2024-11-05").then_some(TestClientProtocolMode::Legacy2024));
+        for mode in modes {
+            for cursor in ["", "opaque/repeated?cursor=%2F"] {
+                for (method, field) in [
+                    ("tools/list", "tools"),
+                    ("resources/list", "resources"),
+                    ("resources/templates/list", "resourceTemplates"),
+                    ("prompts/list", "prompts"),
+                ] {
+                    let (mut client, mut peer) = catalog_fixture(mode);
+                    for (id, name, next) in [
+                        (2, "alpha", Some(cursor)),
+                        (3, "beta", Some(cursor)),
+                        (4, "gamma", None),
+                    ] {
+                        queue_catalog_result(&mut peer, id, catalog_result(mode, field, name, next));
+                    }
+                    assert_eq!(catalog_names(&mut client, field).unwrap(), ["alpha", "beta", "gamma"]);
+                    let mut first_meta = None;
+                    for id in 2..=4 {
+                        let JsonRpcMessage::Request(request) = peer.recv(&Cx::for_testing()).unwrap() else {
+                            panic!("every page must be requested");
+                        };
+                        assert_eq!(request.method, method);
+                        assert_eq!(request.id, Some(RequestId::Number(id)));
+                        let params = request.params.unwrap();
+                        if id == 2 {
+                            assert!(params.get("cursor").is_none());
+                            first_meta = params.get("_meta").cloned();
+                        } else {
+                            assert_eq!(params["cursor"], cursor);
+                            assert_eq!(params.get("_meta"), first_meta.as_ref());
+                        }
+                    }
+                    client.close();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_client_catalog_limits_refuse_without_returning_partial_results() {
+        for (limits, expected) in [
+            (
+                TestClientPaginationLimits { max_pages: 1, ..TestClientPaginationLimits::default() },
+                "Automatic pagination page limit exceeded",
+            ),
+            (
+                TestClientPaginationLimits { max_items: 1, ..TestClientPaginationLimits::default() },
+                "Automatic pagination item limit exceeded",
+            ),
+            (
+                TestClientPaginationLimits { max_serialized_bytes: 200, ..TestClientPaginationLimits::default() },
+                "Automatic pagination serialized-byte limit exceeded",
+            ),
+        ] {
+            for field in ["tools", "resources", "resourceTemplates", "prompts"] {
+                let mode = TestClientProtocolMode::Modern2026;
+                let (client, mut peer) = catalog_fixture(mode);
+                let mut client = client.with_pagination_limits(limits).unwrap();
+                queue_catalog_result(&mut peer, 2, catalog_result(mode, field, "alpha", Some("next")));
+                queue_catalog_result(&mut peer, 3, catalog_result(mode, field, "beta", None));
+                let error = catalog_names(&mut client, field).expect_err("no partial catalog is success");
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert_eq!(error.message, expected);
+                let expected_next_id = if limits.max_pages == 1 { 3 } else { 4 };
+                assert_eq!(client.next_id.load(Ordering::SeqCst), expected_next_id);
+                client.close();
+            }
+        }
+    }
+
+
+    #[test]
+    fn test_client_catalog_byte_limit_counts_open_result_members() {
+        let modes = [TestClientProtocolMode::Modern2026, TestClientProtocolMode::Auto]
+            .into_iter()
+            .chain(cfg!(feature = "legacy-2024-11-05").then_some(TestClientProtocolMode::Legacy2024));
+        for mode in modes {
+            for field in ["tools", "resources", "resourceTemplates", "prompts"] {
+                for note_bytes in [0, 1_000] {
+                    let (client, mut peer) = catalog_fixture(mode);
+                    let mut client = client
+                        .with_pagination_limits(TestClientPaginationLimits {
+                            max_serialized_bytes: 1_000,
+                            ..TestClientPaginationLimits::default()
+                        })
+                        .unwrap();
+                    queue_catalog_result(
+                        &mut peer,
+                        2,
+                        catalog_result(mode, field, "alpha", Some("next")),
+                    );
+                    let mut second = catalog_result(mode, field, "beta", None);
+                    second["x-page-note"] = serde_json::json!("x".repeat(note_bytes));
+                    queue_catalog_result(&mut peer, 3, second);
+                    let result = catalog_names(&mut client, field);
+                    if note_bytes == 0 {
+                        assert_eq!(result.unwrap(), ["alpha", "beta"]);
+                    } else {
+                        let error = result.expect_err("open members count toward the traversal bound");
+                        assert_eq!(error.code, McpErrorCode::InternalError);
+                        assert_eq!(
+                            error.message,
+                            "Automatic pagination serialized-byte limit exceeded",
+                        );
+                    }
+                    assert_eq!(client.next_id.load(Ordering::SeqCst), 4);
+                    client.close();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_client_catalog_cursor_limit_is_checked_before_continuation() {
+        for length in [MAX_CATALOG_CURSOR_BYTES, MAX_CATALOG_CURSOR_BYTES + 1] {
+            let mode = TestClientProtocolMode::Modern2026;
+            let (mut client, mut peer) = catalog_fixture(mode);
+            let cursor = "x".repeat(length);
+            queue_catalog_result(&mut peer, 2, catalog_result(mode, "tools", "alpha", Some(&cursor)));
+            queue_catalog_result(&mut peer, 3, catalog_result(mode, "tools", "beta", None));
+            if length == MAX_CATALOG_CURSOR_BYTES {
+                assert_eq!(client.list_tools().unwrap().len(), 2);
+                assert_eq!(client.next_id.load(Ordering::SeqCst), 4);
+            } else {
+                let error = client.list_tools().expect_err("oversized cursor is never forwarded");
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert_eq!(error.message, "Automatic pagination cursor byte limit exceeded");
+                assert_eq!(client.next_id.load(Ordering::SeqCst), 3);
+            }
+            client.close();
+        }
+    }
+
+    #[test]
+    fn test_client_catalog_second_page_admission_failure_returns_no_partial_result() {
+        let mode = TestClientProtocolMode::Modern2026;
+        let (mut client, mut peer) = catalog_fixture(mode);
+        queue_catalog_result(&mut peer, 2, catalog_result(mode, "tools", "alpha", Some("next")));
+        let mut invalid = catalog_result(mode, "tools", "beta", None);
+        invalid["tools"] = serde_json::json!("not an array");
+        queue_catalog_result(&mut peer, 3, invalid);
+        let error = client.list_tools().expect_err("the admitted first page is not a complete catalog");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(!client.is_initialized());
+        assert!(client.transport().is_closed());
+    }
+
+    #[test]
+    fn test_client_catalog_cancellation_during_continuation_returns_no_partial_result() {
+        use std::time::Duration;
+
+        let mode = TestClientProtocolMode::Modern2026;
+        let (mut client, mut peer) = catalog_fixture(mode);
+        let cancellation = client.cx.clone();
+        let handle = std::thread::spawn(move || {
+            let clock = Cx::for_testing();
+            let cx = Cx::for_testing_with_budget(clock.budget_for_timeout(Duration::from_secs(5)));
+            let JsonRpcMessage::Request(first) = peer.recv(&cx).unwrap() else {
+                panic!("first catalog request");
+            };
+            assert_eq!(first.id, Some(RequestId::Number(2)));
+            queue_catalog_result(&mut peer, 2, catalog_result(mode, "tools", "alpha", Some("next")));
+            let JsonRpcMessage::Request(second) = peer.recv(&cx).unwrap() else {
+                panic!("continuation catalog request");
+            };
+            assert_eq!(second.id, Some(RequestId::Number(3)));
+            assert_eq!(second.params.unwrap()["cursor"], "next");
+            cancellation.set_cancel_requested(true);
+            peer
+        });
+        let result = client.list_tools();
+        let _peer = handle.join().expect("bounded peer settles");
+        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+        assert!(client.transport().is_closed());
+    }
+
+    #[test]
+    fn test_client_catalog_limits_reject_invalid_configuration() {
+        for limits in [
+            TestClientPaginationLimits { max_pages: 0, ..TestClientPaginationLimits::default() },
+            TestClientPaginationLimits { max_pages: 1_025, ..TestClientPaginationLimits::default() },
+            TestClientPaginationLimits { max_items: 0, ..TestClientPaginationLimits::default() },
+            TestClientPaginationLimits { max_items: 100_001, ..TestClientPaginationLimits::default() },
+            TestClientPaginationLimits { max_serialized_bytes: 1, ..TestClientPaginationLimits::default() },
+            TestClientPaginationLimits { max_serialized_bytes: 64 * 1024 * 1024 + 1, ..TestClientPaginationLimits::default() },
+        ] {
+            let (transport, _peer) = create_memory_transport_pair();
+            let error = TestClient::new(transport, Cx::for_testing())
+                .with_pagination_limits(limits)
+                .unwrap_err();
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
         }
     }
 
