@@ -851,7 +851,9 @@ pub struct CompletionParams {
 }
 
 impl CompletionParams {
-    fn into_legacy(self) -> McpResult<fastmcp_protocol::LegacyCompletionParams> {
+    /// Projects the lossless subset onto the exact MCP 2024-11-05 wire shape.
+    /// A prompt title or completion context cannot be represented in that era.
+    pub fn into_legacy(self) -> McpResult<fastmcp_protocol::LegacyCompletionParams> {
         if self.context.is_some() {
             return Err(McpError::invalid_params(
                 "MCP 2024-11-05 completion cannot represent completion context",

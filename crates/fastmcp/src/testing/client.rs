@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use asupersync::Cx;
-use fastmcp_client::{MemoryClient, MemoryClientBuilder};
+use fastmcp_client::{CompletionParams, MemoryClient, MemoryClientBuilder};
 use fastmcp_core::{McpError, McpErrorCode, McpResult};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
@@ -846,6 +846,19 @@ impl TestClient {
     /// Returns an error if the request fails.
     pub fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
         self.collect_catalog("prompts/list", "prompts")
+    }
+
+    /// Completes a prompt argument or resource-template variable in the negotiated era.
+    /// Exact MCP 2024-11-05 refuses a prompt title or context before sending a request.
+    pub fn complete(&mut self, params: CompletionParams) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let parameters = if self.is_modern() {
+            serde_json::to_value(params)
+        } else {
+            serde_json::to_value(params.into_legacy()?)
+        }
+        .map_err(|_| McpError::invalid_params("Invalid TestClient completion parameters"))?;
+        self.request_core(fastmcp_protocol::methods::COMPLETION_COMPLETE, parameters)
     }
 
     /// Gets a prompt with the given arguments.
@@ -1961,6 +1974,61 @@ mod tests {
             result["nextCursor"] = serde_json::json!(cursor);
         }
         result
+    }
+
+    #[test]
+    fn test_client_completion_uses_the_negotiated_wire_contract() {
+        for mode in [
+            TestClientProtocolMode::Modern2026,
+            TestClientProtocolMode::Auto,
+        ]
+        .into_iter()
+        .chain(cfg!(feature = "legacy-2024-11-05").then_some(TestClientProtocolMode::Legacy2024))
+        {
+            let (mut client, mut peer) = catalog_fixture(mode);
+            let legacy = mode == TestClientProtocolMode::Legacy2024;
+            let mut params = serde_json::json!({
+                "ref": {"type": "ref/prompt", "name": "deploy", "title": "Deploy"},
+                "argument": {"name": "environment", "value": "sta"},
+                "context": {"arguments": {"region": "west"}},
+            });
+            let mut reply = serde_json::json!({"completion": {"values": ["staging"]}});
+            if legacy {
+                // Each final-only field must be refused individually before publication.
+                let mut with_title = params.clone();
+                with_title.as_object_mut().unwrap().remove("context");
+                params["ref"].as_object_mut().unwrap().remove("title");
+                for unsupported in [with_title, params.clone()] {
+                    let error = client
+                        .complete(serde_json::from_value(unsupported).unwrap())
+                        .unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::InvalidParams);
+                }
+                params.as_object_mut().unwrap().remove("context");
+            } else {
+                reply["resultType"] = serde_json::json!("complete");
+            }
+            queue_catalog_result(&mut peer, 2, reply);
+            let result = client
+                .complete(serde_json::from_value(params.clone()).unwrap())
+                .unwrap();
+            assert!(match result {
+                CoreResult::Legacy(LegacyCoreResult::Completion(_)) => legacy,
+                CoreResult::Final(FinalCoreResult::Completion { .. }) => !legacy,
+                _ => false,
+            });
+            let JsonRpcMessage::Request(request) = peer.recv(&client.cx).unwrap() else {
+                panic!("expected a completion request");
+            };
+            assert_eq!(request.id, Some(RequestId::Number(2)));
+            assert_eq!(request.method, "completion/complete");
+            let mut sent = request.params.unwrap();
+            assert_eq!(
+                sent.as_object_mut().unwrap().remove("_meta").is_none(),
+                legacy
+            );
+            assert_eq!(sent, params);
+        }
     }
 
     fn queue_catalog_result(peer: &mut MemoryTransport, id: i64, result: serde_json::Value) {

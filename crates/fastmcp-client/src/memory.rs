@@ -1127,6 +1127,25 @@ impl MemoryClient {
             .map(|(result, _)| result)
     }
 
+    /// Completes a prompt argument or resource-template variable in MCP 2026-07-28.
+    /// The caller owns cancellation, and the result retains its original wire metadata.
+    pub async fn complete(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: crate::CompletionParams,
+    ) -> McpResult<CoreResult> {
+        let parameters = serde_json::to_value(params)
+            .map_err(|_| McpError::invalid_params("Invalid Memory completion parameters"))?;
+        self.request_core(
+            cx,
+            cancellation,
+            fastmcp_protocol::methods::COMPLETION_COMPLETE,
+            parameters,
+        )
+        .await
+    }
+
     /// Calls a tool, following input-required results through installed handlers.
     ///
     /// [`MemoryClientBuilder::reverse_request_handlers`] enables continuations
@@ -1836,6 +1855,67 @@ mod tests {
                 .any(|version| version == "2026-07-28")
         );
         (client, peer)
+    }
+
+    #[test]
+    fn typed_memory_completion_preserves_context_result_and_caller_cancellation() {
+        run(|cx| async move {
+            let (mut client, mut peer) = connected(&cx).await;
+            let wire = json!({
+                "ref": {"type": "ref/prompt", "name": "deploy", "title": "Deploy"},
+                "argument": {"name": "environment", "value": "sta"},
+                "context": {"arguments": {"region": "west"}}
+            });
+            let params: crate::CompletionParams = serde_json::from_value(wire.clone()).unwrap();
+            let cancelled = McpRequestCancellation::new();
+            cancelled.cancel();
+            assert_eq!(
+                client
+                    .complete(&cx, &cancelled, params.clone())
+                    .await
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::RequestCancelled
+            );
+
+            let live = McpRequestCancellation::new();
+            let reply = serde_json::from_str(
+                r#"{"resultType":"complete","completion":{"values":["staging"]},"com.example/exact":7.30e-2}"#,
+            )
+            .unwrap();
+            peer.send_async(&cx, &response(2, reply)).await.unwrap();
+            let result = client.complete(&cx, &live, params.clone()).await.unwrap();
+            assert!(matches!(
+                &result,
+                CoreResult::Final(FinalCoreResult::Completion { .. })
+            ));
+            assert!(result.encode().unwrap().contains("7.30e-2"));
+            let mut sent = receive(&cx, &mut peer, "completion/complete", Some(2))
+                .await
+                .params
+                .unwrap();
+            let meta = sent.as_object_mut().unwrap().remove("_meta").unwrap();
+            assert_eq!(
+                meta[fastmcp_protocol::FINAL_PROTOCOL_VERSION_META_KEY],
+                MODERN_PROTOCOL_VERSION
+            );
+            assert_eq!(sent, wire);
+
+            peer.send_async(
+                &cx,
+                &response(
+                    3,
+                    json!({
+                        "resultType": "input_required",
+                        "inputRequests": {"roots": {"method": "roots/list"}},
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(client.complete(&cx, &live, params).await.is_err());
+            receive(&cx, &mut peer, "completion/complete", Some(3)).await;
+        });
     }
 
     async fn result(
