@@ -6498,6 +6498,9 @@ impl ClientHttpConnection {
             .validate_legacy_capabilities(client_capabilities)
             .map_err(ClientHttpConnectionError::LegacyCallbackConfiguration)?;
         let caller = legacy_receive_pump_caller(cx)?;
+        client
+            .admit_send(&caller)
+            .map_err(ClientHttpConnectionError::Legacy)?;
         let reader = client
             .take_reader()
             .ok_or(ClientHttpConnectionError::LegacyPersistentReceiverUnavailable)?;
@@ -6721,6 +6724,12 @@ impl ClientHttpConnection {
                         .await
                         .map(ClientHttpResponse::Legacy);
                 }
+                // This path retains the outbound send's uncertain-commit
+                // receipt, but must share the direct client's generation
+                // admission before contacting its advertised POST endpoint.
+                client
+                    .admit_send(cx)
+                    .map_err(ClientHttpConnectionError::Legacy)?;
                 if cancelled_response_ids
                     .iter()
                     .any(|cancelled_id| cancelled_id.correlates_with(&request_id))
@@ -12544,6 +12553,28 @@ impl LegacySseHttpClient {
         self.stream.take()
     }
 
+    /// Admits a new effect on this exact SSE generation. A refused or expired
+    /// reader cannot be promoted into a new receive pump or authorize a POST.
+    /// Already received events remain readable until a new effect is attempted.
+    fn admit_send(&mut self, cx: &Cx) -> Result<(), LegacySseHttpClientError> {
+        if cx.checkpoint().is_err() {
+            return Err(LegacySseHttpClientError::Cancelled);
+        }
+        if self.closed {
+            return Err(LegacySseHttpClientError::Closed);
+        }
+        if let Some(stream) = self.stream.as_mut() {
+            if stream.has_ended() {
+                return Err(LegacySseHttpClientError::StreamGenerationEnded);
+            }
+            if let Some(error) = stream.expired_lifetime(cx.now()) {
+                stream.close_for_cancellation();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     /// Sends one legacy JSON-RPC envelope to the validated advertised POST URL.
     ///
     /// The legacy request intentionally carries no final-MCP metadata headers.
@@ -12554,19 +12585,7 @@ impl LegacySseHttpClient {
         cx: &Cx,
         message: &JsonRpcMessage,
     ) -> Result<(), LegacySseHttpClientError> {
-        if cx.checkpoint().is_err() {
-            return Err(LegacySseHttpClientError::Cancelled);
-        }
-        if self.closed {
-            return Err(LegacySseHttpClientError::Closed);
-        }
-        if self
-            .stream
-            .as_ref()
-            .is_some_and(LegacySseResponseStream::has_ended)
-        {
-            return Err(LegacySseHttpClientError::StreamGenerationEnded);
-        }
+        self.admit_send(cx)?;
         self.outbound()
             .send(cx, message)
             .await
@@ -12602,7 +12621,16 @@ impl LegacySseHttpClient {
             .stream
             .as_mut()
             .ok_or(LegacySseHttpClientError::ReceiverOwnedByReadyClient)?;
-        let message = next_legacy_sse_message(stream, cx).await?;
+        let message = match next_legacy_sse_message(stream, cx).await {
+            Ok(message) => message,
+            Err(error) => {
+                // Envelope admission and repeated endpoint events fail above
+                // the body reader. They revoke this generation just like an
+                // I/O failure; a later call must not POST into its old session.
+                stream.close_for_cancellation();
+                return Err(error);
+            }
+        };
         if matches!(message, Some(JsonRpcMessage::Response(_))) {
             stream.response_received();
         }
@@ -26052,6 +26080,264 @@ mod tests {
         assert_eq!(notification.method, "notifications/progress");
         assert!(connection.take_legacy_notification().is_none());
         server.join().expect("legacy request server must join");
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[derive(Clone, Copy)]
+    enum LegacyConnectionEnding {
+        Response,
+        Eof,
+        InvalidMessage,
+        RepeatedEndpoint,
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn assert_legacy_connection_generation_admission(ending: LegacyConnectionEnding) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_target = message_target.clone();
+        let (done, finished) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+            let mut sse = accept_legacy_test_peer(&listener, &finished, deadline)
+                .unwrap()
+                .expect("public connection opens its SSE generation");
+            assert!(read_request(&mut sse).head.starts_with("GET /legacy-sse "));
+            begin_chunked_sse(&mut sse);
+            let endpoint = format!("event: endpoint\ndata: {advertised_target}\n\n");
+            write_chunked_sse_event(&mut sse, &endpoint);
+
+            let mut post = accept_legacy_test_peer(&listener, &finished, deadline)
+                .unwrap()
+                .expect("the live generation admits its first request");
+            let request = read_request(&mut post);
+            assert!(request.head.starts_with("POST /legacy-message "));
+            let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(request["id"], 41);
+            assert_eq!(request["method"], "ping");
+            match ending {
+                LegacyConnectionEnding::Response => write_chunked_sse_event(
+                    &mut sse,
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":41,\"result\":{\"ok\":true}}\n\n",
+                ),
+                LegacyConnectionEnding::Eof => {}
+                LegacyConnectionEnding::InvalidMessage => {
+                    write_chunked_sse_event(&mut sse, "event: message\ndata: {invalid}\n\n");
+                }
+                LegacyConnectionEnding::RepeatedEndpoint => {
+                    write_chunked_sse_event(&mut sse, &endpoint);
+                }
+            }
+            // The SSE bytes and EOF precede the POST acknowledgement. A
+            // successfully admitted response must remain observable, while
+            // an absent/invalid response must revoke subsequent POSTs.
+            finish_chunked_sse(&mut sse);
+            write_response(&mut post, 202, "application/json", b"");
+            let mut posts = 1;
+            while let Some(mut unexpected) =
+                accept_legacy_test_peer(&listener, &finished, deadline).unwrap()
+            {
+                let request = read_request(&mut unexpected);
+                assert!(request.head.starts_with("POST /legacy-message "));
+                posts += 1;
+                // Respond even to a forbidden POST so the planted regression
+                // fails on the typed result/count, without stranding a client.
+                write_response(&mut unexpected, 202, "application/json", b"");
+            }
+            posts
+        });
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let mut connection = runtime
+            .block_on(
+                ClientBuilder::new()
+                    .protocol_plan(plan(
+                        "http://127.0.0.1:9/unused-modern",
+                        &sse_target,
+                        &message_target,
+                        ProtocolPolicy::LegacyOnly,
+                    ))
+                    .connect_http_with_cx(&cx),
+            )
+            .unwrap();
+        let result = runtime.block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(41),
+            4096,
+        ));
+        match ending {
+            LegacyConnectionEnding::Response => {
+                let response = result.expect("a response before EOF is still delivered");
+                assert_eq!(response.id, Some(RequestId::Number(41)));
+                assert_eq!(response.result, Some(serde_json::json!({"ok":true})));
+            }
+            LegacyConnectionEnding::Eof => assert!(matches!(
+                result,
+                Err(ClientHttpConnectionError::LegacyResponseStreamEnded {
+                    request_id: RequestId::Number(41),
+                })
+            )),
+            LegacyConnectionEnding::InvalidMessage => assert!(matches!(
+                result,
+                Err(ClientHttpConnectionError::Legacy(
+                    LegacySseHttpClientError::MessageDecodeFailed
+                ))
+            )),
+            LegacyConnectionEnding::RepeatedEndpoint => assert!(matches!(
+                result,
+                Err(ClientHttpConnectionError::Legacy(
+                    LegacySseHttpClientError::UnexpectedEndpointEvent
+                ))
+            )),
+        }
+        if !matches!(ending, LegacyConnectionEnding::Response) {
+            let result = runtime.block_on(connection.request_json(
+                &cx,
+                "ping",
+                serde_json::json!({}),
+                RequestId::Number(42),
+                4096,
+            ));
+            assert!(matches!(
+                result,
+                Err(ClientHttpConnectionError::Legacy(
+                    LegacySseHttpClientError::StreamGenerationEnded
+                ))
+            ));
+            let result = runtime.block_on(connection.start_legacy_request(
+                &cx,
+                "ping",
+                serde_json::json!({}),
+                RequestId::Number(43),
+            ));
+            assert!(matches!(
+                result,
+                Err(ClientHttpConnectionError::Legacy(
+                    LegacySseHttpClientError::StreamGenerationEnded
+                ))
+            ));
+            assert!(connection.legacy_persistent_receiver().is_none());
+        }
+        assert!(
+            cx.checkpoint().is_ok(),
+            "generation failure is not caller cancellation"
+        );
+        signal_legacy_test_peer_stop(&done);
+        assert_eq!(server.join().unwrap(), 1, "no POST reuses a revoked endpoint");
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_http_connection_preserves_response_before_eof_and_post_ack() {
+        assert_legacy_connection_generation_admission(LegacyConnectionEnding::Response);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_http_connection_eof_revokes_post_and_receive_pump_admission() {
+        assert_legacy_connection_generation_admission(LegacyConnectionEnding::Eof);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_http_connection_invalid_message_revokes_post_and_receive_pump_admission() {
+        assert_legacy_connection_generation_admission(LegacyConnectionEnding::InvalidMessage);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_http_connection_repeated_endpoint_revokes_post_and_receive_pump_admission() {
+        assert_legacy_connection_generation_admission(LegacyConnectionEnding::RepeatedEndpoint);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn assert_legacy_expiry_before_post(expire: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_target = message_target.clone();
+        let (done, finished) = mpsc::sync_channel(1);
+        let peer = thread::spawn(move || {
+            let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+            let mut sse = accept_legacy_test_peer(&listener, &finished, deadline)
+                .unwrap()
+                .expect("open direct legacy generation");
+            assert!(read_request(&mut sse).head.starts_with("GET /legacy-sse "));
+            begin_chunked_sse(&mut sse);
+            write_chunked_sse_event(
+                &mut sse,
+                &format!("event: endpoint\ndata: {advertised_target}\n\n"),
+            );
+            let mut posts = 0;
+            while let Some(mut post) =
+                accept_legacy_test_peer(&listener, &finished, deadline).unwrap()
+            {
+                assert!(read_request(&mut post).head.starts_with("POST /legacy-message "));
+                posts += 1;
+                write_response(&mut post, 202, "application/json", b"");
+            }
+            posts
+        });
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let mut client = runtime
+            .block_on(super::LegacySseHttpClient::connect(
+                &cx,
+                plan(
+                    "http://127.0.0.1:9/unused-modern",
+                    &sse_target,
+                    &message_target,
+                    ProtocolPolicy::LegacyOnly,
+                ),
+            ))
+            .unwrap();
+        if expire {
+            client.set_stream_lifetime(Duration::from_nanos(1)).unwrap();
+        }
+        // No read discovers expiry first: outbound admission itself must
+        // retire an expired generation before submitting the notification.
+        runtime.block_on(async {
+            asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+        });
+        let message = JsonRpcMessage::Request(JsonRpcRequest::notification(
+            "notifications/initialized",
+            None,
+        ));
+        let result = runtime.block_on(client.send(&cx, &message));
+        if expire {
+            assert!(matches!(
+                result,
+                Err(LegacySseHttpClientError::SseStreamLifetimeExpired)
+            ));
+            assert!(matches!(
+                runtime.block_on(client.send(&cx, &message)),
+                Err(LegacySseHttpClientError::StreamGenerationEnded)
+            ));
+            assert!(runtime.block_on(client.next_message(&cx)).unwrap().is_none());
+        } else {
+            result.expect("an unexpired generation admits the same notification");
+        }
+        signal_legacy_test_peer_stop(&done);
+        assert_eq!(peer.join().unwrap(), usize::from(!expire));
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_http_generation_unexpired_admits_notification() {
+        assert_legacy_expiry_before_post(false);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_http_generation_expired_refuses_notification_without_read_or_post() {
+        assert_legacy_expiry_before_post(true);
     }
 
     #[cfg(feature = "legacy-2024-11-05")]
