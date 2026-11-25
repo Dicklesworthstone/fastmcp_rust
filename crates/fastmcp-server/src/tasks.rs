@@ -1608,8 +1608,9 @@ pub trait FinalTaskStore: Send + Sync {
     /// request-local cancellation. A write that may have committed must report
     /// that uncertainty instead of treating cancellation as proof of rollback.
     /// Worker mutations, service recovery, and dispatch election also have
-    /// asynchronous entrypoints. Lease maintenance and drop-time restoration
-    /// remain bounded synchronous operations; these hooks do not establish a
+    /// asynchronous entrypoints. Dispatch renewal may also await caller-owned
+    /// storage. Final lease release and drop-time restoration remain bounded
+    /// synchronous operations; these hooks do not establish a
     /// persistent or completely asynchronous Task backend.
     fn get_task_access_metadata_with_context<'a>(
         &'a self,
@@ -2657,6 +2658,37 @@ pub trait FinalTaskStore: Send + Sync {
         Err(McpError::internal_error(
             "Final task store does not implement durable handoff lease renewal",
         ))
+    }
+
+    /// Renews the exact elected owner through caller-owned storage I/O.
+    ///
+    /// Preserve the synchronous operation's task, generation, owner and fence
+    /// comparison in one atomic mutation. Recheck caller cancellation and the
+    /// backend's lease, retention and execution deadlines immediately before
+    /// writing after any suspension. Waiting must not revive an expired lease,
+    /// replace its owner, reset attempts, or extend an execution deadline.
+    ///
+    /// Durable Task cancellation may still renew the same elected fence for
+    /// the executor's bounded cooperative cleanup. It never permits starting a
+    /// new invocation, and cancellation of the caller itself prevents renewal.
+    ///
+    /// Return the actual renewal receipt. A pending renewal prevents another
+    /// application poll, and its wait consumes the original execution budget.
+    /// Dropping this future must obey [FinalTaskStoreFuture]'s cancellation
+    /// contract; an uncertain renewal remains protected by the same finite
+    /// owner lease and never authorizes a new application invocation.
+    fn renew_handoff_dispatch_if_current_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+        generation: u64,
+        owner_id: &'a str,
+        dispatch_fence: u64,
+    ) -> FinalTaskStoreFuture<'a, bool> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.renew_handoff_dispatch_if_current(task_id, generation, owner_id, dispatch_fence)
+        })
     }
 
     /// Returns a positive interval strictly shorter than the store's elected
@@ -10175,17 +10207,6 @@ impl FinalTaskRuntime {
             .begin_handoff_dispatch_for_owner_if_current(task_id, generation, owner_id)
     }
 
-    fn renew_handoff_dispatch(
-        &self,
-        task_id: &FinalTaskId,
-        generation: u64,
-        owner_id: &str,
-        dispatch_fence: u64,
-    ) -> McpResult<bool> {
-        self.store
-            .renew_handoff_dispatch_if_current(task_id, generation, owner_id, dispatch_fence)
-    }
-
     fn handoff_dispatch_lease_heartbeat_interval(&self) -> McpResult<StdDuration> {
         let interval = self.store.handoff_dispatch_lease_heartbeat_interval()?;
         if interval.is_zero() {
@@ -11415,7 +11436,9 @@ impl FinalTaskHandoffExecutor {
         if guard.retire_if_cancellation_requested()? {
             return Ok(());
         }
-        guard.ensure_live_dispatch_for_application()?;
+        guard
+            .ensure_live_dispatch_for_application_with_cx(cx, cancellation_wake)
+            .await?;
         if guard.pending_write.application_closed() {
             return Err(McpError::request_cancelled());
         }
@@ -11459,6 +11482,7 @@ impl FinalTaskHandoffExecutor {
                             .min(StdDuration::from_nanos(deadline.duration_since(cx.now())))
                     });
             let mut heartbeat = Box::pin(asupersync::time::sleep(cx.now(), heartbeat_interval));
+            let mut renewal = recovery::FinalTaskLeaseRenewal::default();
             let completed = std::future::poll_fn(|task_context| {
                 // A backend may have committed and parked its receipt. Settle
                 // only that provider before checking the now-consumed lease;
@@ -11498,9 +11522,6 @@ impl FinalTaskHandoffExecutor {
                     Ok(false) => {}
                     Err(error) => return std::task::Poll::Ready(Some(Err(error))),
                 }
-                if let Err(error) = guard.ensure_live_dispatch_for_application() {
-                    return std::task::Poll::Ready(Some(Err(error)));
-                }
                 cancellation_wake.register_waker(task_context.waker());
                 if !supervisor_started {
                     match guard.is_cancellation_requested() {
@@ -11525,6 +11546,43 @@ impl FinalTaskHandoffExecutor {
                 // including a simultaneously-ready late success. On grace
                 // expiry the future is dropped below before the runner
                 // publishes terminal cancellation.
+                if cancellation_grace
+                    .as_mut()
+                    .is_some_and(|grace| grace.as_mut().poll(task_context).is_ready())
+                {
+                    return std::task::Poll::Ready(Some(Ok(())));
+                }
+                // Cancellation grace keeps running while storage is pending.
+                // A timely receipt permits cooperative cleanup; expiry never
+                // grants another application poll under an unconfirmed lease.
+                match renewal.poll(cx, guard, task_context) {
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                    std::task::Poll::Ready(Ok(true)) => {}
+                    std::task::Poll::Ready(Ok(false)) => {
+                        return std::task::Poll::Ready(Some(Err(McpError::internal_error(
+                            "Final task dispatch lease was lost while application work was running",
+                        ))));
+                    }
+                    std::task::Poll::Ready(Err(error)) => {
+                        return std::task::Poll::Ready(Some(Err(error)));
+                    }
+                }
+                // A provider poll may itself publish cancellation or consume
+                // the remaining grace. Check the receipt's application
+                // boundary as well as the boundary before waiting for it.
+                match guard.is_cancellation_requested() {
+                    Ok(true) if !supervisor_started => {
+                        return std::task::Poll::Ready(Some(Ok(())));
+                    }
+                    Ok(true) if cancellation_grace.is_none() => {
+                        cancellation_grace = Some(Box::pin(asupersync::time::sleep(
+                            cx.now(),
+                            FINAL_TASK_CANCELLATION_GRACE_PERIOD,
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(error) => return std::task::Poll::Ready(Some(Err(error))),
+                }
                 if cancellation_grace
                     .as_mut()
                     .is_some_and(|grace| grace.as_mut().poll(task_context).is_ready())
@@ -11589,6 +11647,10 @@ impl FinalTaskHandoffExecutor {
                 std::task::Poll::Pending
             })
             .await;
+            // Grace expiry can select a terminal result while renewal is
+            // parked. Drop that provider before dropping the supervisor or
+            // finishing the guard's cancellation/restoration path.
+            drop(renewal);
             let Some(result) = completed else {
                 if guard.retire_if_execution_expired()? {
                     return Ok(());
@@ -11599,18 +11661,8 @@ impl FinalTaskHandoffExecutor {
                     guard.disarm();
                     return Ok(());
                 }
-                if !guard.renew()? {
-                    if guard.retire_if_execution_expired()? {
-                        return Ok(());
-                    }
-                    if guard.is_authoritatively_expired() {
-                        guard.disarm();
-                        return Ok(());
-                    }
-                    return Err(McpError::internal_error(
-                        "Final task dispatch lease was lost while application work was running",
-                    ));
-                }
+                // The next maintenance pass renews before another application
+                // poll. A second wait here could hide task cancellation grace.
                 continue;
             };
             drop(supervisor);
@@ -12206,24 +12258,9 @@ impl FinalTaskExecutionGuard {
         Ok(true)
     }
 
-    fn renew(&self) -> McpResult<bool> {
-        self.ensure_execution_authorized()?;
-        // A successful fenced transition consumes the dispatch lease. The
-        // same future may still need to finish asynchronous cleanup before a
-        // successor handoff starts. Only this private commit receipt permits
-        // that cleanup; observing a newer store generation alone does not.
-        if self.transition_committed.load(TaskServiceOrdering::Acquire) {
-            return Ok(true);
-        }
-        let Some(dispatch_fence) = self.dispatch_fence else {
-            return Ok(false);
-        };
-        self.runtime.renew_handoff_dispatch(
-            &self.task_id,
-            self.generation,
-            &self.owner_id,
-            dispatch_fence,
-        )
+    async fn renew_with_cx(&self, cx: &Cx) -> McpResult<bool> {
+        let mut renewal = recovery::FinalTaskLeaseRenewal::default();
+        std::future::poll_fn(|poll| renewal.poll(cx, self, poll)).await
     }
 
     fn ensure_execution_authorized(&self) -> McpResult<()> {
@@ -12272,8 +12309,31 @@ impl FinalTaskExecutionGuard {
         Ok(true)
     }
 
-    fn ensure_live_dispatch_for_application(&self) -> McpResult<()> {
-        if self.renew()? {
+    async fn ensure_live_dispatch_for_application_with_cx(
+        &self,
+        cx: &Cx,
+        cancellation_wake: &FinalTaskCancellationWakeRegistration,
+    ) -> McpResult<()> {
+        let mut renewal = std::pin::pin!(self.renew_with_cx(cx));
+        let renewed = std::future::poll_fn(|task| {
+            if let Err(error) = final_task_service_caller(cx) {
+                return std::task::Poll::Ready(Err(error));
+            }
+            cancellation_wake.register_waker(task.waker());
+            // No application future exists yet, so cancellation needs no
+            // cooperative grace and must not wait for a parked provider.
+            match self.is_cancellation_requested() {
+                Ok(true) => return std::task::Poll::Ready(Err(McpError::request_cancelled())),
+                Ok(false) => {}
+                Err(error) => return std::task::Poll::Ready(Err(error)),
+            }
+            renewal.as_mut().poll(task)
+        })
+        .await?;
+        if self.is_cancellation_requested()? {
+            return Err(McpError::request_cancelled());
+        }
+        if renewed {
             Ok(())
         } else {
             Err(McpError::internal_error(
@@ -17932,6 +17992,26 @@ mod tests {
                 update(&mut self.handoff, message)
             }
 
+            fn renew(&self) -> McpResult<bool> {
+                let runtime = RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 0)
+                    .build()
+                    .unwrap();
+                let caller = runtime.request_cx_with_budget(Budget::INFINITE);
+                let result = runtime.block_on(async {
+                    let host = Cx::current().unwrap();
+                    asupersync::time::timeout(
+                        host.now(),
+                        StdDuration::from_secs(2),
+                        self.guard.as_ref().unwrap().renew_with_cx(&caller),
+                    )
+                    .await
+                    .expect("the actual asynchronous renewal must remain bounded")
+                });
+                assert!(runtime.shutdown_timeout(StdDuration::from_secs(2)));
+                result
+            }
+
             fn snapshot(&self) -> FinalTaskSnapshot {
                 self.store
                     .get_task_snapshot(&self.task_id)
@@ -18059,7 +18139,7 @@ mod tests {
                             .transition_committed
                             .load(TaskServiceOrdering::Acquire)
                     );
-                    assert!(fixture.guard.as_ref().unwrap().renew().unwrap());
+                    assert!(fixture.renew().unwrap());
                     assert_final_task_payload_accounting(&fixture.store);
                     previous_generation = current.generation();
                 }
@@ -18077,7 +18157,7 @@ mod tests {
                 assert!(fixture.snapshot().generation() > previous_generation);
                 assert_eq!(fixture.events.lock().unwrap().len(), 4);
                 assert!(
-                    fixture.guard.as_ref().unwrap().renew().unwrap(),
+                    fixture.renew().unwrap(),
                     "own terminal commit still permits bounded cleanup",
                 );
                 let terminal = final_task_restoration_snapshot(&fixture.store, &fixture.task_id);
@@ -18216,7 +18296,7 @@ mod tests {
                     final_task_restoration_snapshot(&fixture.store, &fixture.task_id),
                     exhausted,
                 );
-                assert!(fixture.guard.as_ref().unwrap().renew().unwrap());
+                assert!(fixture.renew().unwrap());
                 assert_final_task_payload_accounting(&fixture.store);
             }
         }
@@ -18374,7 +18454,7 @@ mod tests {
                     reclaimed.task().base().status_message.as_deref(),
                     Some("retained")
                 );
-                assert!(!matches!(fixture.guard.as_ref().unwrap().renew(), Ok(true)));
+                assert!(!matches!(fixture.renew(), Ok(true)));
                 drop(fixture.guard.take());
                 let mut successor = recover(&fixture.runtime, resumed);
                 let mut guard = FinalTaskExecutionGuard::new(

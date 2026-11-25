@@ -11,6 +11,130 @@ use std::task::Poll;
 
 const RECOVERY_CHECKPOINT_INTERVAL: StdDuration = StdDuration::from_millis(25);
 
+/// One outstanding renewal, shared by the application-poll and maintenance
+/// paths. The owned future carries the original caller and exact lease identity;
+/// it does not borrow a mutable guard across unrelated storage or worker polls.
+#[derive(Default)]
+pub(super) struct FinalTaskLeaseRenewal {
+    operation: Option<FinalTaskStoreFuture<'static, bool>>,
+    checkpoint: Option<Pin<Box<asupersync::time::Sleep>>>,
+}
+
+impl FinalTaskLeaseRenewal {
+    pub(super) fn poll(
+        &mut self,
+        cx: &Cx,
+        guard: &FinalTaskExecutionGuard,
+        task: &mut std::task::Context<'_>,
+    ) -> Poll<McpResult<bool>> {
+        let result = self.poll_renewal(cx, guard, task);
+        if result.is_ready() {
+            // Also drop an abandoned provider before its guard can restore
+            // the lease. A completed provider is never polled a second time.
+            self.operation = None;
+            self.checkpoint = None;
+        }
+        result
+    }
+
+    fn poll_renewal(
+        &mut self,
+        cx: &Cx,
+        guard: &FinalTaskExecutionGuard,
+        task: &mut std::task::Context<'_>,
+    ) -> Poll<McpResult<bool>> {
+        let caller = match final_task_service_caller(cx) {
+            Ok(caller) => caller,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        if Self::expired(guard) {
+            return Poll::Ready(Ok(false));
+        }
+        if let Err(error) = guard.ensure_execution_authorized() {
+            return Poll::Ready(Err(error));
+        }
+        // Only this attempt's private commit receipt permits its bounded
+        // cleanup after the transition has consumed the dispatch lease.
+        if guard
+            .transition_committed
+            .load(TaskServiceOrdering::Acquire)
+        {
+            return Poll::Ready(Ok(true));
+        }
+        let Some(fence) = guard.dispatch_fence else {
+            return Poll::Ready(Ok(false));
+        };
+        let operation = self.operation.get_or_insert_with(|| {
+            let store = Arc::clone(&guard.runtime.store);
+            let task_id = guard.task_id.clone();
+            let generation = guard.generation;
+            let owner = guard.owner_id.clone();
+            Box::pin(async move {
+                CallerContextFuture::new(&caller, async {
+                    store
+                        .renew_handoff_dispatch_if_current_with_cx(
+                            &caller, &task_id, generation, &owner, fence,
+                        )
+                        .await
+                })
+                .await
+            })
+        });
+        if let Poll::Ready(result) = operation.as_mut().poll(task) {
+            // A receipt can arrive with cancellation, expiry or revocation.
+            // It may describe a committed extension but grants no application
+            // poll after the original caller or execution bound has expired.
+            if let Err(error) = final_task_service_caller(cx) {
+                return Poll::Ready(Err(error));
+            }
+            if Self::expired(guard) {
+                return Poll::Ready(Ok(false));
+            }
+            if let Err(error) = guard.ensure_execution_authorized() {
+                return Poll::Ready(Err(error));
+            }
+            return Poll::Ready(result);
+        }
+        if let Err(error) = final_task_service_caller(cx) {
+            return Poll::Ready(Err(error));
+        }
+        if Self::expired(guard) {
+            return Poll::Ready(Ok(false));
+        }
+        if let Err(error) = guard.ensure_execution_authorized() {
+            return Poll::Ready(Err(error));
+        }
+        // A silent provider cannot hide caller cancellation or the original
+        // backend execution/retention deadline. This timer only checks those
+        // bounds; it never renews a lease or resets an execution budget.
+        let checkpoint = self.checkpoint.get_or_insert_with(|| {
+            Box::pin(asupersync::time::sleep(
+                cx.now(),
+                RECOVERY_CHECKPOINT_INTERVAL,
+            ))
+        });
+        if checkpoint.as_mut().poll(task).is_ready() {
+            checkpoint.set(asupersync::time::sleep(
+                cx.now(),
+                RECOVERY_CHECKPOINT_INTERVAL,
+            ));
+            task.waker().wake_by_ref();
+        }
+        Poll::Pending
+    }
+
+    fn expired(guard: &FinalTaskExecutionGuard) -> bool {
+        let now = guard.runtime.retention_clock_now();
+        guard.is_authoritatively_expired()
+            || guard.execution_budget.is_some_and(|budget| {
+                now >= budget.total_deadline
+                    || budget
+                        .attempt_deadline
+                        .is_some_and(|deadline| now >= deadline)
+            })
+    }
+}
+
 /// Hold a validated claim across the asynchronous post-claim read. Successful
 /// transfer performs no synchronous storage access. Abandonment uses exactly
 /// the existing owner-bound execution guard's restoration rules.
@@ -577,7 +701,9 @@ impl FinalTaskExecutionGuard {
             }
             let Some(current) = await_recovery_store_while(
                 cx,
-                self.runtime.store.get_task_snapshot_with_cx(cx, &self.task_id),
+                self.runtime
+                    .store
+                    .get_task_snapshot_with_cx(cx, &self.task_id),
                 false,
                 &checkpoint,
             )
@@ -638,11 +764,7 @@ impl FinalTaskExecutionGuard {
                 cx,
                 self.runtime
                     .store
-                    .task_retention_deadline_if_current_with_cx(
-                        cx,
-                        &self.task_id,
-                        self.generation,
-                    ),
+                    .task_retention_deadline_if_current_with_cx(cx, &self.task_id, self.generation),
                 false,
                 &checkpoint,
             )
@@ -724,6 +846,7 @@ impl FinalTaskHandoffExecutor {
             let mut maintenance = None;
             let mut completed = None;
             let mut heartbeat = None;
+            let mut renewal = FinalTaskLeaseRenewal::default();
             std::future::poll_fn(|task| {
                 match std::task::ready!(Self::poll_maintenance_checkpoint(
                     cx,
@@ -736,7 +859,12 @@ impl FinalTaskHandoffExecutor {
                     Err(error) => return Poll::Ready(Err(error)),
                 }
                 if heartbeat.is_none() {
-                    let interval = match Self::renew_maintenance_lease(cx, guard) {
+                    let interval = match std::task::ready!(Self::poll_renew_maintenance_lease(
+                        cx,
+                        guard,
+                        &mut renewal,
+                        task,
+                    )) {
                         Ok(Some(interval)) => interval,
                         Ok(None) => return Poll::Ready(Ok(())),
                         Err(error) => return Poll::Ready(Err(error)),
@@ -778,7 +906,12 @@ impl FinalTaskHandoffExecutor {
                 }
                 let heartbeat = heartbeat.as_mut().expect("maintenance heartbeat is armed");
                 if heartbeat.as_mut().poll(task).is_ready() {
-                    let interval = match Self::renew_maintenance_lease(cx, guard) {
+                    let interval = match std::task::ready!(Self::poll_renew_maintenance_lease(
+                        cx,
+                        guard,
+                        &mut renewal,
+                        task,
+                    )) {
                         Ok(Some(interval)) => interval,
                         Ok(None) => return Poll::Ready(Ok(())),
                         Err(error) => return Poll::Ready(Err(error)),
@@ -851,12 +984,26 @@ impl FinalTaskHandoffExecutor {
 
     /// Renews only the guard's exact owner/fence and returns its next bounded
     /// heartbeat. A false renewal never authorizes reconstructing a lease.
-    fn renew_maintenance_lease(
+    fn poll_renew_maintenance_lease(
         cx: &Cx,
         guard: &mut FinalTaskExecutionGuard,
+        renewal: &mut FinalTaskLeaseRenewal,
+        task: &mut std::task::Context<'_>,
+    ) -> Poll<McpResult<Option<StdDuration>>> {
+        let renewed = match std::task::ready!(renewal.poll(cx, guard, task)) {
+            Ok(renewed) => renewed,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        Poll::Ready(Self::maintenance_interval_after_renewal(cx, guard, renewed))
+    }
+
+    fn maintenance_interval_after_renewal(
+        cx: &Cx,
+        guard: &mut FinalTaskExecutionGuard,
+        renewed: bool,
     ) -> McpResult<Option<StdDuration>> {
         final_task_service_caller(cx)?;
-        if !guard.renew()? {
+        if !renewed {
             if guard
                 .transition_committed
                 .load(TaskServiceOrdering::Acquire)
