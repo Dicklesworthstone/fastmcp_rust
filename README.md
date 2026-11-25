@@ -1758,6 +1758,14 @@ the task. It does not reconnect or promise replay across disconnects.
 emits one document per event; human output bounds and sanitizes fields and
 redacts recognizable credentials.
 
+For a polling-only peer, add `--poll` to `tasks watch` over HTTP, stdio, or
+WebSocket. The command uses only `tasks/get` after discovery. It waits for
+the interval in each snapshot, using one second when the peer omits
+`pollIntervalMs`. Only changed snapshots count toward `--max-events`.
+A finite Task TTL, the command timeout, and a ceiling of 4,096 follow-up
+reads bound observation. Polling continues through `input_required` so
+another client can supply input while the watch remains open.
+
 Use `--server EXECUTABLE` and repeat `--server-arg ARGUMENT` for stdio. Each
 command starts a fresh process, so previously issued task IDs require a store
 retained outside the prior process. For authenticated HTTPS, Tasks commands and

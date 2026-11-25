@@ -5380,6 +5380,7 @@ import time
 mode, task_id, log_path, transport, ready_path = sys.argv[1:]
 poll_ms = 5000 if mode == "working" else 80
 called_at = None
+reads = 0
 raw_result = r'{"content":[{"type":"text","text":"done"}],"isError":false,"com.example\/number":1.20e+4,"com.example/big":9007199254740993,"_meta":{"com.example/result":"preserved"}}'
 
 def task(status, result_type):
@@ -5410,7 +5411,7 @@ def task(status, result_type):
     return encoded
 
 def respond(request):
-    global called_at
+    global called_at, reads
     method = request["method"]
     event = {"request": request, "pid": os.getpid()}
     if called_at is not None:
@@ -5439,6 +5440,22 @@ def respond(request):
             result = '{"resultType":"complete","content":[{"type":"text","text":"immediate"}]}'
         else:
             result = task("completed" if mode == "immediate" else "working", "task")
+    elif method == "tasks/get" and mode.startswith("poll_"):
+        assert request["params"]["taskId"] == task_id
+        if called_at is not None:
+            assert event["elapsed_ms"] >= 80, "peer poll interval shortened"
+        reads += 1
+        called_at = time.monotonic()
+        status = "working" if reads <= 2 else ("input_required" if reads == 3 else "completed")
+        result = task(status, "complete")
+        if mode == "poll_replaced" and reads == 2:
+            result = result.replace('"createdAt":"2026-11-16', '"createdAt":"2026-11-15')
+        if mode == "poll_expired_terminal":
+            result = task("completed", "complete")
+        if mode in ("poll_expired", "poll_expired_terminal"):
+            result = result.replace('"ttlMs":null', '"ttlMs":1').replace('2026-11-16', '2020-01-01')
+        if mode == "poll_with_default":
+            result = result.replace(',"pollIntervalMs":80', '')
     elif method == "tasks/get":
         assert called_at is not None, "observation must follow creation"
         assert request["params"]["taskId"] == task_id
@@ -5496,17 +5513,21 @@ else:
             ready.to_str().unwrap(),
         ];
         let mut command = Command::new(get_binary_path());
-        command.args([
-            "call",
-            "background",
-            "--wait",
-            "--protocol-policy",
-            "modern-only",
-            "--timeout",
-            if mode == "working" { "1" } else { "5" },
-            "--arguments",
-            &json!({"work": task_id}).to_string(),
-        ]);
+        if mode.starts_with("poll_") {
+            command.args(["tasks", "watch", task_id, "--poll", "--timeout", "5"]);
+        } else {
+            command.args([
+                "call",
+                "background",
+                "--wait",
+                "--protocol-policy",
+                "modern-only",
+                "--timeout",
+                if mode == "working" { "1" } else { "5" },
+                "--arguments",
+                &json!({"work": task_id}).to_string(),
+            ]);
+        }
         if json_output {
             command.arg("--json");
         }
@@ -5608,6 +5629,54 @@ else:
             );
             assert!(params.get("ttlMs").is_none(), "no undeclared creation TTL");
         }
+    }
+
+    #[test]
+    fn tasks_watch_poll_observes_read_only_peers_until_terminal_or_change_limit() {
+        for http in [false, true] {
+            for limited in [false, true] {
+                let extra: &[&str] = if limited { &["--max-events", "1"] } else { &[] };
+                let (output, events) = call("poll_steps", http, true, extra);
+                assert!(output.status.success(), "{}", stderr_str(&output));
+                let mut expected = vec!["server/discover", "tasks/get", "tasks/get", "tasks/get"];
+                if !limited {
+                    expected.push("tasks/get");
+                }
+                assert_exchange(&events, &expected);
+                let docs = documents(&output);
+                assert_eq!(docs[0]["event"], "snapshot");
+                assert_eq!(docs[1]["event"], "task-updated");
+                assert_eq!(docs[1]["data"]["status"], "input_required");
+                let end = docs.last().unwrap();
+                assert_eq!(end["event"], "watch-ended");
+                if limited {
+                    assert_eq!(end["data"], json!({"reason":"max-events","updates":1}));
+                } else {
+                    assert_eq!(docs[2]["data"]["status"], "completed");
+                    assert_eq!(end["data"], json!({"reason":"task-terminal","updates":2}));
+                    assert!(stdout_str(&output).contains(r#""com.example\/number":1.20e+4"#));
+                }
+            }
+            for mode in ["poll_replaced", "poll_expired", "poll_expired_terminal"] {
+                let (output, events) = call(mode, http, true, &[]);
+                assert!(!output.status.success(), "{mode} must refuse");
+                let mut expected = vec!["server/discover", "tasks/get"];
+                if mode == "poll_replaced" {
+                    expected.push("tasks/get");
+                }
+                assert_exchange(&events, &expected);
+                assert_eq!(documents(&output).len(), usize::from(mode == "poll_replaced"), "invalid snapshot was emitted");
+            }
+        }
+    }
+
+    #[test]
+    fn tasks_watch_poll_waits_one_second_when_peer_omits_its_interval() {
+        let (output, events) = call("poll_with_default", false, true, &["--max-events", "1"]);
+        assert!(output.status.success(), "{}", stderr_str(&output));
+        assert_exchange(&events, &["server/discover", "tasks/get", "tasks/get", "tasks/get"]);
+        assert!(events[2]["elapsed_ms"].as_f64().unwrap() >= 1000.0);
+        assert!(events[3]["elapsed_ms"].as_f64().unwrap() >= 1000.0);
     }
 
     #[test]

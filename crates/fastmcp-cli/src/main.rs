@@ -25,6 +25,8 @@
 #![forbid(unsafe_code)]
 #![recursion_limit = "256"]
 
+#[cfg(feature = "tasks")]
+mod task_poll;
 #[cfg(feature = "websocket-experimental")]
 mod websocket;
 
@@ -1176,7 +1178,11 @@ enum TaskAction {
     /// Read a snapshot, then watch live notifications until a bound or stream end.
     Watch {
         task_id: String,
-        /// Maximum task notifications after the initial snapshot.
+        /// Read snapshots using tasks/get without opening a subscription.
+        /// Uses the peer interval (one second when omitted) and at most 4096 polls.
+        #[arg(long)]
+        poll: bool,
+        /// Maximum updates after the initial snapshot. Polling counts changed snapshots.
         #[arg(long, default_value_t = 100,
             value_parser = clap::value_parser!(u64).range(1..=10_000))]
         max_events: u64,
@@ -8364,7 +8370,17 @@ fn run_stdio_task(
             )?;
             output.write_event(cx, "update-acknowledged", &result)
         }
-        TaskAction::Watch { max_events, .. } => {
+        TaskAction::Watch { max_events, poll, .. } => {
+            if *poll {
+                return task_poll::watch_sync(cx, output, budget, &task_id, task, *max_events, |remaining| {
+                    client.set_request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
+                        remaining, remaining,
+                    )?)?;
+                    Ok(client
+                        .get_task_final_with_cancellation(cx, &cancellation, task_id.clone())?
+                        .task)
+                });
+            }
             output.write_event(cx, "snapshot", &task)?;
             if is_terminal_task_status(task.base().status) {
                 return output.write_event(
@@ -8451,7 +8467,19 @@ async fn run_yielding_stdio_task(
                 .await?;
             output.write_event(cx, "update-acknowledged", &result)
         }
-        TaskAction::Watch { max_events, .. } => {
+        TaskAction::Watch { max_events, poll, .. } => {
+            if *poll {
+                return task_poll::watch(cx, output, budget, &task_id, task, *max_events, async |remaining| {
+                    client.set_request_timeout_policy(fastmcp_client::RequestTimeoutPolicy::new(
+                        remaining, remaining,
+                    )?)?;
+                    Ok(client
+                        .get_task_final_with_cx(cx, &cancellation, task_id.clone())
+                        .await?
+                        .task)
+                })
+                .await;
+            }
             output.write_event(cx, "snapshot", &task)?;
             if is_terminal_task_status(task.base().status) {
                 return output.write_event(
@@ -8793,7 +8821,15 @@ async fn run_http_task(
                 .map_err(error)?;
             output.write_event(cx, "update-acknowledged", &result)
         }
-        TaskAction::Watch { max_events, .. } => {
+        TaskAction::Watch { max_events, poll, .. } => {
+            if *poll {
+                let initial = handle.task().clone();
+                let expected = handle.task_id().clone();
+                return task_poll::watch(cx, output, budget, &expected, initial, *max_events, async |_| {
+                    handle.poll(cx, &mut client).await.cloned().map_err(error)
+                })
+                .await;
+            }
             output.write_event(cx, "snapshot", handle.task())?;
             if is_terminal_task_status(handle.task().base().status) {
                 return output.write_event(
@@ -16961,7 +16997,7 @@ IFS= read -r end
                 let connection = TaskConnection { server: Some("sh".to_owned()), server_arg: Vec::new(), http_url: None, websocket_url: None, bearer_token_file: None, json: true, timeout: 5 };
                 let budget = TaskCommandBudget::new(&connection).unwrap();
                 let output = TaskOutput::new(&connection, budget);
-                let action = TaskAction::Watch { task_id: subject.clone(), max_events: 1 };
+                let action = TaskAction::Watch { task_id: subject.clone(), max_events: 1, poll: false };
                 let outcome = run_yielding_stdio_task(&cx, &mut client, &output, budget, &action, task_id.clone(), None).await;
                 if cancel {
                     assert_eq!(outcome.unwrap_err().code, fastmcp_core::McpErrorCode::RequestCancelled);

@@ -617,7 +617,7 @@ where
                 })?;
             output.write_event(cx, "update-acknowledged", &result)
         }
-        TaskAction::Watch { max_events, .. } => {
+        TaskAction::Watch { max_events, poll, .. } => {
             watch_task(
                 cx,
                 client,
@@ -625,6 +625,7 @@ where
                 budget,
                 &mut handle,
                 *max_events,
+                *poll,
                 &cancellation,
             )
             .await
@@ -641,6 +642,7 @@ async fn watch_task<IO>(
     budget: TaskCommandBudget,
     handle: &mut fastmcp_client::FinalTaskHandle,
     max_events: u64,
+    poll: bool,
     cancellation: &McpRequestCancellation,
 ) -> McpResult<()>
 where
@@ -649,6 +651,17 @@ where
     use fastmcp_client::StdioTaskSubscriptionEvent;
 
     let mut latest_task = handle.task().clone();
+    if poll {
+        let expected = handle.task_id().clone();
+        return task_poll::watch(cx, output, budget, &expected, latest_task, max_events, async |_| {
+            handle
+                .poll_with_websocket(cx, client, cancellation)
+                .await
+                .cloned()
+                .map_err(|error| operation_failure(error, "WebSocket Task read failed"))
+        })
+        .await;
+    }
     // Task timestamps retain their wire spelling; equivalent UTC offsets or
     // fractional precision must not look like a changed identity.
     let created_at = chrono::DateTime::parse_from_rfc3339(latest_task.base().created_at.as_str())
@@ -829,6 +842,52 @@ mod tests {
         json!({"jsonrpc": "2.0", "method": "notifications/tasks", "params": params})
     }
 
+    #[test]
+    fn websocket_task_watch_poll_uses_only_get_and_retains_terminal_result() {
+        RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let (client_io, peer_io) = VirtualTcpStream::pair(
+                "127.0.0.1:45251".parse().unwrap(),
+                "127.0.0.1:45252".parse().unwrap(),
+            );
+            let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+            let discovery = json!({"jsonrpc":"2.0","id":1,"result":{
+                "resultType":"complete","supportedVersions":["2026-07-28"],
+                "capabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},
+                "ttlMs":0,"cacheScope":"private"
+            }});
+            let mut initial = task("2026-07-28T00:00:00Z", "initial", false);
+            initial["pollIntervalMs"] = json!(1);
+            let terminal = task("2026-07-28T00:00:02Z", "finished", true);
+            for frame in [discovery, task_response(2, &initial), task_response(3, &terminal)] {
+                peer.send(&cx, &serde_json::from_value(frame).unwrap()).await.unwrap();
+            }
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
+                .await.unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let mut handle = client.attach_final_task(
+                &cx, &cancellation, fastmcp_protocol::FinalTaskId::parse("cli-watch-task").unwrap(),
+            ).await.unwrap();
+            let budget = TaskCommandBudget {
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(3),
+            };
+            let output = TaskOutput { json: true, budget };
+            watch_task(&cx, &mut client, &output, budget, &mut handle, 1, true, &cancellation)
+                .await.unwrap();
+            assert_eq!(serde_json::to_value(handle.task()).unwrap(), terminal);
+            client.close(&cx).await.unwrap();
+            for (index, method) in ["server/discover", "tasks/get", "tasks/get"].into_iter().enumerate() {
+                let message = asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(1),
+                    Box::pin(peer.recv(&cx))).await.unwrap().unwrap();
+                let JsonRpcMessage::Request(request) = message else { panic!("expected request") };
+                assert_eq!(request.method, method);
+                assert_eq!(request.id, Some(RequestId::Number((index + 1) as i64)));
+            }
+        });
+    }
+
     /// Exercises the real native framing, dispatcher queue, Task handle, and
     /// CLI watch loop. A stale queued event must not consume max-events before
     /// the required authoritative read or the later terminal notification.
@@ -926,6 +985,7 @@ mod tests {
                             budget,
                             &mut handle,
                             if clock_regresses { 3 } else { 2 },
+                            false,
                             &cancellation,
                         )),
                     )
