@@ -3819,7 +3819,12 @@ mod async_handler_expansion_tests {
 /// `type`: their remaining constraints apply solely to non-null instances.
 /// Custom schemas can contain `enum`, `const`, or combinators that still reject
 /// null even when `type` admits it, or when `type` is absent altogether.
-fn uses_compact_nullable_schema(ty: &Type) -> bool {
+fn uses_compact_nullable_schema(ty: &Type, generic_params: &[Ident]) -> bool {
+    if let Type::Path(type_path) = ty
+        && is_schema_generic_param(type_path, generic_params)
+    {
+        return false;
+    }
     let Some(segment) = type_last_segment(ty) else {
         return false;
     };
@@ -3827,7 +3832,8 @@ fn uses_compact_nullable_schema(ty: &Type) -> bool {
         "String" | "str" | "char" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8"
         | "u16" | "u32" | "u64" | "u128" | "usize" | "f32" | "f64" | "bool" | "Vec" | "HashSet"
         | "BTreeSet" | "HashMap" | "BTreeMap" | "Value" => true,
-        "Option" => option_inner_type(ty).is_some_and(uses_compact_nullable_schema),
+        "Option" => option_inner_type(ty)
+            .is_some_and(|inner| uses_compact_nullable_schema(inner, generic_params)),
         _ => false,
     }
 }
@@ -3843,6 +3849,38 @@ fn is_schema_generic_param(type_path: &syn::TypePath, generic_params: &[Ident]) 
         && type_path.path.segments.len() == 1
         && type_path.path.segments[0].arguments.is_none()
         && generic_params.contains(&type_path.path.segments[0].ident)
+}
+
+/// Resolves actual missing-field behavior without probing a JSON schema.
+///
+/// Known Option syntax remains independent of the payload's provider: an
+/// inherent-only custom payload need not implement JsonSchemaType. Generic
+/// parameters and aliases use bounded trait dispatch, with a conservative
+/// fallback for handwritten providers that expose only json_schema().
+fn type_accepts_missing(ty: &Type, generic_params: &[Ident]) -> TokenStream2 {
+    match ty {
+        Type::Paren(paren) => return type_accepts_missing(&paren.elem, generic_params),
+        Type::Group(group) => return type_accepts_missing(&group.elem, generic_params),
+        Type::Reference(reference) => return type_accepts_missing(&reference.elem, generic_params),
+        // Autoref dispatch also covers generic parameters: explicit field
+        // schema overrides may intentionally omit a JsonSchemaType bound.
+        // Those providers must remain usable and conservatively required.
+        Type::Path(type_path) if is_schema_generic_param(type_path, generic_params) => {}
+        Type::Path(_) => {
+            if option_inner_type(ty).is_some() {
+                return quote! { true };
+            }
+            // Resolve wrappers by their actual implementation. A custom type
+            // named Box/Rc/Arc need not share std's missing-field behavior,
+            // and Cow must account for its owned deserialization form.
+        }
+        _ => return quote! { false },
+    }
+    quote! {{
+        use fastmcp_protocol::schema::DispatchSchema as _;
+        (&fastmcp_protocol::schema::SchemaTypeDispatch::<#ty>::new())
+            .accepts_missing(__fastmcp_schema_context)
+    }}
 }
 
 /// Generates a JSON schema type for a Rust type.
@@ -3970,7 +4008,7 @@ fn type_to_json_schema(ty: &Type, generic_params: &[Ident]) -> TokenStream2 {
             if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                 if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
                     let inner_schema = type_to_json_schema(inner_ty, generic_params);
-                    if !uses_compact_nullable_schema(inner_ty) {
+                    if !uses_compact_nullable_schema(inner_ty, generic_params) {
                         return quote! {{
                             let mut inner_schema = #inner_schema;
                             // A dialect belongs to its schema resource. A
@@ -6726,6 +6764,13 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// containers or variants. Object and boolean overrides use the same bounded
 /// schema validation and resource/reference admission as handwritten providers.
 ///
+/// Named-field presence follows the actual schema type through generic
+/// parameters, aliases, and transparent wrappers. Accepting JSON null alone
+/// never makes a field optional. Custom field deserializers still require a
+/// default to permit omission. Transparent wrappers with custom converters
+/// conservatively remain required unless their enclosing field has a default.
+/// Conditional generic/alias skips retain the explicit-default requirement.
+///
 /// Recursive and repeated derived types share bounded local `$defs` in each
 /// generated document. `Box`, `Rc`, `Arc`, and `Cow` retain their payload's
 /// schema. Generation uses an explicit context and never global state.
@@ -6829,6 +6874,35 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
         Err(error) => return error.to_compile_error().into(),
     };
 
+    let accepts_missing_impl = if let syn::Data::Struct(data) = &input.data
+        && serde_attrs.transparent
+    {
+        let payload = match transparent_schema_payload(data) {
+            Ok(payload) => payload,
+            Err(error) => return error.to_compile_error().into(),
+        };
+        let attrs = match SchemaSerdeAttrs::parse_with_directional_skips(&payload.attrs, true) {
+            Ok(attrs) => attrs,
+            Err(error) => return error.to_compile_error().into(),
+        };
+        // A custom converter can choose any Deserializer entry point. Its
+        // missing-input behavior cannot be inferred from the output schema.
+        let accepts_missing = if attrs.custom_deserializer {
+            quote! { false }
+        } else {
+            type_accepts_missing(&payload.ty, &generic_params)
+        };
+        quote! {
+            fn accepts_missing(
+                __fastmcp_schema_context: &mut fastmcp_protocol::schema::SchemaGenerator,
+            ) -> bool {
+                #accepts_missing
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let flatten_marker = if let syn::Data::Struct(data) = &input.data
         && matches!(data.fields, syn::Fields::Named(_))
         && !serde_attrs.transparent
@@ -6869,6 +6943,8 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
                 ) -> serde_json::Value {
                     #schema_impl
                 }
+
+                #accepts_missing_impl
             }
 
             #flatten_marker
@@ -7321,11 +7397,7 @@ fn generate_struct_schema(
     generate_fields_schema(&data.fields, type_desc_tokens, serde_attrs, generic_params)
 }
 
-fn generate_transparent_struct_schema(
-    data: &syn::DataStruct,
-    type_desc_tokens: &TokenStream2,
-    generic_params: &[Ident],
-) -> syn::Result<TokenStream2> {
+fn transparent_schema_payload(data: &syn::DataStruct) -> syn::Result<&syn::Field> {
     let mut serialized = None;
     let mut deserialized = None;
     for (index, field) in data.fields.iter().enumerate() {
@@ -7392,6 +7464,15 @@ fn generate_transparent_struct_schema(
             "JsonSchema serde(transparent) requires the same payload in both wire directions; implement json_schema() explicitly",
         ));
     }
+    Ok(payload)
+}
+
+fn generate_transparent_struct_schema(
+    data: &syn::DataStruct,
+    type_desc_tokens: &TokenStream2,
+    generic_params: &[Ident],
+) -> syn::Result<TokenStream2> {
+    let payload = transparent_schema_payload(data)?;
     let payload_schema = field_to_json_schema(payload, generic_params)?;
     Ok(quote! {
         {
@@ -7565,10 +7646,14 @@ fn generate_fields_schema(
 
                 // Generate schema for this field's type
                 let field_type = &field.ty;
-                let is_optional = (is_option_type(field_type) && !field_attrs.custom_deserializer)
-                    || field_attrs.default
-                    || serde_attrs.default;
-                if field_attrs.skip_serializing_if && !is_optional {
+                let statically_optional =
+                    (is_option_type(field_type) && !field_attrs.custom_deserializer)
+                        || field_attrs.default
+                        || serde_attrs.default;
+                // Keep the existing compile-time boundary for arbitrary skip
+                // predicates: generic/aliased conditional skips still need an
+                // explicit default or an authored schema.
+                if field_attrs.skip_serializing_if && !statically_optional {
                     return Err(syn::Error::new_spanned(
                         field,
                         "JsonSchema cannot represent skip_serializing_if on a required field; add a matching serde default or implement json_schema() explicitly",
@@ -7596,16 +7681,20 @@ fn generate_fields_schema(
                 property_entries.push(quote! {
                     (#schema_name.to_string(), #property_value)
                 });
-                let required = !is_optional;
+                let required = if field_attrs.default || serde_attrs.default {
+                    quote! { false }
+                } else if field_attrs.custom_deserializer {
+                    quote! { true }
+                } else {
+                    let accepts_missing = type_accepts_missing(field_type, generic_params);
+                    quote! { !(#accepts_missing) }
+                };
                 composed_properties.push(quote! {
                     let property_schema = #property_value;
-                    object.property(__fastmcp_schema_context, #schema_name, property_schema, #required);
+                    let required = #required;
+                    object.property(__fastmcp_schema_context, #schema_name, property_schema, required);
                 });
-
-                // Add to required if not optional
-                if !is_optional {
-                    required_fields.push(schema_name);
-                }
+                required_fields.push(quote! { (#schema_name, #required) });
             }
 
             if !flattened_fields.is_empty() {
@@ -7626,11 +7715,16 @@ fn generate_fields_schema(
             let deny_unknown_fields = serde_attrs.deny_unknown_fields;
             quote! {
                 {
-                    let properties: std::collections::BTreeMap<String, serde_json::Value> = vec![
+                    let properties: std::collections::BTreeMap<std::string::String, serde_json::Value> = vec![
                         #(#property_entries),*
                     ].into_iter().collect();
 
-                    let required: Vec<String> = vec![#(#required_fields.to_string()),*];
+                    let required: std::vec::Vec<(&str, bool)> = vec![#(#required_fields),*];
+                    let required: std::vec::Vec<std::string::String> = required
+                        .into_iter()
+                        .filter(|(_, required)| *required)
+                        .map(|(name, _)| name.to_string())
+                        .collect();
 
                     let mut schema = serde_json::json!({
                         "type": "object",
@@ -7692,7 +7786,7 @@ fn generate_fields_schema(
                 let num_items = item_schemas.len();
                 quote! {
                     {
-                        let items: Vec<serde_json::Value> = vec![#(#item_schemas),*];
+                        let items: std::vec::Vec<serde_json::Value> = vec![#(#item_schemas),*];
                         serde_json::json!({
                             "type": "array",
                             "prefixItems": items,
@@ -7905,7 +7999,7 @@ fn generate_enum_schema(
         };
         quote! {
             {
-                let variants: Vec<serde_json::Value> = vec![#(#variant_schemas),*];
+                let variants: std::vec::Vec<serde_json::Value> = vec![#(#variant_schemas),*];
                 let mut schema = serde_json::json!({
                     #combination: variants
                 });
@@ -8044,24 +8138,31 @@ fn generate_enum_variant_schema(
             }
         }
         SchemaEnumRepresentation::Adjacent { tag, content } => {
-            let content_optional = matches!(fields, syn::Fields::Unit)
-                || matches!(fields, syn::Fields::Unnamed(fields)
-                    if fields.unnamed.len() == 1 && is_option_type(&fields.unnamed[0].ty));
-            let required = if content_optional {
-                vec![tag]
-            } else {
-                vec![tag, content]
+            // Serde uses missing_field on an adjacent newtype's actual
+            // payload, including aliases and transparent wrappers. Field
+            // converters apply only when the content member is present.
+            let content_optional = match fields {
+                syn::Fields::Unit => quote! { true },
+                syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                    type_accepts_missing(&fields.unnamed[0].ty, generic_params)
+                }
+                _ => quote! { false },
             };
             let deny_unknown_fields = payload_attrs.deny_unknown_fields;
             Ok(quote! {
                 {
+                    let required = if #content_optional {
+                        vec![#tag]
+                    } else {
+                        vec![#tag, #content]
+                    };
                     let mut schema = serde_json::json!({
                         "type": "object",
                         "properties": {
                             #tag: { "type": "string", "const": #name },
                             #content: (#payload)
                         },
-                        "required": [#(#required),*]
+                        "required": required
                     });
                     if #deny_unknown_fields {
                         schema["additionalProperties"] = serde_json::json!(false);

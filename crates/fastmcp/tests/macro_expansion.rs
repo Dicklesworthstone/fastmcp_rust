@@ -6561,6 +6561,396 @@ mod generic_builtin_schemas {
     }
 }
 
+mod missing_value_schema_presence {
+    use super::*;
+    use fastmcp_rust::schema::{
+        AdmittedSchema, JsonSchemaType, SchemaGenerationError, SchemaGenerationLimits,
+        SchemaGenerator, admit_final_schema,
+    };
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct Envelope<T: JsonSchemaType> {
+        value: T,
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    #[serde(transparent)]
+    struct Transparent<T: JsonSchemaType>(T);
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct Newtype(Option<u8>);
+
+    type MaybeCount = Option<u8>;
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct AliasFields {
+        alias: MaybeCount,
+        boxed: Box<MaybeCount>,
+        transparent: Transparent<MaybeCount>,
+        manual: Option<ConstChoice>,
+    }
+
+    fn schema_for<T: JsonSchemaType>() -> AdmittedSchema {
+        let mut generator = SchemaGenerator::new();
+        let root = generator.subschema_for::<T>();
+        admit_final_schema(generator.finish(root).unwrap()).unwrap()
+    }
+
+    fn assert_wire_case<T>(valid: serde_json::Value, invalid: serde_json::Value)
+    where
+        T: JsonSchemaType + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let schema = schema_for::<T>();
+        schema.validate(&valid).unwrap();
+        let decoded: T = serde_json::from_value(valid).unwrap();
+        schema.validate(&serde_json::to_value(decoded).unwrap()).unwrap();
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+        assert!(serde_json::from_value::<T>(invalid).is_err());
+    }
+
+    #[test]
+    fn json_schema_missing_generic_alias_and_transparent_fields_match_serde() {
+        assert_wire_case::<Envelope<MaybeCount>>(json!({}), json!({"value": 256}));
+        assert_wire_case::<Envelope<Box<MaybeCount>>>(json!({}), json!({"value": 256}));
+        assert_wire_case::<Envelope<std::borrow::Cow<'static, MaybeCount>>>(
+            json!({}),
+            json!({"value": 256}),
+        );
+        assert_wire_case::<Envelope<Transparent<MaybeCount>>>(
+            json!({}),
+            json!({"value": 256}),
+        );
+        assert_eq!(schema_for::<AliasFields>().schema()["required"], json!([]));
+        for (name, invalid) in [
+            ("alias", json!(256)),
+            ("boxed", json!(256)),
+            ("transparent", json!(256)),
+            ("manual", json!("Denied")),
+        ] {
+            let mut wrong = json!({});
+            wrong[name] = invalid;
+            assert_wire_case::<AliasFields>(json!({}), wrong);
+        }
+        assert_wire_case::<AliasFields>(
+            json!({"alias": 255, "boxed": null, "transparent": 0, "manual": "Allowed"}),
+            json!({"alias": null, "boxed": 256}),
+        );
+
+        // These pointer schemas do not require enabling Serde's optional rc
+        // feature merely to describe their wire representation.
+        for schema in [
+            schema_for::<Envelope<std::rc::Rc<MaybeCount>>>(),
+            schema_for::<Envelope<std::sync::Arc<MaybeCount>>>(),
+        ] {
+            schema.validate(&json!({})).unwrap();
+            schema.validate(&json!({"value": null})).unwrap();
+            assert!(schema.validate(&json!({"value": 256})).is_err());
+        }
+    }
+
+    mod named_like_pointer {
+        use super::*;
+
+        #[derive(serde::Serialize, serde::Deserialize, JsonSchema)]
+        pub struct Box<T: JsonSchemaType>(pub T);
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct CustomBoxField {
+        value: named_like_pointer::Box<MaybeCount>,
+    }
+
+    #[test]
+    fn json_schema_custom_pointer_names_do_not_make_fields_optional() {
+        assert_wire_case::<Envelope<named_like_pointer::Box<MaybeCount>>>(
+            json!({"value": null}),
+            json!({}),
+        );
+        assert_wire_case::<CustomBoxField>(json!({"value": 255}), json!({}));
+        assert_wire_case::<CustomBoxField>(json!({"value": null}), json!({"value": 256}));
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, JsonSchema)]
+    #[serde(transparent)]
+    struct BorrowedOptional(Option<u8>);
+
+    // Deliberately neither Clone nor JsonSchemaType: custom ToOwned may
+    // deserialize a required ordinary newtype even when the borrowed form
+    // accepts a missing field.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct RequiredOwned(BorrowedOptional);
+
+    impl std::borrow::ToOwned for BorrowedOptional {
+        type Owned = RequiredOwned;
+
+        fn to_owned(&self) -> Self::Owned {
+            RequiredOwned(BorrowedOptional(self.0))
+        }
+    }
+
+    impl std::borrow::Borrow<BorrowedOptional> for RequiredOwned {
+        fn borrow(&self) -> &BorrowedOptional {
+            &self.0
+        }
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct ConcreteCow {
+        value: std::borrow::Cow<'static, BorrowedOptional>,
+    }
+
+    #[test]
+    fn json_schema_cow_missing_fields_follow_the_owned_wire_type() {
+        assert_wire_case::<Envelope<std::borrow::Cow<'static, BorrowedOptional>>>(
+            json!({"value": null}),
+            json!({}),
+        );
+        assert_wire_case::<ConcreteCow>(json!({"value": 255}), json!({}));
+        assert_wire_case::<ConcreteCow>(json!({"value": null}), json!({"value": 256}));
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct TraitNull;
+
+    impl JsonSchemaType for TraitNull {
+        fn schema_body(_context: &mut SchemaGenerator) -> serde_json::Value {
+            json!({"type": "null"})
+        }
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct InherentNull;
+
+    impl InherentNull {
+        fn json_schema() -> serde_json::Value {
+            json!({"type": "null"})
+        }
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct InherentNullField {
+        value: InherentNull,
+    }
+
+    #[test]
+    fn json_schema_null_admission_never_substitutes_for_missing_value_semantics() {
+        assert_wire_case::<Envelope<u8>>(json!({"value": 0}), json!({}));
+        assert_wire_case::<Envelope<serde_json::Value>>(json!({"value": null}), json!({}));
+        assert_wire_case::<Envelope<()>>(json!({"value": null}), json!({}));
+        assert_wire_case::<Envelope<Newtype>>(json!({"value": null}), json!({}));
+        assert_wire_case::<Envelope<TraitNull>>(json!({"value": null}), json!({}));
+        assert_wire_case::<InherentNullField>(json!({"value": null}), json!({}));
+        assert_eq!(
+            schema_for::<InherentNullField>().schema()["required"],
+            json!(["value"]),
+        );
+    }
+
+    fn optional_count_schema() -> serde_json::Value {
+        json!({"type": ["integer", "null"], "minimum": 0, "maximum": 255})
+    }
+
+    fn decode_count<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<MaybeCount, D::Error> {
+        serde::Deserialize::deserialize(deserializer)
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct CustomDeserializer {
+        #[serde(deserialize_with = "decode_count")]
+        #[json_schema(schema = optional_count_schema())]
+        value: MaybeCount,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct DefaultedCustomDeserializer {
+        #[serde(default, deserialize_with = "decode_count")]
+        #[json_schema(schema = optional_count_schema())]
+        value: MaybeCount,
+    }
+
+    #[derive(Default, serde::Serialize, serde::Deserialize, JsonSchema)]
+    #[serde(default)]
+    struct ContainerDefaultedCustomDeserializer {
+        #[serde(deserialize_with = "decode_count")]
+        #[json_schema(schema = optional_count_schema())]
+        value: MaybeCount,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct SerializeOnly {
+        #[serde(serialize_with = "serde::Serialize::serialize")]
+        #[json_schema(schema = optional_count_schema())]
+        value: MaybeCount,
+    }
+
+    #[test]
+    fn json_schema_missing_aliases_preserve_converter_and_default_precedence() {
+        assert_wire_case::<CustomDeserializer>(json!({"value": null}), json!({}));
+        assert_wire_case::<CustomDeserializer>(json!({"value": 255}), json!({"value": 256}));
+        assert_wire_case::<DefaultedCustomDeserializer>(json!({}), json!({"value": 256}));
+        assert_wire_case::<ContainerDefaultedCustomDeserializer>(
+            json!({}),
+            json!({"value": 256}),
+        );
+        assert_wire_case::<SerializeOnly>(json!({}), json!({"value": 256}));
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    #[serde(tag = "kind", content = "payload")]
+    enum Adjacent<T: JsonSchemaType> {
+        Value(T),
+        Unit,
+    }
+
+    #[test]
+    fn json_schema_adjacent_content_uses_actual_generic_payload_presence() {
+        assert_wire_case::<Adjacent<MaybeCount>>(
+            json!({"kind": "Value"}),
+            json!({"kind": "Value", "payload": 256}),
+        );
+        assert_wire_case::<Adjacent<Box<MaybeCount>>>(
+            json!({"kind": "Value"}),
+            json!({"kind": "Value", "payload": 256}),
+        );
+        assert_wire_case::<Adjacent<Transparent<MaybeCount>>>(
+            json!({"kind": "Value"}),
+            json!({"kind": "Value", "payload": 256}),
+        );
+        assert_wire_case::<Adjacent<u8>>(
+            json!({"kind": "Value", "payload": 0}),
+            json!({"kind": "Value"}),
+        );
+        assert_wire_case::<Adjacent<serde_json::Value>>(
+            json!({"kind": "Value", "payload": null}),
+            json!({"kind": "Value"}),
+        );
+        assert_wire_case::<Adjacent<Newtype>>(
+            json!({"kind": "Value", "payload": null}),
+            json!({"kind": "Value"}),
+        );
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    enum Choice {
+        Allowed,
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct ShadowedNames<String: JsonSchemaType, Value: JsonSchemaType, Vec: JsonSchemaType> {
+        first: Option<String>,
+        repeated: Option<String>,
+        other: Option<Value>,
+        nested: Option<Option<Vec>>,
+    }
+
+    #[test]
+    fn json_schema_nullable_shadowed_generics_keep_enum_and_reference_constraints() {
+        type Subject = ShadowedNames<Choice, Choice, Choice>;
+        assert!(schema_for::<Subject>().schema()["$defs"].is_object());
+        let valid = json!({"first": null, "repeated": null, "other": null, "nested": null});
+        for field in ["first", "repeated", "other", "nested"] {
+            let mut invalid = valid.clone();
+            invalid[field] = json!("Denied");
+            assert_wire_case::<Subject>(valid.clone(), invalid);
+        }
+        assert_wire_case::<Subject>(
+            json!({"first": "Allowed", "repeated": "Allowed", "other": "Allowed", "nested": "Allowed"}),
+            json!({"repeated": 0}),
+        );
+        assert_wire_case::<Subject>(json!({}), json!({"nested": false}));
+    }
+
+    #[derive(JsonSchema)]
+    #[serde(transparent)]
+    struct RecursiveTransparent(Box<Self>);
+
+    #[test]
+    fn json_schema_missing_value_wrapper_analysis_obeys_generation_depth_limit() {
+        let mut generator = SchemaGenerator::new();
+        assert!(!generator.accepts_missing_for::<RecursiveTransparent>());
+        assert_eq!(
+            generator.finish(json!({})).unwrap_err(),
+            SchemaGenerationError::DepthLimit,
+        );
+
+        let mut limited = SchemaGenerator::with_limits(SchemaGenerationLimits {
+            max_depth: 2,
+            ..SchemaGenerationLimits::default()
+        });
+        assert!(!limited.accepts_missing_for::<Box<Box<MaybeCount>>>());
+        assert_eq!(
+            limited.finish(json!({})).unwrap_err(),
+            SchemaGenerationError::DepthLimit,
+        );
+
+        let mut fresh = SchemaGenerator::new();
+        assert!(fresh.accepts_missing_for::<MaybeCount>());
+        fresh.finish(json!({})).unwrap();
+    }
+
+    type Request = Envelope<MaybeCount>;
+    static TOOL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[tool]
+    fn echo_missing_generic(request: Request) -> McpResult<String> {
+        TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        serde_json::to_string(&request).map_err(McpError::from)
+    }
+
+    #[test]
+    fn json_schema_missing_generic_fields_reach_registered_modern_tool() {
+        on_caller_runtime(async {
+            let server = Server::new("missing-generic-field", "1.0.0")
+                .tool(EchoMissingGeneric)
+                .try_build()
+                .unwrap();
+            let connection = ModernConnection::new();
+            let before = TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let result = schema_bound_complete(
+                schema_bound_wire_call(
+                    &server,
+                    &connection,
+                    "echo_missing_generic",
+                    json!({"request": {}}),
+                )
+                .await,
+            );
+            assert_ne!(result["isError"], json!(true));
+            let actual: serde_json::Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(actual, json!({"value": null}));
+            assert_eq!(
+                TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1,
+            );
+            for invalid in [
+                json!({"request": {"value": 256}}),
+                json!({"request": {"value": "bad"}}),
+                json!({}),
+            ] {
+                let response = schema_bound_wire_call(
+                    &server,
+                    &connection,
+                    "echo_missing_generic",
+                    invalid,
+                )
+                .await;
+                assert!(
+                    response.error.is_some()
+                        || response.result.as_ref().is_some_and(|result| result["isError"] == json!(true)),
+                );
+                assert_eq!(
+                    TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                    before + 1,
+                    "invalid inputs must not enter the application handler",
+                );
+            }
+        });
+    }
+}
+
 mod alias_schema_providers {
     use super::*;
     use fastmcp_rust::schema::{JsonSchemaType, SchemaGenerator, admit_final_schema};

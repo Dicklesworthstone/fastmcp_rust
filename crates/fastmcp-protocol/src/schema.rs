@@ -229,6 +229,17 @@ impl std::error::Error for SchemaGenerationError {}
 pub trait JsonSchemaType: 'static {
     /// Builds this type's schema body within the current document.
     fn schema_body(context: &mut SchemaGenerator) -> Value;
+
+    /// Whether Serde can deserialize this type from a missing named field.
+    ///
+    /// This is distinct from accepting JSON null. The default is conservative:
+    /// unit values, arbitrary JSON values, ordinary newtypes, and handwritten
+    /// providers remain required unless they explicitly declare otherwise.
+    /// Transparent implementations must delegate through
+    /// [`SchemaGenerator::accepts_missing_for`] to retain the generation bounds.
+    fn accepts_missing(_context: &mut SchemaGenerator) -> bool {
+        false
+    }
 }
 
 macro_rules! impl_scalar_schema {
@@ -281,6 +292,10 @@ impl_integer_schema!(serde_json::json!({"type": "integer"}); i8, i16, i32, i64, 
 impl_integer_schema!(serde_json::json!({"type": "integer", "minimum": 0}); u8, u16, u32, u64, u128, usize);
 
 impl<T: JsonSchemaType> JsonSchemaType for Option<T> {
+    fn accepts_missing(_context: &mut SchemaGenerator) -> bool {
+        true
+    }
+
     fn schema_body(context: &mut SchemaGenerator) -> Value {
         let mut inner = context.subschema_for::<T>();
         // Preserve every payload constraint, including schemas that already
@@ -359,6 +374,10 @@ macro_rules! impl_transparent_schema {
     ($($wrapper:ty),* $(,)?) => {
         $(
             impl<T: JsonSchemaType + ?Sized> JsonSchemaType for $wrapper {
+                fn accepts_missing(context: &mut SchemaGenerator) -> bool {
+                    context.accepts_missing_for::<T>()
+                }
+
                 fn schema_body(context: &mut SchemaGenerator) -> Value {
                     context.subschema_for::<T>()
                 }
@@ -374,6 +393,14 @@ where
     T: JsonSchemaType + ToOwned + ?Sized,
     T::Owned: 'static,
 {
+    fn accepts_missing(context: &mut SchemaGenerator) -> bool {
+        // Serde deserializes the owned form, which custom ToOwned providers
+        // may represent differently. Delegate only when both forms are the
+        // same type, without requiring a new schema bound on T::Owned.
+        TypeId::of::<T>() == TypeId::of::<T::Owned>()
+            && context.accepts_missing_for::<T>()
+    }
+
     fn schema_body(context: &mut SchemaGenerator) -> Value {
         context.subschema_for::<T>()
     }
@@ -512,6 +539,25 @@ impl SchemaGenerator {
             .expect("a generated type keeps its reserved definition")
             .body = Some(body.clone());
         body
+    }
+
+    /// Determines missing-field behavior without inspecting JSON nullability.
+    ///
+    /// Transparent pointer and derived-wrapper chains share the generation
+    /// depth limit. Recursive wrappers therefore fail the complete generation
+    /// instead of overflowing the stack or publishing a partially inferred schema.
+    pub fn accepts_missing_for<T: JsonSchemaType + ?Sized>(&mut self) -> bool {
+        if self.error.is_some() {
+            return false;
+        }
+        if self.depth >= self.limits.max_depth {
+            self.error = Some(SchemaGenerationError::DepthLimit);
+            return false;
+        }
+        self.depth += 1;
+        let accepts_missing = T::accepts_missing(self);
+        self.depth -= 1;
+        accepts_missing
     }
 
     /// Accounts for a nested handwritten schema returned within this operation.
@@ -910,9 +956,9 @@ fn check_generated_reference_resources(
 
 /// Autoref dispatch adapter used by generated code for custom field types.
 #[derive(Debug)]
-pub struct SchemaTypeDispatch<T>(PhantomData<T>);
+pub struct SchemaTypeDispatch<T: ?Sized>(PhantomData<T>);
 
-impl<T> SchemaTypeDispatch<T> {
+impl<T: ?Sized> SchemaTypeDispatch<T> {
     /// Constructs a dispatch adapter without constructing the Rust type.
     #[must_use]
     pub const fn new() -> Self {
@@ -920,7 +966,7 @@ impl<T> SchemaTypeDispatch<T> {
     }
 }
 
-impl<T> Default for SchemaTypeDispatch<T> {
+impl<T: ?Sized> Default for SchemaTypeDispatch<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -956,15 +1002,32 @@ impl<T: JsonSchemaType> SchemaTypeFallback for T {
 pub trait DispatchSchema {
     /// Resolves a schema within the caller's current generation operation.
     fn schema(self, context: &mut SchemaGenerator, fallback: impl FnOnce() -> Value) -> Value;
-}
 
-impl<T: JsonSchemaType> DispatchSchema for &SchemaTypeDispatch<T> {
-    fn schema(self, context: &mut SchemaGenerator, _fallback: impl FnOnce() -> Value) -> Value {
-        context.subschema_for::<T>()
+    /// Resolves missing-field behavior, conservatively retaining requiredness
+    /// for an inherent-only handwritten provider or an existing adapter.
+    fn accepts_missing(self, _context: &mut SchemaGenerator) -> bool
+    where
+        Self: Sized,
+    {
+        false
     }
 }
 
-impl<T> DispatchSchema for &&SchemaTypeDispatch<T> {
+impl<T: JsonSchemaType + ?Sized> DispatchSchema for &SchemaTypeDispatch<T> {
+    fn schema(self, context: &mut SchemaGenerator, _fallback: impl FnOnce() -> Value) -> Value {
+        context.subschema_for::<T>()
+    }
+
+    fn accepts_missing(self, context: &mut SchemaGenerator) -> bool {
+        context.accepts_missing_for::<T>()
+    }
+}
+
+impl<T: ?Sized> DispatchSchema for &&SchemaTypeDispatch<T> {
+    fn accepts_missing(self, _context: &mut SchemaGenerator) -> bool {
+        false
+    }
+
     fn schema(self, context: &mut SchemaGenerator, fallback: impl FnOnce() -> Value) -> Value {
         if context.error.is_some() {
             Value::Bool(false)
