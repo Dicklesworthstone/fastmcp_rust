@@ -678,6 +678,71 @@ impl FinalTaskRuntime {
 }
 
 impl FinalTaskExecutionGuard {
+    /// Transfer the known elected fence to one final store operation. Before
+    /// admission Drop owns restoration. After admission a lost receipt leaves
+    /// reconciliation to the backend's finite lease.
+    pub(super) async fn settle_dispatch_with_cx(
+        &mut self,
+        cx: &Cx,
+        settlement: FinalTaskDispatchSettlement,
+    ) -> McpResult<bool> {
+        let caller = final_task_service_caller(cx)?;
+        let Some(fence) = self.dispatch_fence else {
+            return Ok(false);
+        };
+        if FinalTaskLeaseRenewal::expired(self) {
+            return Ok(false);
+        }
+        let Some(restoration) = self.restoration.take() else {
+            return Ok(false);
+        };
+        // The factory itself may commit. Disarm the guard before constructing
+        // it, and keep factory, polls and destruction inside the caller's Cx.
+        CallerContextFuture::new(&caller, async {
+            let store = &self.runtime.store;
+            let operation = match (settlement, restoration) {
+                (FinalTaskDispatchSettlement::Finish, _) => {
+                    store.finish_handoff_dispatch_for_owner_if_current_with_cx(
+                        &caller,
+                        &self.task_id,
+                        self.generation,
+                        &self.owner_id,
+                        fence,
+                    )
+                }
+                (FinalTaskDispatchSettlement::Restore, FinalTaskHandoffRestoration::Initial(work)) => {
+                    store.restore_initial_work_for_owner_if_current_with_cx(
+                        &caller,
+                        &self.task_id,
+                        self.generation,
+                        &self.owner_id,
+                        fence,
+                        work,
+                    )
+                }
+                (FinalTaskDispatchSettlement::Restore, FinalTaskHandoffRestoration::Resumed(inputs)) => {
+                    store.restore_input_for_owner_if_current_with_cx(
+                        &caller,
+                        &self.task_id,
+                        self.generation,
+                        &self.owner_id,
+                        fence,
+                        inputs,
+                    )
+                }
+            };
+            await_recovery_store_while(&caller, operation, true, || {
+                if FinalTaskLeaseRenewal::expired(self) {
+                    Err(McpError::request_cancelled())
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+        })
+        .await
+    }
+
     /// Keeps a claimed handoff in restoration custody while its dispatch
     /// preflight awaits storage. An uncertain election instead retains the
     /// backend's finite lease; only an actual receipt supplies a restore fence.

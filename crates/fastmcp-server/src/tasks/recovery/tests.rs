@@ -19,6 +19,9 @@ enum Step {
     ExecutionBudget,
     Retention,
     Election,
+    Finish,
+    RestoreInitial,
+    RestoreInput,
 }
 
 struct Gate {
@@ -90,8 +93,10 @@ impl Gate {
 struct AsyncRecoveryStore {
     inner: InMemoryFinalTaskStore,
     clock: Arc<Mutex<Instant>>,
-    gates: [Gate; 11],
-    calls: [AtomicUsize; 11],
+    gates: [Gate; 14],
+    calls: [AtomicUsize; 14],
+    settlement_receipt: Gate,
+    sync_settlements: AtomicUsize,
     initial_pause_from: AtomicUsize,
     receipt: Gate,
     claimed: AtomicUsize,
@@ -137,6 +142,8 @@ impl AsyncRecoveryStore {
             clock,
             gates: std::array::from_fn(|_| Gate::new()),
             calls: std::array::from_fn(|_| AtomicUsize::new(0)),
+            settlement_receipt: Gate::new(),
+            sync_settlements: AtomicUsize::new(0),
             initial_pause_from: AtomicUsize::new(1),
             receipt: Gate::new(),
             claimed: AtomicUsize::new(0),
@@ -202,6 +209,22 @@ impl AsyncRecoveryStore {
         }
         self.caller(cx);
         cx.checkpoint().map_err(|_| McpError::request_cancelled())
+    }
+
+    async fn settle(
+        &self,
+        cx: &Cx,
+        step: Step,
+        mutation: impl FnOnce() -> McpResult<bool>,
+    ) -> McpResult<bool> {
+        self.enter(cx, step).await?;
+        let receipt = mutation()?;
+        if receipt && matches!(step, Step::RestoreInitial | Step::RestoreInput) {
+            self.restored.fetch_add(1, Ordering::SeqCst);
+        }
+        self.settlement_receipt.wait().await;
+        self.caller(cx);
+        Ok(receipt)
     }
 
     fn is_expiry_caller(&self, cx: &Cx) -> bool {
@@ -275,7 +298,6 @@ impl FinalTaskStore for AsyncRecoveryStore {
         fn replace_task(&self, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<()>;
         fn replace_task_if_current(&self, expected: &FinalTaskSnapshot, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<bool>;
         fn replace_task_and_clear_input_for_handoff_if_current(&self, expected: &FinalTaskSnapshot, owner_id: &str, dispatch_fence: u64, cancellation_required: bool, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<Option<FinalTaskSnapshot>>;
-        fn finish_handoff_dispatch_for_owner_if_current(&self, task_id: &FinalTaskId, generation: u64, owner_id: &str, dispatch_fence: u64) -> McpResult<bool>;
         fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()>;
         fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool>;
         fn request_cancellation_and_clear_input_if_current(&self, expected: &FinalTaskSnapshot, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<Option<FinalTaskSnapshot>>;
@@ -576,6 +598,7 @@ impl FinalTaskStore for AsyncRecoveryStore {
         dispatch_fence: Option<u64>,
         descriptor: FinalTaskWorkDescriptor,
     ) -> McpResult<bool> {
+        self.sync_settlements.fetch_add(1, Ordering::SeqCst);
         let restored = self.inner.restore_initial_work_for_owner_if_current(
             task_id,
             generation,
@@ -597,6 +620,7 @@ impl FinalTaskStore for AsyncRecoveryStore {
         dispatch_fence: Option<u64>,
         inputs: FinalTaskInputResponses,
     ) -> McpResult<bool> {
+        self.sync_settlements.fetch_add(1, Ordering::SeqCst);
         let restored = self.inner.restore_input_for_owner_if_current(
             task_id,
             generation,
@@ -608,6 +632,83 @@ impl FinalTaskStore for AsyncRecoveryStore {
             self.restored.fetch_add(1, Ordering::SeqCst);
         }
         Ok(restored)
+    }
+
+    fn finish_handoff_dispatch_for_owner_if_current(
+        &self,
+        task_id: &FinalTaskId,
+        generation: u64,
+        owner_id: &str,
+        dispatch_fence: u64,
+    ) -> McpResult<bool> {
+        self.sync_settlements.fetch_add(1, Ordering::SeqCst);
+        self.inner.finish_handoff_dispatch_for_owner_if_current(
+            task_id,
+            generation,
+            owner_id,
+            dispatch_fence,
+        )
+    }
+
+    fn finish_handoff_dispatch_for_owner_if_current_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+        generation: u64,
+        owner_id: &'a str,
+        dispatch_fence: u64,
+    ) -> FinalTaskStoreFuture<'a, bool> {
+        self.caller(cx);
+        Box::pin(self.settle(cx, Step::Finish, move || {
+            self.inner.finish_handoff_dispatch_for_owner_if_current(
+                task_id,
+                generation,
+                owner_id,
+                dispatch_fence,
+            )
+        }))
+    }
+
+    fn restore_initial_work_for_owner_if_current_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+        generation: u64,
+        owner_id: &'a str,
+        dispatch_fence: u64,
+        descriptor: FinalTaskWorkDescriptor,
+    ) -> FinalTaskStoreFuture<'a, bool> {
+        self.caller(cx);
+        Box::pin(self.settle(cx, Step::RestoreInitial, move || {
+            self.inner.restore_initial_work_for_owner_if_current(
+                task_id,
+                generation,
+                owner_id,
+                Some(dispatch_fence),
+                descriptor,
+            )
+        }))
+    }
+
+    fn restore_input_for_owner_if_current_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+        generation: u64,
+        owner_id: &'a str,
+        dispatch_fence: u64,
+        inputs: FinalTaskInputResponses,
+    ) -> FinalTaskStoreFuture<'a, bool> {
+        self.caller(cx);
+        Box::pin(self.settle(cx, Step::RestoreInput, move || {
+            self.inner.restore_input_for_owner_if_current(
+                task_id,
+                generation,
+                owner_id,
+                Some(dispatch_fence),
+                inputs,
+            )
+        }))
     }
 
     fn renew_handoff_dispatch_if_current(
@@ -2487,6 +2588,163 @@ fn task_dispatch_async_pending_election_keeps_siblings_live_and_settles_service_
                 assert!(final_tasks_match_exactly(recovered.task(), second.task()).unwrap());
                 wait_until(&host, || fixture.store.inner.active_task_count() == 0).await;
             }
+        });
+    }
+}
+
+async fn settlement_guard(
+    fixture: &Fixture,
+    caller: &Cx,
+    snapshot: &FinalTaskSnapshot,
+    resumed: bool,
+) -> (FinalTaskExecutionGuard, FinalTaskSupervisorHandoff) {
+    let owner = "settlement-owner";
+    let mut handoff = recover(fixture, caller, snapshot, resumed, true, owner)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_handoff(&handoff, snapshot, resumed);
+    let mut guard = FinalTaskExecutionGuard::new(&fixture.runtime, owner, &handoff);
+    assert!(guard.elect_with_cx(caller, &AtomicBool::new(false)).await.unwrap());
+    handoff.attach_authority(guard.authority().unwrap());
+    (guard, handoff)
+}
+
+fn complete_settlement_work(handoff: FinalTaskSupervisorHandoff) {
+    let result = serde_json::from_value(serde_json::json!({
+        "content": [{"type": "text", "text": "durably committed"}]
+    }))
+    .unwrap();
+    match handoff {
+        FinalTaskSupervisorHandoff::Initial(work) => work.complete_task(result, None),
+        FinalTaskSupervisorHandoff::Resumed(work) => work.complete_task(result, None),
+    }
+    .unwrap();
+}
+
+#[test]
+fn task_dispatch_async_settlement_preserves_the_transition_or_exact_work() {
+    for resumed in [false, true] {
+        for outcome in ["complete", "error", "no-transition"] {
+            run(|caller| async move {
+                let host = Cx::current().unwrap();
+                let fixture = Fixture::new();
+                let snapshot = fixture.seed("settlement-result", resumed);
+                let (guard, handoff) = settlement_guard(&fixture, &caller, &snapshot, resumed).await;
+                let (step, application_result) = if outcome == "complete" {
+                    complete_settlement_work(handoff);
+                    (Step::Finish, Ok(()))
+                } else {
+                    let result = if outcome == "error" {
+                        Err(McpError::internal_error("provider work failed"))
+                    } else {
+                        Ok(())
+                    };
+                    (if resumed { Step::RestoreInput } else { Step::RestoreInitial }, result)
+                };
+
+                fixture.store.gate(step).close();
+                let mut operation = Box::pin(FinalTaskHandoffExecutor::finish_handoff(
+                    &caller, guard, application_result,
+                ));
+                drive_until(&host, operation.as_mut(), || {
+                    fixture.store.gate(step).waiter.lock().unwrap().is_some()
+                })
+                .await;
+                assert_eq!(fixture.store.restored.load(Ordering::SeqCst), 0);
+                fixture.store.gate(step).release();
+                let result = operation.await;
+                assert_eq!(fixture.store.count(step), 1);
+                assert_eq!(fixture.store.sync_settlements.load(Ordering::SeqCst), 0);
+                assert_eq!(fixture.store.inner.active_task_count(), 0);
+                if outcome == "complete" {
+                    result.unwrap();
+                    let task = fixture.store.inner.get_task(&snapshot.task().base().task_id).unwrap().unwrap();
+                    assert!(matches!(task, FinalTask::Completed { .. }));
+                    assert!(fixture.store.next_candidate(resumed).is_none());
+                    assert_eq!(fixture.emitted.lock().unwrap().len(), 1);
+                } else {
+                    assert!(result.is_err());
+                    assert_eq!(fixture.store.restored.load(Ordering::SeqCst), 1);
+                    fixture.assert_recoverable(&snapshot, resumed);
+                    let work = recover(&fixture, &caller, &snapshot, resumed, true, "replacement-owner")
+                        .await.unwrap().unwrap();
+                    assert_handoff(&work, &snapshot, resumed);
+                }
+            });
+        }
+    }
+}
+
+#[test]
+fn task_dispatch_async_settlement_abandonment_never_repeats_a_storage_mutation() {
+    for resumed in [false, true] {
+        for after_commit in [false, true] {
+            for cancel in [false, true] {
+                run(|caller| async move {
+                    let host = Cx::current().unwrap();
+                    let fixture = Fixture::new();
+                    let snapshot = fixture.seed("settlement-uncertain", resumed);
+                    let (guard, _handoff) = settlement_guard(&fixture, &caller, &snapshot, resumed).await;
+                    let step = if resumed { Step::RestoreInput } else { Step::RestoreInitial };
+                    let gate = if after_commit { &fixture.store.settlement_receipt } else { fixture.store.gate(step) };
+                    gate.close();
+                    let mut operation = Box::pin(FinalTaskHandoffExecutor::finish_handoff(
+                        &caller, guard, Err(McpError::internal_error("interrupted work")),
+                    ));
+                    drive_until(&host, operation.as_mut(), || gate.waiter.lock().unwrap().is_some()).await;
+                    if cancel {
+                        caller.cancel_with(asupersync::types::CancelKind::User, None);
+                        assert!(operation.await.is_err());
+                    } else {
+                        drop(operation);
+                    }
+                    assert_eq!(gate.abandoned.load(Ordering::SeqCst), 1);
+                    assert_eq!(fixture.store.count(step), 1);
+                    assert_eq!(fixture.store.sync_settlements.load(Ordering::SeqCst), 0);
+                    assert_eq!(fixture.store.restored.load(Ordering::SeqCst), usize::from(after_commit));
+                    if !after_commit {
+                        assert!(fixture.store.next_candidate(resumed).is_none());
+                        let (_, owner, _, _) = elected_lease(&fixture.store, &snapshot.task().base().task_id);
+                        assert_eq!(owner, "settlement-owner");
+                        *fixture.store.clock.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+                    }
+                    fixture.assert_recoverable(&snapshot, resumed);
+                    assert!(fixture.emitted.lock().unwrap().is_empty());
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn task_dispatch_async_settlement_keeps_committed_success_through_custodian_cancellation() {
+    for cancel_during_finish in [false, true] {
+        run(|caller| async move {
+            let host = Cx::current().unwrap();
+            let fixture = Fixture::new();
+            let snapshot = fixture.seed("settlement-committed", false);
+            let (guard, handoff) = settlement_guard(&fixture, &caller, &snapshot, false).await;
+            complete_settlement_work(handoff);
+            fixture.store.gate(Step::Finish).close();
+            let mut operation = Box::pin(FinalTaskHandoffExecutor::finish_handoff(
+                &caller, guard, Ok(()),
+            ));
+            if cancel_during_finish {
+                drive_until(&host, operation.as_mut(), || {
+                    fixture.store.gate(Step::Finish).waiter.lock().unwrap().is_some()
+                })
+                .await;
+            }
+            caller.cancel_with(asupersync::types::CancelKind::User, None);
+            operation.await.unwrap();
+            assert_eq!(fixture.store.count(Step::Finish), usize::from(cancel_during_finish));
+            assert_eq!(fixture.store.sync_settlements.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.store.inner.active_task_count(), 0);
+            let task = fixture.store.inner.get_task(&snapshot.task().base().task_id).unwrap().unwrap();
+            assert!(matches!(task, FinalTask::Completed { .. }));
+            assert!(fixture.store.next_candidate(false).is_none());
+            assert_eq!(fixture.emitted.lock().unwrap().len(), 1);
         });
     }
 }

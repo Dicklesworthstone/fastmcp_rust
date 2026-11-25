@@ -3191,8 +3191,8 @@ not leave detached writes running after returning. The bounded
 `retention_clock_now` hook must remain nonblocking and perform no storage I/O.
 
 The built-in in-memory store uses bounded synchronous defaults for these
-hooks. Worker dispatch election, lease maintenance, and final store cleanup
-still use their existing bounded synchronous interfaces.
+hooks. Application stores may also suspend dispatch election, lease renewal,
+and final settlement on the caller's runtime.
 
 ### Asynchronous Task service recovery
 
@@ -3230,10 +3230,19 @@ expiry. It must not treat cancellation as proof of rollback or start detached
 writes. A committed execution-expiry result remains committed if notification
 delivery is cancelled or an observer fails.
 
-Dispatch election, per-attempt execution monitoring and lease renewal, and
-drop-time restoration remain bounded synchronous backend operations. These
-recovery hooks do not provide restart persistence or a completely asynchronous
-Task backend.
+After the application region and its descendants have stopped, the service
+awaits the store's owner- and fence-bound finish or restoration. A failed
+initial attempt returns its original work descriptor. A failed resumed attempt
+returns its exact accepted inputs. Stores can override
+`finish_handoff_dispatch_for_owner_if_current_with_cx`,
+`restore_initial_work_for_owner_if_current_with_cx`, and
+`restore_input_for_owner_if_current_with_cx` to perform that work asynchronously.
+A missing receipt leaves recovery with the backend's finite lease. The
+framework never reissues the admitted final mutation from a destructor.
+
+A handoff abandoned before final settlement still uses the bounded synchronous
+restoration path. Per-attempt authorization and cancellation checks also retain
+synchronous store operations. The built-in store remains process-local.
 
 ### Tasks retention administration
 

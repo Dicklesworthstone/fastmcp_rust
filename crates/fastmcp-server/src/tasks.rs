@@ -1608,10 +1608,9 @@ pub trait FinalTaskStore: Send + Sync {
     /// request-local cancellation. A write that may have committed must report
     /// that uncertainty instead of treating cancellation as proof of rollback.
     /// Worker mutations, service recovery, and dispatch election also have
-    /// asynchronous entrypoints. Dispatch renewal may also await caller-owned
-    /// storage. Final lease release and drop-time restoration remain bounded
-    /// synchronous operations; these hooks do not establish a
-    /// persistent or completely asynchronous Task backend.
+    /// asynchronous entrypoints, including lease renewal and settlement after
+    /// the worker region closes. Drop-time restoration of a known, unsettled
+    /// claim still requires bounded synchronous storage.
     fn get_task_access_metadata_with_context<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -2539,6 +2538,34 @@ pub trait FinalTaskStore: Send + Sync {
         ))
     }
 
+    /// Restores an elected initial handoff after the application region closes.
+    /// Compare the original descriptor, generation, owner, live fence, execution
+    /// budget and cancellation state atomically, as in the synchronous hook.
+    /// After suspension, checkpoint immediately before the write. Return its
+    /// actual receipt even if cancellation arrives during delivery. If dropped
+    /// with an unknown outcome, keep any unconsumed work behind its finite
+    /// recovery lease. The runtime will not repeat an admitted settlement.
+    fn restore_initial_work_for_owner_if_current_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+        generation: u64,
+        owner_id: &'a str,
+        dispatch_fence: u64,
+        descriptor: FinalTaskWorkDescriptor,
+    ) -> FinalTaskStoreFuture<'a, bool> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.restore_initial_work_for_owner_if_current(
+                task_id,
+                generation,
+                owner_id,
+                Some(dispatch_fence),
+                descriptor,
+            )
+        })
+    }
+
     /// Returns one current `working` task with an unconsumed accepted-input
     /// handoff without consuming that handoff, continuing after
     /// `after_task_id` and wrapping to the beginning when necessary.
@@ -2606,6 +2633,29 @@ pub trait FinalTaskStore: Send + Sync {
         Err(McpError::internal_error(
             "Final task store does not implement accepted-input restoration",
         ))
+    }
+
+    /// Restores the exact accepted inputs under the same receipt and recovery
+    /// contract as [`Self::restore_initial_work_for_owner_if_current_with_cx`].
+    fn restore_input_for_owner_if_current_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+        generation: u64,
+        owner_id: &'a str,
+        dispatch_fence: u64,
+        inputs: FinalTaskInputResponses,
+    ) -> FinalTaskStoreFuture<'a, bool> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.restore_input_for_owner_if_current(
+                task_id,
+                generation,
+                owner_id,
+                Some(dispatch_fence),
+                inputs,
+            )
+        })
     }
 
     /// Atomically elects a claimed handoff to begin application execution.
@@ -2726,6 +2776,31 @@ pub trait FinalTaskStore: Send + Sync {
         Err(McpError::internal_error(
             "Final task store does not implement atomic handoff dispatch completion",
         ))
+    }
+
+    /// Finishes an elected handoff once its application region is quiescent.
+    /// Preserve the atomic comparison and cancellation-retirement contract of
+    /// [`Self::finish_handoff_dispatch_for_owner_if_current`]. Checkpoint before
+    /// writing after suspension and return the original comparison result.
+    /// Abandonment or an error must leave a committed finish intact and any
+    /// unconsumed handoff recoverable under its finite lease.
+    fn finish_handoff_dispatch_for_owner_if_current_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+        generation: u64,
+        owner_id: &'a str,
+        dispatch_fence: u64,
+    ) -> FinalTaskStoreFuture<'a, bool> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+            self.finish_handoff_dispatch_for_owner_if_current(
+                task_id,
+                generation,
+                owner_id,
+                dispatch_fence,
+            )
+        })
     }
 
     /// Atomically cancels an unelected task or records cancellation intent for
@@ -10217,6 +10292,7 @@ impl FinalTaskRuntime {
         Ok(interval)
     }
 
+    #[cfg(test)]
     fn finish_handoff_dispatch(
         &self,
         task_id: &FinalTaskId,
@@ -11341,10 +11417,14 @@ impl FinalTaskHandoffExecutor {
         cancellation.map_err(|_| {
             McpError::internal_error("Task attempt region cancellation could not be requested")
         })?;
-        Self::finish_handoff(guard, result)
+        Self::finish_handoff(cx, guard, result).await
     }
 
-    fn finish_handoff(mut guard: FinalTaskExecutionGuard, result: McpResult<()>) -> McpResult<()> {
+    async fn finish_handoff(
+        cx: &Cx,
+        mut guard: FinalTaskExecutionGuard,
+        result: McpResult<()>,
+    ) -> McpResult<()> {
         if guard.pending_write.outcome_uncertain() {
             // A failed observer does not establish that an admitted transaction
             // rolled back. Leave its exact store fence for reconciliation.
@@ -11367,7 +11447,9 @@ impl FinalTaskHandoffExecutor {
                     return Ok(());
                 }
                 if guard.is_recoverable_without_transition()? {
-                    let restored = guard.restore()?;
+                    let restored = guard
+                        .settle_dispatch_with_cx(cx, FinalTaskDispatchSettlement::Restore)
+                        .await?;
                     if !restored {
                         if guard.retire_if_cancellation_requested()? {
                             return Ok(());
@@ -11380,7 +11462,20 @@ impl FinalTaskHandoffExecutor {
                         "Final task supervisor returned success without a fenced task transition",
                     ));
                 }
-                let finished = guard.finish()?;
+                let finish = guard
+                    .settle_dispatch_with_cx(cx, FinalTaskDispatchSettlement::Finish)
+                    .await;
+                // A committed transition consumes this invocation's mutation
+                // authority. Late caller cancellation during final bookkeeping
+                // cannot turn the worker's acknowledged result into a failure.
+                if guard.transition_committed.load(TaskServiceOrdering::Acquire)
+                    && cx.checkpoint().is_err()
+                    && finish.as_ref().is_err_and(|error| error.code == fastmcp_core::McpErrorCode::RequestCancelled)
+                {
+                    guard.disarm();
+                    return Ok(());
+                }
+                let finished = finish?;
                 if !finished && guard.retire_if_cancellation_requested()? {
                     return Ok(());
                 }
@@ -11394,9 +11489,8 @@ impl FinalTaskHandoffExecutor {
                 if guard.retire_if_execution_expired()? {
                     return Ok(());
                 }
-                // Returned errors restore synchronously so a recovery runner
-                // sees the exact pre-await payload. Cancellation, dropped
-                // futures, and unwinding use the same lease in `Drop`.
+                // Return the original descriptor or accepted inputs to the
+                // store with the exact elected fence for this restoration.
                 if guard.is_authoritatively_expired() {
                     guard.disarm();
                     return Err(error);
@@ -11404,7 +11498,9 @@ impl FinalTaskHandoffExecutor {
                 if guard.retire_if_cancellation_requested()? {
                     return Ok(());
                 }
-                let restored = guard.restore()?;
+                let restored = guard
+                    .settle_dispatch_with_cx(cx, FinalTaskDispatchSettlement::Restore)
+                    .await?;
                 if !restored && guard.retire_if_cancellation_requested()? {
                     return Ok(());
                 }
@@ -12014,6 +12110,11 @@ enum FinalTaskHandoffRestoration {
     Resumed(FinalTaskInputResponses),
 }
 
+enum FinalTaskDispatchSettlement {
+    Finish,
+    Restore,
+}
+
 /// Private guard that is the only path from a claimed durable handoff to an
 /// application invocation. It owns the service identity, exact dispatch
 /// fence, completion, renewal, and restoration rights for one handoff.
@@ -12414,6 +12515,7 @@ impl FinalTaskExecutionGuard {
         })
     }
 
+    #[cfg(test)]
     fn finish(&self) -> McpResult<bool> {
         let Some(dispatch_fence) = self.dispatch_fence else {
             return Ok(false);
@@ -12467,7 +12569,10 @@ impl FinalTaskExecutionGuard {
 
 impl Drop for FinalTaskExecutionGuard {
     fn drop(&mut self) {
-        if self.dispatch_election_uncertain
+        // An admitted final store operation owns the restoration payload.
+        // Its missing receipt cannot authorize a second cleanup from Drop.
+        if self.restoration.is_none()
+            || self.dispatch_election_uncertain
             || self.pending_write.admitted_pending()
             || self.pending_write.outcome_uncertain()
         {
