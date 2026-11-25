@@ -16,7 +16,9 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::future::{Future, poll_fn};
 use std::sync::{Arc, RwLock, Weak};
+use std::task::Poll;
 use std::time::Instant;
 
 use fastmcp_core::runtime::{ProcessBoundToken, ProcessGenerationGuard};
@@ -314,9 +316,9 @@ impl EnterpriseResourcePolicy {
     /// Installs automatic asynchronous key refresh from an independently
     /// configured guarded HTTPS source with its own roots, freshness, backoff
     /// and capacity policy. Request declarations are admitted before any fetch;
-    /// metadata replacement or revocation during refresh prevents final
-    /// authentication. The synchronous path uses installed fresh keys without
-    /// performing I/O.
+    /// metadata replacement, revocation or owner drop interrupts pending
+    /// authentication without cancelling the caller's context or other policy
+    /// owners. The synchronous path uses installed fresh keys without I/O.
     pub fn guarded_provider(
         &self,
         verifier: GuardedJwtResourceVerifier,
@@ -486,7 +488,25 @@ impl AuthProvider for EnterpriseAuthProvider {
         Box::pin(async move {
             let snapshot = self.snapshot()?;
             admit_request(request)?;
-            let auth = self.verifier.authenticate_async(ctx, request).await?;
+            let mut retired = std::pin::pin!(snapshot.cancellation.cancelled());
+            let mut authentication = self.verifier.authenticate_async(ctx, request);
+            let auth = poll_fn(|task| {
+                snapshot.check().map_err(|_| denied())?;
+                // Register the policy wakeup before polling the verifier. A
+                // suspended key fetch must not delay revocation until its own
+                // socket, timeout or caller-cancellation wakeup arrives.
+                if retired.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(Err(denied()));
+                }
+                let result = authentication.as_mut().poll(task);
+                // A verifier may invoke an embedding callback while polled.
+                // Never release facts or remain pending after it retires this
+                // snapshot. Dropping the request-owned verifier future retires
+                // only this attempt, leaving shared caller authority intact.
+                snapshot.check().map_err(|_| denied())?;
+                result
+            })
+            .await?;
             self.finish(&snapshot, auth)
         })
     }

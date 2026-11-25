@@ -590,6 +590,7 @@ mod enterprise {
     use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId, CanonicalResourceIdPolicy};
     use serde_json::Value;
     use std::sync::atomic::AtomicBool;
+    use std::task::Wake;
 
     fn configuration(generation: u64) -> EnterpriseResourceConfiguration {
         let endpoint = CanonicalHttpUrl::parse("https://tools.example/mcp").unwrap();
@@ -830,6 +831,19 @@ mod enterprise {
         waker: Mutex<Option<Waker>>,
     }
 
+    #[derive(Default)]
+    struct AuthenticationWake(AtomicUsize);
+
+    impl Wake for AuthenticationWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     impl DelayedExchange {
         fn release(&self) {
             self.released.store(true, Ordering::SeqCst);
@@ -863,7 +877,7 @@ mod enterprise {
     }
 
     #[test]
-    fn enterprise_guarded_provider_rechecks_policy_after_suspended_refresh() {
+    fn enterprise_guarded_provider_policy_invalidation_interrupts_suspended_refresh() {
         let clock = Arc::new(VirtualClock::new());
         let timer = TimerDriverHandle::with_virtual_clock(clock);
         let runtime = RuntimeBuilder::current_thread()
@@ -875,8 +889,9 @@ mod enterprise {
         runtime.block_on(async {
             let _ambient = Cx::set_current(None);
             let context = McpContext::new(caller.clone(), 1);
+            let sibling = McpContext::new(caller.clone(), 2);
             for change in ["replace", "revoke", "drop"] {
-                let (mut verifier, _, _) = fixture(vec![]);
+                let (mut verifier, _, elapsed) = fixture(vec![]);
                 let delayed = Arc::new(DelayedExchange {
                     released: AtomicBool::new(false),
                     calls: AtomicUsize::new(0),
@@ -893,11 +908,14 @@ mod enterprise {
                 let authorization = format!("Bearer {}", token("one").token);
                 let mut authentication =
                     provider.authenticate_async(&context, request(&params, &authorization));
-                let mut task = Context::from_waker(Waker::noop());
+                let wakes = Arc::new(AuthenticationWake::default());
+                let waker = Waker::from(wakes.clone());
+                let mut task = Context::from_waker(&waker);
                 assert!(authentication.as_mut().poll(&mut task).is_pending());
                 assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
                 assert_eq!(verifier.source.admission.active.lock().unwrap().len(), 1);
                 assert_eq!(timer.pending_count(), 1);
+                let wake_count = wakes.0.load(Ordering::SeqCst);
 
                 match change {
                     "replace" => {
@@ -918,23 +936,127 @@ mod enterprise {
                     "revoke" => owner.as_ref().unwrap().revoke(),
                     _ => drop(owner.take()),
                 }
-                delayed.release();
+                assert!(
+                    wakes.0.load(Ordering::SeqCst) > wake_count,
+                    "{change} must wake authentication without waiting for the key endpoint"
+                );
+                assert!(!delayed.released.load(Ordering::SeqCst));
                 match authentication.as_mut().poll(&mut task) {
                     Poll::Ready(Err(error)) => {
                         assert_eq!(error.code, McpErrorCode::ResourceForbidden)
                     }
                     _ => {
-                        panic!("policy changed during fetch but authentication did not fail closed")
+                        panic!("{change} did not interrupt the suspended authentication")
                     }
+                }
+                assert!(verifier.source.admission.active.lock().unwrap().is_empty());
+                assert_eq!(timer.pending_count(), 0);
+                {
+                    let state = verifier.managed.shared.state.read().unwrap();
+                    assert!(state.flight.is_none());
+                    assert!(state.active.is_none());
                 }
                 drop(authentication);
                 assert!(verifier.source.admission.active.lock().unwrap().is_empty());
                 assert_eq!(timer.pending_count(), 0);
+                assert!(context.checkpoint().is_ok());
+                assert!(sibling.checkpoint().is_ok());
+                assert!(caller.checkpoint().is_ok());
+                assert_eq!(
+                    verifier
+                        .verify_access_token(&context, &token("one"))
+                        .unwrap_err()
+                        .code,
+                    crate::auth::AUTH_PROVIDER_UNAVAILABLE_CODE,
+                    "an interrupted response must not install keys"
+                );
+                // The response becoming ready after cancellation has no owner
+                // left that could publish it. A replacement can make its own
+                // fresh attempt after the unchanged fetch backoff expires.
+                delayed.release();
+                elapsed.store(3, Ordering::SeqCst);
                 let next =
                     ready(provider.authenticate_async(&context, request(&params, &authorization)));
                 assert_eq!(next.is_ok(), change == "replace");
-                assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    delayed.calls.load(Ordering::SeqCst),
+                    if change == "replace" { 2 } else { 1 }
+                );
+                assert!(verifier.source.admission.active.lock().unwrap().is_empty());
+                assert_eq!(timer.pending_count(), 0);
             }
+        });
+        assert_eq!(timer.pending_count(), 0);
+        drop(caller);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn enterprise_guarded_provider_rejected_policy_update_preserves_suspended_refresh() {
+        let clock = Arc::new(VirtualClock::new());
+        let timer = TimerDriverHandle::with_virtual_clock(clock);
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        let caller = runtime.request_cx_with_budget(Budget::INFINITE);
+        runtime.block_on(async {
+            let _ambient = Cx::set_current(None);
+            let context = McpContext::new(caller.clone(), 1);
+            let (mut verifier, _, _) = fixture(vec![]);
+            let delayed = Arc::new(DelayedExchange {
+                released: AtomicBool::new(false),
+                calls: AtomicUsize::new(0),
+                waker: Mutex::new(None),
+            });
+            verifier.source.test_exchange = Some(delayed.clone());
+            let mut owner = owner();
+            let provider = owner.guarded_provider(verifier.clone()).unwrap();
+            let params = params();
+            let authorization = format!("Bearer {}", token("one").token);
+            let mut authentication =
+                provider.authenticate_async(&context, request(&params, &authorization));
+            let wakes = Arc::new(AuthenticationWake::default());
+            let waker = Waker::from(wakes.clone());
+            let mut task = Context::from_waker(&waker);
+            assert!(authentication.as_mut().poll(&mut task).is_pending());
+            let wake_count = wakes.0.load(Ordering::SeqCst);
+            let documents = documents();
+            let deadline = Instant::now() + Duration::from_secs(120);
+            assert_eq!(
+                owner.replace(
+                    configuration(1),
+                    &documents[0],
+                    &documents[1],
+                    deadline,
+                    deadline,
+                ),
+                Err(EnterpriseResourceError::GenerationRollback)
+            );
+            assert_eq!(wakes.0.load(Ordering::SeqCst), wake_count);
+            assert!(authentication.as_mut().poll(&mut task).is_pending());
+            assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(verifier.source.admission.active.lock().unwrap().len(), 1);
+            assert_eq!(timer.pending_count(), 1);
+
+            delayed.release();
+            let facts = match authentication.as_mut().poll(&mut task) {
+                Poll::Ready(Ok(facts)) => facts,
+                _ => panic!("rejected policy update must preserve valid pending authentication"),
+            };
+            assert_eq!(facts.subject.as_deref(), Some("alice"));
+            assert!(facts.verification_is_current());
+            drop(authentication);
+            assert!(verifier.source.admission.active.lock().unwrap().is_empty());
+            assert_eq!(timer.pending_count(), 0);
+            assert!(context.checkpoint().is_ok());
+            assert!(caller.checkpoint().is_ok());
+            let again =
+                ready(provider.authenticate_async(&context, request(&params, &authorization)))
+                    .unwrap();
+            assert_eq!(again.session_owner(), facts.session_owner());
+            assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
         });
         assert_eq!(timer.pending_count(), 0);
         drop(caller);
