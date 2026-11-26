@@ -6736,11 +6736,12 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// or skips that disagree require an explicit `json_schema()` implementation.
 /// Enum schemas follow Serde's external, internal (`tag`), adjacent (`tag` and
 /// `content`), and `untagged` representations. Internal tagging supports named
-/// and unit variants, plus newtypes containing a derived named-object payload.
-/// Internal newtypes preserve their payload's references and reject discriminator
-/// collisions, closed objects, root resource/applicator boundaries, and catch-all
-/// maps. Other internal newtype payloads require adjacent tagging or an explicit
-/// schema. Adjacent tagging supports every payload form. Untagged
+/// and unit variants, plus newtypes containing a derived named object or a
+/// String-keyed map. Closed object payloads retain their unknown-field policy.
+/// Map and catch-all payloads validate every additional member using the map's
+/// value schema. The discriminator is reserved. Root resources, applicators,
+/// and unsupported payload shapes require an explicit schema or adjacent
+/// tagging. Adjacent tagging supports every payload form. Untagged
 /// enums and trailing `#[serde(untagged)]` variants use `anyOf` so overlapping
 /// alternatives remain valid. Enum aliases, catch-all variants, flattened
 /// fields, and container/variant wire conversions require an explicit schema
@@ -8052,20 +8053,26 @@ fn generate_enum_variant_schema(
                         "internally tagged newtype payloads cannot be skipped, defaulted, or conditionally omitted; implement json_schema() explicitly",
                     ));
                 }
-                let payload = match schema_flatten_type(&field.ty) {
-                    Ok(SchemaFlattenType::Object(payload)) => payload,
-                    Ok(SchemaFlattenType::MapValue(_)) | Err(_) => {
-                        return Err(syn::Error::new_spanned(
-                            field,
-                            "internally tagged newtype schemas require a derived named-object payload; use adjacent tagging or implement json_schema() explicitly",
-                        ));
+                match schema_flatten_type(&field.ty) {
+                    Ok(SchemaFlattenType::Object(payload)) => Ok(quote! {
+                        fastmcp_protocol::schema::FlattenedObjectSchema::internally_tagged::<#payload>(
+                            __fastmcp_schema_context, #tag, #name,
+                        )
+                    }),
+                    Ok(SchemaFlattenType::MapValue(value_ty)) => {
+                        let value_schema = type_to_json_schema(value_ty, generic_params);
+                        Ok(quote! {{
+                            let value_schema = #value_schema;
+                            fastmcp_protocol::schema::FlattenedObjectSchema::internally_tagged_map(
+                                __fastmcp_schema_context, #tag, #name, value_schema,
+                            )
+                        }})
                     }
-                };
-                Ok(quote! {
-                    fastmcp_protocol::schema::FlattenedObjectSchema::internally_tagged::<#payload>(
-                        __fastmcp_schema_context, #tag, #name,
-                    )
-                })
+                    Err(_) => Err(syn::Error::new_spanned(
+                        field,
+                        "internally tagged newtype schemas require a derived named-object payload or a String-keyed map; use adjacent tagging or implement json_schema() explicitly",
+                    )),
+                }
             }
             syn::Fields::Unnamed(_) => Err(syn::Error::new_spanned(
                 variant,
@@ -8896,7 +8903,7 @@ mod serde_schema_tests {
                 "require a derived named-object payload",
             ),
             (
-                syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Value(BTreeMap<String, u8>) } },
+                syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Value(BTreeMap<u32, u8>) } },
                 "require a derived named-object payload",
             ),
             (

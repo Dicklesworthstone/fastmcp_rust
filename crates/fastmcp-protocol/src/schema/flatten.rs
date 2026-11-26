@@ -47,9 +47,9 @@ impl FlattenedObjectSchema {
     /// derived named-object payload. The cached payload body remains unchanged
     /// so another variant or an ordinary property can reuse its original refs.
     ///
-    /// This deliberately shares the bounded object-composition profile with
-    /// flattening. Arbitrary root applicators/resources, closed payloads and
-    /// catch-all maps require an explicit schema; no constraint is discarded.
+    /// Serde consumes the discriminator before decoding the payload. Declaring
+    /// it as an ordinary property keeps the payload's additionalProperties
+    /// rule on every other unclaimed key, including for closed structs.
     #[must_use]
     pub fn internally_tagged<T: FlattenableSchemaObject>(
         context: &mut SchemaGenerator,
@@ -59,19 +59,40 @@ impl FlattenedObjectSchema {
         if context.error.is_some() {
             return Value::Bool(false);
         }
-        if T::DENY_UNKNOWN_FIELDS {
-            context.reject_flatten(
-                "$",
-                "internally tagged newtype payloads with deny_unknown_fields require an explicit schema",
-            );
+        let Some(mut body) = context.completed_flatten_body::<T>() else {
             return Value::Bool(false);
-        }
+        };
         let mut object = Self::new();
-        object.flatten::<T>(context);
+        // Only derived closure and catch-all maps can contribute this keyword.
+        // The copy was charged by completed_flatten_body. Keep the original
+        // value (and any reference inside it) in the same document scope.
+        if (T::DENY_UNKNOWN_FIELDS || T::HAS_FLATTEN_FIELDS)
+            && let Some(members) = body.as_object_mut()
+        {
+            object.catch_all = members.remove("additionalProperties");
+        }
+        object.merge_body(context, body);
+        object.finish_tagged(context, tag, variant)
+    }
+
+    /// Tags a String-keyed map, leaving its value schema on all other keys.
+    #[must_use]
+    pub fn internally_tagged_map(
+        context: &mut SchemaGenerator,
+        tag: &str,
+        variant: &str,
+        value_schema: Value,
+    ) -> Value {
+        let mut object = Self::new();
+        object.catch_all(context, value_schema);
+        object.finish_tagged(context, tag, variant)
+    }
+
+    fn finish_tagged(mut self, context: &mut SchemaGenerator, tag: &str, variant: &str) -> Value {
         if context.error.is_some() {
             return Value::Bool(false);
         }
-        if object.properties.contains_key(tag) {
+        if self.properties.contains_key(tag) {
             context.reject_flatten(
                 tag,
                 "internally tagged newtype payload property conflicts with the serde tag key",
@@ -89,13 +110,13 @@ impl FlattenedObjectSchema {
             context.error = Some(SchemaGenerationError::ByteLimit);
             return Value::Bool(false);
         }
-        object.property(
+        self.property(
             context,
             tag,
             serde_json::json!({ "type": "string", "const": variant }),
             true,
         );
-        object.finish()
+        self.finish()
     }
 
     /// Adds an ordinary field without silently replacing a renamed collision.
@@ -159,6 +180,11 @@ impl FlattenedObjectSchema {
         let Some(body) = context.completed_flatten_body::<T>() else {
             return;
         };
+        self.merge_body(context, body);
+        self.nested_flatten |= T::HAS_FLATTEN_FIELDS;
+    }
+
+    fn merge_body(&mut self, context: &mut SchemaGenerator, body: Value) {
         let Value::Object(mut body) = body else {
             context.reject_flatten("$", "serde(flatten) requires a derived named object");
             return;
@@ -212,7 +238,6 @@ impl FlattenedObjectSchema {
         // Moving its members here preserves property $refs and nested $ids.
         self.properties.extend(properties);
         self.required.extend(required_names);
-        self.nested_flatten |= T::HAS_FLATTEN_FIELDS;
     }
 
     /// Installs the value schema for a single final flattened String-keyed map.

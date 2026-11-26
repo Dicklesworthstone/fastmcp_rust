@@ -5946,7 +5946,7 @@ struct RepeatedConflictingFlattenedSchema {
     second: FlattenedSchemaFields,
 }
 
-#[derive(JsonSchema)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ClosedFlattenedSchemaFields {
     count: u8,
@@ -6119,6 +6119,7 @@ mod internally_tagged_newtypes {
         Start(CommandFields),
         #[serde(rename = "resume-job")]
         Resume(Box<CommandFields>),
+        Counters(BTreeMap<String, u8>),
         Finished,
     }
 
@@ -6270,38 +6271,48 @@ mod internally_tagged_newtypes {
         Value(ConflictingFields),
     }
 
-    #[derive(JsonSchema)]
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
     #[serde(tag = "kind")]
-    enum ClosedCommand {
-        Value(ClosedFlattenedSchemaFields),
-    }
-
-    #[derive(JsonSchema)]
-    #[serde(tag = "kind")]
-    enum CatchAllCommand {
-        Value(FlattenedTypedMapEnvelope),
+    enum CommandData {
+        Strict(ClosedFlattenedSchemaFields),
+        Extensions(FlattenedTypedMapEnvelope),
+        Values(HashMap<String, Option<RecursiveSchemaNode>>),
     }
 
     #[test]
-    fn json_schema_internal_newtypes_refuse_collisions_closure_and_budget_exhaustion() {
-        for (result, message) in [
-            (
-                ConflictingCommand::try_json_schema(),
-                "conflicts with the serde tag key",
-            ),
-            (
-                ClosedCommand::try_json_schema(),
-                "deny_unknown_fields require an explicit schema",
-            ),
-            (
-                CatchAllCommand::try_json_schema(),
-                "resources, applicators, closure",
-            ),
+    fn json_schema_internal_newtype_extra_keys_obey_the_original_payload_policy() {
+        let schema = fastmcp_rust::schema::admit_final_schema(CommandData::try_json_schema().unwrap())
+            .unwrap();
+        let mut extensions = flattened_typed_map_payload();
+        extensions["kind"] = json!("Extensions");
+        for valid in [
+            json!({"kind":"Strict", "count":255}),
+            extensions.clone(),
+            json!({"kind":"Values"}),
+            json!({"kind":"Values", "x":null, "y":{"value":1,"children":[]}}),
         ] {
-            let error =
-                result.expect_err("unsupported payloads cannot publish a partial tagged schema");
-            assert!(error.to_string().contains(message), "{error}");
+            assert_round_trip::<CommandData>(&schema, valid);
         }
+        extensions["unclaimed"] = json!({"value":"bad","children":[]});
+        for invalid in [
+            json!({"kind":"Strict", "count":1, "other":true}),
+            json!({"kind":"Strict"}),
+            json!({"kind":"Strict", "count":256}),
+            extensions,
+            json!({"kind":"Values", "x":{"value":0,"children":[{}]}}),
+            json!({"kind":"Values", "x":false}),
+            json!({"x":null}),
+        ] {
+            assert!(schema.validate(&invalid).is_err(), "{invalid}");
+            assert!(serde_json::from_value::<CommandData>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn json_schema_internal_newtypes_refuse_collisions_and_budget_exhaustion() {
+        let error = ConflictingCommand::try_json_schema()
+            .expect_err("a payload field cannot overwrite the discriminator");
+        assert!(error.to_string().contains("conflicts with the serde tag key"), "{error}");
         for (limits, expected) in [
             (
                 SchemaGenerationLimits {
@@ -6365,12 +6376,24 @@ mod internally_tagged_newtypes {
                 .await,
             );
             assert_schema_bound_success(&result, &expected);
-            for (property, value) in [
-                ("kind", json!("unknown")),
-                ("requestId", json!(false)),
-                ("attemptCount", json!(256)),
+            let counters = json!({"kind":"counters", "accepted":255});
+            let result = schema_bound_complete(
+                schema_bound_wire_call(
+                    &server,
+                    &connection,
+                    "echo_internal_newtype",
+                    json!({"value":counters.clone()}),
+                )
+                .await,
+            );
+            assert_schema_bound_success(&result, &counters);
+            for (base, property, value) in [
+                (&valid, "kind", json!("unknown")),
+                (&valid, "requestId", json!(false)),
+                (&valid, "attemptCount", json!(256)),
+                (&counters, "accepted", json!(256)),
             ] {
-                let mut invalid = valid.clone();
+                let mut invalid = (*base).clone();
                 invalid[property] = value;
                 let result = schema_bound_complete(
                     schema_bound_wire_call(
@@ -6385,7 +6408,7 @@ mod internally_tagged_newtypes {
                 assert_eq!(result["structuredContent"], json!({"kind":"finished"}));
                 assert_eq!(
                     COMMAND_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-                    before + 1,
+                    before + 2,
                     "invalid tagged payloads must not invoke the application handler"
                 );
             }
