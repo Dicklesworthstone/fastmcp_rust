@@ -1794,6 +1794,164 @@ enum HttpTaskWatchRetentionCase {
     OpeningCallerCancelled,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchInterruption {
+    BoundaryEof,
+    BrokenBody,
+    BeforeAck,
+    PartialSse,
+    InvalidRecord,
+    BadChunk,
+}
+
+fn http_drive_interruption(case: WatchInterruption, fallback: bool) {
+    use WatchInterruption as Case;
+
+    let recovers = fallback && matches!(case, Case::BoundaryEof | Case::BrokenBody);
+    let interval = if recovers { 400 } else { 60_000 };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let peer = std::thread::spawn(move || {
+        let mut discover = accept(&listener);
+        assert_eq!(read(&mut discover)["method"], "server/discover");
+        write(&mut discover, &discovery()).unwrap();
+
+        let mut attach = accept(&listener);
+        assert_eq!(read(&mut attach)["method"], "tasks/get");
+        // This retained input is stale across the listen gap. It must never
+        // trigger a callback or an update before an authoritative read.
+        write(&mut attach, &response(2, task("input_required", Some(interval)))).unwrap();
+        let initial_receipt = Instant::now();
+
+        let mut stream = accept(&listener);
+        let request = read(&mut stream);
+        assert_eq!(request["method"], "subscriptions/listen");
+        assert_eq!(request["id"], 3);
+        let ack = json!({
+            "jsonrpc":"2.0", "method":"notifications/subscriptions/acknowledged",
+            "params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3},
+                "notifications":{"taskIds":["wait-task"]}}
+        });
+        let mut body = if case == Case::BeforeAck {
+            String::new()
+        } else {
+            format!("data: {ack}\n\n")
+        };
+        match case {
+            Case::PartialSse => body.push_str("data: incomplete"),
+            Case::InvalidRecord => body.push_str("data: not-json\n\n"),
+            _ => {}
+        }
+        // A short fixed-length body fails in the HTTP decoder. A complete
+        // entity without a final MCP response reports end-of-stream instead.
+        if case == Case::BadChunk {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\nnot-hex\r\n",
+                body.len(),
+            ).unwrap();
+        } else {
+            let length = body.len() + usize::from(case == Case::BrokenBody) * 100;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}",
+            ).unwrap();
+        }
+        stream.flush().unwrap();
+        drop(stream);
+
+        let sibling_id = if recovers {
+            let mut get = accept(&listener);
+            let request = read(&mut get);
+            assert_eq!(request["method"], "tasks/get");
+            assert_eq!(request["id"], 4);
+            assert_eq!(request["params"]["taskId"], "wait-task");
+            assert!(
+                initial_receipt.elapsed() + Duration::from_millis(2)
+                    >= Duration::from_millis(interval)
+            );
+            write(&mut get, &response(4, task("completed", None))).unwrap();
+            5
+        } else {
+            4
+        };
+        // Any automatic reopen, early read or replayed input is observable.
+        let mut sibling = accept(&listener);
+        let request = read(&mut sibling);
+        assert_eq!(request["method"], "tools/list");
+        assert_eq!(request["id"], sibling_id);
+        write(
+            &mut sibling,
+            &json!({"jsonrpc":"2.0","id":sibling_id,"result":{
+                "resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"
+            }}),
+        ).unwrap();
+    });
+
+    RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().unwrap())
+        .build()
+        .unwrap()
+        .block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut client = HttpClient::connect(
+                &cx,
+                plan(&target),
+                ClientInfo { name: "http-watch-recovery".to_owned(), version: "1".to_owned() },
+                ClientCapabilities::default(),
+            ).await.unwrap();
+            let handle = client.attach_final_task(
+                &cx, FinalTaskId::parse("wait-task").unwrap()
+            ).await.unwrap();
+            let mut policy = FinalTaskDrivePolicy::new(
+                policy(5000, 1, 1), 1, 4, 4096, 8192
+            ).unwrap();
+            if fallback {
+                policy = policy.with_http_poll_fallback();
+            }
+            let mut driver = handle.into_driver(policy);
+            let outcome = driver.drive_watching(
+                &cx,
+                &mut client,
+                &McpRequestCancellation::new(),
+                crate::sse::SseLimits::new(4096, 8192, 8).unwrap(),
+            ).await;
+            if recovers {
+                assert_eq!(outcome.unwrap(), FinalTaskWaitOutcome::Completed);
+                assert!(matches!(driver.task(), FinalTask::Completed { .. }));
+            } else {
+                assert!(matches!(outcome, Err(HttpClientError::Connection(
+                    crate::ClientHttpConnectionError::SubscriptionsListen(_)
+                ))));
+                assert!(matches!(driver.task(), FinalTask::InputRequired { .. }));
+            }
+            assert!(!driver.input_resolution_interrupted());
+            client.list_tools(&cx, None).await.unwrap();
+        });
+    peer.join().unwrap();
+}
+
+#[test]
+fn public_http_driver_reconciles_an_acknowledged_watch_interruption_by_polling() {
+    for case in [WatchInterruption::BoundaryEof, WatchInterruption::BrokenBody] {
+        http_drive_interruption(case, true);
+    }
+}
+
+#[test]
+fn public_http_driver_preserves_fail_fast_and_wire_admission_errors() {
+    http_drive_interruption(WatchInterruption::BoundaryEof, false);
+    for case in [
+        WatchInterruption::BeforeAck,
+        WatchInterruption::PartialSse,
+        WatchInterruption::InvalidRecord,
+        WatchInterruption::BadChunk,
+    ] {
+        http_drive_interruption(case, true);
+    }
+}
+
 fn write_http_task_watch_event(stream: &mut TcpStream, event: Value) {
     write!(stream, "data: {event}\n\n").unwrap();
     stream.flush().unwrap();

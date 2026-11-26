@@ -1906,6 +1906,15 @@ streams. Reads respect the Task's latest `pollIntervalMs`. One invocation
 budget covers subscription setup, waiting, reads, callbacks, and updates;
 `with_maximum_notifications` also bounds repeated notifications.
 
+For native HTTP, select `with_http_poll_fallback()` on
+the policy passed to `into_driver` to continue after an acknowledged SSE
+response loses its connection, ends early with a fixed content length, or ends
+between events without a terminal response. The driver retires the listener
+and reads `tasks/get` on the original poll schedule before answering any more
+input. The original deadline, retention bound, and answered-input ledger
+remain in force. An invalid MCP record, a partial SSE event at clean EOF,
+a chunk framing error, or a failed input update still returns an error.
+
 Keep the same driver when continuing a Task. Its lifetime input ledger prevents
 an already answered input key from invoking a callback again, including after
 a partial update or a switch between watching and polling. Dropping or

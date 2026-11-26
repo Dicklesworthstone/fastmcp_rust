@@ -1090,6 +1090,9 @@ impl HttpResponseDeadline {
 pub struct ModernHttpBody {
     inner: Option<ClientIncomingBody<ModernHttpIo>>,
     deadline: HttpResponseDeadline,
+    // The public body error deliberately elides HTTP decoder details. Retain
+    // just the disposition needed by a caller-owned, read-only Task watch.
+    interrupted: bool,
 }
 
 impl ModernHttpBody {
@@ -1124,7 +1127,26 @@ impl Body for ModernHttpBody {
             return Poll::Ready(Some(Err(error)));
         }
         match frame {
-            Poll::Ready(Some(Err(_))) => {
+            Poll::Ready(Some(Err(error))) => {
+                use asupersync::http::h1::HttpError;
+                use std::io::ErrorKind;
+
+                self.interrupted = match error {
+                    // The head has already been admitted. In the pinned body
+                    // decoder this is early EOF in a fixed-length response.
+                    HttpError::BadContentLength => true,
+                    HttpError::Io(error) => matches!(
+                        error.kind(),
+                        ErrorKind::UnexpectedEof
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::ConnectionAborted
+                            | ErrorKind::BrokenPipe
+                            | ErrorKind::NotConnected
+                    ),
+                    // Chunked decoding can report the same error for early EOF
+                    // and malformed chunk syntax. Keep ambiguous errors terminal.
+                    _ => false,
+                };
                 self.inner = None;
                 self.deadline.sleep = None;
                 Poll::Ready(Some(Err(ModernHttpExecutorError::ResponseBodyReadFailed)))
@@ -1211,6 +1233,7 @@ impl ModernHttpResponseStream {
             pending_events: VecDeque::new(),
             pending_event_bytes: 0,
             end_of_stream: None,
+            body_interrupted: false,
         })
     }
 
@@ -1563,6 +1586,11 @@ impl HttpSubscriptionCollectionBudget {
 }
 
 impl ModernHttpSubscriptionListener {
+    #[cfg(feature = "tasks")]
+    pub(crate) const fn body_interrupted(&self) -> bool {
+        self.stream.body_interrupted
+    }
+
     /// Tightens decoded JSON admission independently of the SSE framing
     /// allowance. Managed callers use this before consuming any stream event.
     pub(crate) fn with_maximum_jsonrpc_bytes(mut self, maximum_bytes: usize) -> Self {
@@ -3730,6 +3758,7 @@ pub struct ModernHttpSseResponseStream {
     pending_events: VecDeque<String>,
     pending_event_bytes: usize,
     end_of_stream: Option<SseEndOfStream>,
+    body_interrupted: bool,
 }
 
 impl fmt::Debug for ModernHttpSseResponseStream {
@@ -3755,7 +3784,9 @@ impl ModernHttpSseResponseStream {
     /// and every refused wire record so a caller cannot resume a malformed
     /// stream.
     fn close(&mut self) {
-        self.response = None;
+        if let Some(response) = self.response.take() {
+            self.body_interrupted = response.body.interrupted;
+        }
         self.diagnostic_credential = None;
         self.parser = None;
         self.pending_events.clear();
@@ -3784,6 +3815,7 @@ impl ModernHttpSseResponseStream {
             pending_events: VecDeque::new(),
             pending_event_bytes: 0,
             end_of_stream: None,
+            body_interrupted: false,
         }
     }
 
@@ -5138,6 +5170,7 @@ impl ModernHttpExecutor {
                 body: ModernHttpBody {
                     inner: Some(response.body),
                     deadline,
+                    interrupted: false,
                 },
                 body_withheld: response.body_withheld,
             }),

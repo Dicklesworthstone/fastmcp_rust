@@ -122,6 +122,7 @@ pub struct FinalTaskDrivePolicy {
     maximum_state_bytes: usize,
     maximum_payload_bytes: usize,
     maximum_notifications: usize,
+    poll_on_http_watch_interruption: bool,
 }
 
 impl Default for FinalTaskDrivePolicy {
@@ -133,6 +134,7 @@ impl Default for FinalTaskDrivePolicy {
             maximum_state_bytes: 1024 * 1024,
             maximum_payload_bytes: 8 * 1024 * 1024,
             maximum_notifications: 4096,
+            poll_on_http_watch_interruption: false,
         }
     }
 }
@@ -162,6 +164,7 @@ impl FinalTaskDrivePolicy {
             maximum_state_bytes,
             maximum_payload_bytes,
             maximum_notifications: 4096,
+            poll_on_http_watch_interruption: false,
         })
     }
 
@@ -180,6 +183,20 @@ impl FinalTaskDrivePolicy {
         }
         self.maximum_notifications = maximum;
         Ok(self)
+    }
+
+    /// Continues an acknowledged native HTTP watch by polling if its SSE
+    /// response body breaks or ends at an event boundary without a terminal.
+    /// The next permitted `tasks/get` reconciles the gap before more input
+    /// callbacks run. This keeps the original deadlines, poll limits and
+    /// answered-input ledger. It never reopens the listener or retries an
+    /// input update. Opening failures, invalid MCP records and cancellation
+    /// retain their original errors. Other transports keep their existing
+    /// connection-ownership rules.
+    #[must_use]
+    pub const fn with_http_poll_fallback(mut self) -> Self {
+        self.poll_on_http_watch_interruption = true;
+        self
     }
 
     fn ledger_policy(self) -> ManagedTaskDriverPolicy {
@@ -313,9 +330,11 @@ impl FinalTaskDriver {
     ///
     /// An empty accepted filter or a normal subscription completion/cancellation
     /// retires this listener and continues with bounded polling. It never opens
-    /// a replacement subscription or repeats an uncertain update. Malformed or
-    /// interrupted streams return their transport error; use the retained
-    /// snapshot and interruption latch to decide an explicit next action.
+    /// a replacement subscription or repeats an uncertain update. To continue
+    /// polling after an acknowledged HTTP body is interrupted, select
+    /// [`FinalTaskDrivePolicy::with_http_poll_fallback`]. By default, interrupted
+    /// streams return their transport error. Invalid MCP records are errors in
+    /// both modes.
     pub async fn drive_watching(
         &mut self,
         cx: &Cx,
@@ -2393,6 +2412,10 @@ trait TaskDriveWatchTransport: TaskInputTransport {
         listener: &mut Self::Listener,
     ) -> Result<StdioTaskSubscriptionEvent, Self::Error>;
 
+    fn can_poll_after_interruption(_listener: &Self::Listener, _error: &Self::Error) -> bool {
+        false
+    }
+
     fn abandon_drive_watch(&mut self, listener: Self::Listener);
 }
 
@@ -2552,6 +2575,29 @@ impl TaskDriveWatchTransport for HttpTaskInputTransport<'_> {
                 "Final Task watch received an unrequested core notification",
             )
             .into()),
+        }
+    }
+
+    fn can_poll_after_interruption(listener: &Self::Listener, error: &Self::Error) -> bool {
+        use crate::http_executor::{ModernHttpExecutorError, ModernHttpSubscriptionListenError};
+
+        let HttpClientError::Connection(crate::ClientHttpConnectionError::SubscriptionsListen(
+            cause,
+        )) = error
+        else {
+            return false;
+        };
+        if listener.accepted_filter().is_none() {
+            return false;
+        }
+        match cause {
+            ModernHttpSubscriptionListenError::EndOfStream { framing: Some(end) } => {
+                !end.discarded_pending_event && !end.discarded_partial_line
+            }
+            ModernHttpSubscriptionListenError::Executor(
+                ModernHttpExecutorError::ResponseBodyReadFailed,
+            ) => listener.body_interrupted(),
+            _ => false,
         }
     }
 
@@ -2721,6 +2767,16 @@ async fn drive_task_watching<T: TaskDriveWatchTransport>(
             )
             .await
         {
+            Ok(Err(error))
+                if policy.poll_on_http_watch_interruption
+                    && watch.listener.as_ref().is_some_and(|listener| {
+                        T::can_poll_after_interruption(listener, &error)
+                    }) =>
+            {
+                watch.retire();
+                driver.reconcile_before_input = true;
+                continue;
+            }
             Ok(result) => result?,
             Err(outcome) => return Ok(outcome),
         };
