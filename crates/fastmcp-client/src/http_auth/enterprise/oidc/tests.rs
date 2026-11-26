@@ -139,7 +139,7 @@ fn admit_configuration(
     )
 }
 
-fn configuration() -> OidcCodeFlowConfiguration {
+pub(in crate::http_auth::enterprise) fn configuration() -> OidcCodeFlowConfiguration {
     let (profile, documents) = profile_and_documents();
     admit_configuration(
         profile,
@@ -148,6 +148,13 @@ fn configuration() -> OidcCodeFlowConfiguration {
         EnterpriseOidcSubjectType::Public,
     )
     .unwrap()
+}
+
+pub(in crate::http_auth::enterprise) fn configuration_and_profile(
+) -> (OidcCodeFlowConfiguration, EnterpriseProfile) {
+    let selected = configuration();
+    let profile = selected.profile.clone();
+    (selected, profile)
 }
 
 fn prepared() -> PreparedOidcAuthorization {

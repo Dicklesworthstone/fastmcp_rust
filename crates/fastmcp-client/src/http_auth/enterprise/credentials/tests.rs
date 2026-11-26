@@ -413,6 +413,8 @@ struct FixtureBlobs {
     journal: Arc<Mutex<Journal>>,
     reads: AtomicUsize,
     next_read_gate: Mutex<Option<Arc<CredentialReadGate>>>,
+    next_commit_gate: Mutex<Option<Arc<CredentialReadGate>>>,
+    lose_commit_response: AtomicBool,
     corrupt_read_receipt: AtomicBool,
 }
 
@@ -456,6 +458,10 @@ impl PersistentBlobBackend for FixtureBlobs {
         request: &'a PersistentBlobCommitRequest<'a>,
     ) -> PersistentBackendFuture<'a, PersistentBlobCommitResult> {
         Box::pin(async move {
+            let gate = self.next_commit_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.wait().await;
+            }
             let fence = request.write_fence();
             let next = request.next_revision();
             let mut journal = self.journal.lock().unwrap();
@@ -550,6 +556,9 @@ impl PersistentBlobBackend for FixtureBlobs {
                     .unwrap(),
                 )
             };
+            if self.lose_commit_response.swap(false, Ordering::AcqRel) {
+                return Err(unavailable());
+            }
             Ok(PersistentBlobCommitResult {
                 receipt: request.receipt(),
                 outcome,
@@ -599,6 +608,8 @@ impl CredentialStoreFixture {
             journal,
             reads: AtomicUsize::new(0),
             next_read_gate: Mutex::new(None),
+            next_commit_gate: Mutex::new(None),
+            lose_commit_response: AtomicBool::new(false),
             corrupt_read_receipt: AtomicBool::new(false),
         });
         let store = PersistentBlobStore::new(
@@ -656,6 +667,29 @@ impl CredentialStoreFixture {
         assert!(next.is_none(), "previous read gate has not been consumed");
         *next = Some(Arc::clone(&gate));
         gate
+    }
+
+    pub(in crate::http_auth::enterprise) fn pause_next_commit(&self) -> Arc<CredentialReadGate> {
+        let gate = Arc::new(CredentialReadGate::default());
+        let mut next = self.blobs.next_commit_gate.lock().unwrap();
+        assert!(next.is_none(), "previous commit gate has not been consumed");
+        *next = Some(Arc::clone(&gate));
+        gate
+    }
+
+    pub(in crate::http_auth::enterprise) fn lose_next_commit_response(&self) {
+        self.blobs.lose_commit_response.store(true, Ordering::Release);
+    }
+
+    pub(in crate::http_auth::enterprise) fn corrupt_next_read_receipt(&self) {
+        self.blobs.corrupt_read_receipt.store(true, Ordering::Release);
+    }
+
+    pub(in crate::http_auth::enterprise) fn current_revision(
+        &self,
+        record_id: [u8; 16],
+    ) -> PersistentBlobRevision {
+        self.blobs.journal.lock().unwrap().records[&record_id].revision
     }
 }
 

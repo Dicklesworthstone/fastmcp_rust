@@ -6,10 +6,11 @@
 //! guarded [`super::response::EnterpriseExchangeDriver`] can consume its code
 //! grant directly for native HTTPS redemption. These codecs do not launch a
 //! browser or create deployment/dispatch receipts.
-//! Its in-memory owners are not the durable pending-flow store required for
-//! enterprise activation. An embedding must separately provide the attested
-//! browser, persistent custody, replay and identity authorities before using
-//! these codecs in an operational enterprise authorization flow.
+//! The optional `persistence` consumer protects pending challenges through an
+//! exact-revision blob store and consumes them atomically before callback
+//! admission. It does not attest browser launch, callback origin, or the full
+//! enterprise flow. An embedding must separately provide qualified storage,
+//! browser, replay and identity authorities for enterprise activation.
 //! HTTPS checks here admit URL syntax only. Public-address/DNS/SSRF and origin
 //! authorization still belong to the independently guarded adapter and transport.
 
@@ -38,6 +39,8 @@ use super::response::{
 };
 use super::verification::{OidcVerificationKeys, TenantExpectation};
 
+pub mod persistence;
+
 #[cfg(test)]
 pub(super) mod tests;
 
@@ -64,6 +67,7 @@ pub enum OidcCodeFlowError {
     IssuerMismatch,
     EncodingFailed,
     TokenResponseRejected,
+    PersistentCustodyUnavailable,
 }
 
 impl fmt::Display for OidcCodeFlowError {
@@ -89,6 +93,9 @@ impl fmt::Display for OidcCodeFlowError {
             }
             Self::EncodingFailed => "enterprise OIDC confidential form serialization failed",
             Self::TokenResponseRejected => "enterprise OIDC signed token response was refused",
+            Self::PersistentCustodyUnavailable => {
+                "enterprise OIDC protected flow custody is unavailable"
+            }
         })
     }
 }
@@ -460,9 +467,23 @@ impl OidcCodeFlowConfiguration {
         created_at: SystemTime,
         expires_at: SystemTime,
     ) -> Result<PreparedOidcAuthorization, OidcCodeFlowError> {
-        let state = base64url32(state);
-        let nonce = base64url32(nonce);
-        let verifier = base64url32(verifier);
+        self.prepare_from_challenges(
+            base64url32(state),
+            base64url32(nonce),
+            base64url32(verifier),
+            created_at,
+            expires_at,
+        )
+    }
+
+    fn prepare_from_challenges(
+        &self,
+        state: SecretString,
+        nonce: SecretString,
+        verifier: SecretString,
+        created_at: SystemTime,
+        expires_at: SystemTime,
+    ) -> Result<PreparedOidcAuthorization, OidcCodeFlowError> {
         let challenge = base64url32(&digest(verifier.as_bytes(), 43)?);
         let query = form(
             &[
@@ -622,6 +643,7 @@ impl PreparedOidcAuthorization {
                     callback_digest: digest(callback_uri.as_bytes(), MAX_CALLBACK_BYTES)?,
                     created_at: received_at,
                     expires_at: self.expires_at,
+                    persistent_custody: None,
                 }))
             }
             (None, Some(error)) => {
@@ -683,6 +705,7 @@ pub struct OidcCodeGrant {
     callback_digest: [u8; 32],
     created_at: SystemTime,
     expires_at: SystemTime,
+    persistent_custody: Option<persistence::OidcFlowCustodyGuard>,
 }
 
 impl OidcCodeGrant {
@@ -691,6 +714,27 @@ impl OidcCodeGrant {
     }
     pub fn expires_at(&self) -> SystemTime {
         self.expires_at
+    }
+
+    pub(super) fn check_custody(&self) -> Result<(), OidcCodeFlowError> {
+        if let Some(guard) = &self.persistent_custody {
+            guard.check()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn custody_deadline(&self) -> Option<std::time::Instant> {
+        self.persistent_custody.as_ref().map(|guard| guard.valid_until())
+    }
+
+    pub(super) fn admit_credential_snapshot(
+        &self,
+        snapshot: Option<&super::identity::EnterpriseIdentitySnapshotKey>,
+    ) -> Result<(), OidcCodeFlowError> {
+        if let Some(guard) = &self.persistent_custody {
+            guard.admit_snapshot(snapshot)?;
+        }
+        Ok(())
     }
 
     /// Reject input authority drift before a provider is allowed to access a
@@ -703,6 +747,8 @@ impl OidcCodeGrant {
         keys: &OidcVerificationKeys,
         now: SystemTime,
     ) -> Result<(), EnterpriseExchangeError> {
+        self.check_custody()
+            .map_err(EnterpriseExchangeError::CodeFlowRejected)?;
         if self.configuration.profile != *profile
             || self.configuration.response_policy != policy
             || keys.issuer() != profile.idp_issuer()
@@ -755,17 +801,22 @@ impl OidcCodeGrant {
     /// observe the code/verifier and must erase its storage on every outcome.
     /// A complete write returns the private nonce-bound response admission owner;
     /// a partial/error write destroys it and cannot restore this code grant.
+    /// Persisted grants require native provider-backed redemption with their
+    /// exact identity snapshot; they refuse this unbound local sink.
     pub fn write_token_form(
         self,
         writer: &mut dyn Write,
         now: SystemTime,
     ) -> Result<OidcCodeResponseAdmission, OidcCodeFlowError> {
+        self.admit_credential_snapshot(None)?;
+        self.check_custody()?;
         live(self.created_at, self.expires_at, now)?;
         let body = form(&self.token_fields(), MAX_CODE_FORM_BYTES)?;
         writer
             .write_all(body.as_bytes())
             .map_err(|_| OidcCodeFlowError::EncodingFailed)?;
         let request_digest = digest(body.as_bytes(), MAX_CODE_FORM_BYTES)?;
+        self.check_custody()?;
         Ok(self.into_response_admission(request_digest, now))
     }
 
@@ -791,6 +842,7 @@ impl OidcCodeGrant {
             request_digest,
             created_at: now,
             expires_at: self.expires_at,
+            persistent_custody: self.persistent_custody,
         }
     }
 }
@@ -805,9 +857,17 @@ pub struct OidcCodeResponseAdmission {
     request_digest: [u8; 32],
     created_at: SystemTime,
     expires_at: SystemTime,
+    persistent_custody: Option<persistence::OidcFlowCustodyGuard>,
 }
 
 impl OidcCodeResponseAdmission {
+    pub(super) fn check_custody(&self) -> Result<(), OidcCodeFlowError> {
+        if let Some(guard) = &self.persistent_custody {
+            guard.check()?;
+        }
+        Ok(())
+    }
+
     pub fn launch_url_digest(&self) -> &[u8; 32] {
         &self.launch_url_digest
     }
@@ -827,8 +887,10 @@ impl OidcCodeResponseAdmission {
         keys: &OidcVerificationKeys,
         received_at: SystemTime,
     ) -> Result<EnterpriseResponseOutcome<EnterpriseIdentityAssertion>, OidcCodeFlowError> {
+        self.check_custody()?;
         live(self.created_at, self.expires_at, received_at)?;
-        self.configuration
+        let outcome = self
+            .configuration
             .profile
             .admit_oidc_code_response(
                 response,
@@ -839,7 +901,9 @@ impl OidcCodeResponseAdmission {
                 self.configuration.response_policy,
                 received_at,
             )
-            .map_err(|_| OidcCodeFlowError::TokenResponseRejected)
+            .map_err(|_| OidcCodeFlowError::TokenResponseRejected)?;
+        self.check_custody()?;
+        Ok(outcome)
     }
 }
 

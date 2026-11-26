@@ -219,6 +219,16 @@ impl Default for EnterpriseResponsePolicy {
     }
 }
 impl EnterpriseResponsePolicy {
+    pub(super) const fn binding_durations(self) -> [Duration; 5] {
+        [
+            self.id_token_lifetime,
+            self.id_jag_lifetime,
+            self.access_token_lifetime,
+            self.clock_skew,
+            self.maximum_step_up_age,
+        ]
+    }
+
     pub fn new(
         id_token_lifetime: Duration,
         id_jag_lifetime: Duration,
@@ -1173,6 +1183,13 @@ impl EnterpriseExchangeDriver {
         let admitted = crate::http_auth::caller::with_caller(cx, admit_exchange_caller)?;
         let clock = ExchangeClock::new(received_at, admitted.now());
         let expires_at = grant.expires_at();
+        let credential_snapshot = match &credentials {
+            ExchangeCredentials::Local(_) => None,
+            ExchangeCredentials::Protected { expected_snapshot, .. } => Some(*expected_snapshot),
+        };
+        grant
+            .admit_credential_snapshot(credential_snapshot)
+            .map_err(EnterpriseExchangeError::CodeFlowRejected)?;
         grant.admit_token_request(
             &self.inner.profile,
             self.inner.response_policy,
@@ -1180,6 +1197,9 @@ impl EnterpriseExchangeDriver {
             clock.wall_now()?,
         )?;
         let input_deadline = clock.deadline(expires_at)?;
+        let input_deadline = grant
+            .custody_deadline()
+            .map_or(input_deadline, |limit| limit.min(input_deadline));
         let deadline = ExchangeDeadline::new(
             &admitted,
             &clock,
@@ -1193,7 +1213,11 @@ impl EnterpriseExchangeDriver {
                 &self.inner.profile,
                 EnterpriseCredentialRole::Idp,
                 deadline,
-                || Ok(()),
+                || {
+                    grant
+                        .check_custody()
+                        .map_err(EnterpriseExchangeError::CodeFlowRejected)
+                },
             )
             .await?;
         let (request, response_admission) = grant.into_token_request(
@@ -1211,9 +1235,13 @@ impl EnterpriseExchangeDriver {
                 deadline,
                 &credential,
                 Arc::clone(&permit),
-                // No identity assertion exists until this response is verified.
-                // Replay reservation is mandatory in the subsequent stage.
-                || Ok(()),
+                // Retain protected pending-flow custody through the POST.
+                // Identity-assertion replay reservation belongs to the next stage.
+                || {
+                    response_admission
+                        .check_custody()
+                        .map_err(EnterpriseExchangeError::CodeFlowRejected)
+                },
             )
             .await?;
         let observation = EnterpriseExchangeObservation {

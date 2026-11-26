@@ -4249,3 +4249,214 @@ fn enterprise_exchange_restore_quarantine_during_post_discards_the_reply() {
         assert!(!driver.inner.busy.load(Ordering::Acquire));
     });
 }
+
+
+async fn resumed_protected_code(
+    cx: &Cx,
+    fixture: &CredentialStoreFixture,
+    configuration: crate::http_auth::enterprise::oidc::OidcCodeFlowConfiguration,
+    snapshot: &EnterpriseIdentitySnapshotKey,
+    resume_at: SystemTime,
+    callback_at: SystemTime,
+) -> (OidcCodeGrant, fastmcp_core::persistent::PersistentBlobRevision) {
+    use crate::http_auth::enterprise::oidc::{OidcCallbackOutcome, persistence::OidcPendingFlowStore};
+
+    let flows = OidcPendingFlowStore::new(configuration, snapshot.clone(), fixture.store()).unwrap();
+    let pending = flows.prepare(cx, now(), Duration::from_secs(300), Time::MAX).await.unwrap();
+    let revision = pending.revision();
+    let parsed = CanonicalHttpUrl::parse(pending.authorization_url().unwrap()).unwrap();
+    let state = parsed.query().unwrap().split('&').find_map(|field| field.strip_prefix("state=")).unwrap();
+    let callback = format!("https://client.example/callback?state={state}&iss=https%3A%2F%2Fidp.example&code=resumed-code");
+    drop(pending);
+    let pending = flows.resume(cx, revision, resume_at, Time::MAX).await.unwrap();
+    let outcome = pending.admit_callback(cx, &callback, callback_at, Time::MAX).await.unwrap();
+    match outcome {
+        OidcCallbackOutcome::Code(grant) => (grant, fixture.current_revision(revision.record_id())),
+        OidcCallbackOutcome::Denied(_) => panic!("expected persisted code grant"),
+    }
+}
+
+#[test]
+fn enterprise_persisted_oidc_grant_requires_original_snapshot_at_native_provider_consumer() {
+    let (oidc_keys, _) = keys();
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        for mode in 0..3 {
+            let (configuration, selected) =
+                crate::http_auth::enterprise::oidc::tests::configuration_and_profile();
+            let mappings = subject_mappings(&selected);
+            let flow_fixture = CredentialStoreFixture::new(&cx).await;
+            let (grant, _) = resumed_protected_code(
+                &cx, &flow_fixture, configuration, mappings.snapshot(), now(), now(),
+            ).await;
+            let credential_fixture = CredentialStoreFixture::new(&cx).await;
+            let mut changed = subject_configuration(&selected);
+            changed.snapshot.generation += 1;
+            let changed_mappings = EnterpriseSubjectMappingTable::from_trusted_configuration(
+                &selected, changed, vec![subject_mapping()], now(),
+            ).unwrap();
+            let expected_snapshot = if mode == 1 { changed_mappings.snapshot() } else { mappings.snapshot() };
+            let (provider, _) = protected_exchange_provider(
+                &cx, &credential_fixture, &selected, expected_snapshot,
+                EnterpriseCredentialRole::Idp, "protected-native-secret",
+            ).await;
+
+            let fetcher = test_fetcher();
+            let mut response = ok_exchange_response(
+                "idp.example", fetcher.root_identity(), br#"{"error":"invalid_grant"}"#.to_vec(),
+            );
+            response.status = 400;
+            let poster = ScriptedExchangePoster::new(if mode == 0 { vec![Ok(response)] } else { vec![] });
+            let (driver, _) = driver_with_poster(selected.clone(), Arc::clone(&poster));
+            let result = if mode == 2 {
+                let raw = EnterpriseClientSecret::try_new("unbound-secret").unwrap();
+                driver.exchange_oidc_code_for_identity(&cx, grant, &raw, &oidc_keys, now()).await
+            } else {
+                driver.exchange_oidc_code_for_identity_with_provider(
+                    &cx, grant, &provider, expected_snapshot, &oidc_keys, now(),
+                ).await
+            };
+            if mode == 0 {
+                assert!(matches!(result, Ok((EnterpriseResponseOutcome::Denied { denial, .. }, _))
+                    if denial.code() == EnterpriseOAuthErrorCode::InvalidGrant));
+                let recorded = poster.take_recorded();
+                assert_eq!(recorded.len(), 1);
+                assert!(recorded[0].body.contains("code=resumed-code"));
+                assert!(recorded[0].body.contains("code_verifier="));
+                assert_eq!(credential_fixture.read_count(), 1);
+            } else {
+                assert_eq!(result.err(), Some(EnterpriseExchangeError::CodeFlowRejected(
+                    OidcCodeFlowError::PersistentCustodyUnavailable,
+                )));
+                assert_eq!(credential_fixture.read_count(), 0, "refused binding read a secret");
+                assert!(poster.take_recorded().is_empty());
+            }
+            assert!(!driver.inner.busy.load(Ordering::Acquire));
+        }
+    });
+}
+
+#[test]
+fn enterprise_persisted_oidc_quarantine_during_post_withholds_the_response() {
+    struct QuarantinePoster {
+        flow: Arc<CredentialStoreFixture>,
+        consumed: fastmcp_core::persistent::PersistentBlobRevision,
+        response: std::sync::Mutex<Option<GuardedHttpFetchResponse>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl ExchangePoster for QuarantinePoster {
+        fn post<'a>(
+            &'a self, cx: &'a Cx, _url: &'a GuardedHttpsUrl, _request: &'a GuardedHttpRequest,
+            _lifetime: Arc<dyn Send + Sync>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<GuardedHttpFetchResponse, GuardedHttpFetchError>> + Send + 'a>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                self.flow.corrupt_next_read_receipt();
+                assert!(self.flow.store().read(cx, &self.consumed, Time::MAX).await.is_err());
+                assert!(self.flow.store().is_quarantined());
+                Ok(self.response.lock().unwrap().take().unwrap())
+            })
+        }
+    }
+
+    let (oidc_keys, _) = keys();
+    run_exchange_async(async {
+        let cx = Cx::current().unwrap();
+        let (configuration, selected) =
+            crate::http_auth::enterprise::oidc::tests::configuration_and_profile();
+        let mappings = subject_mappings(&selected);
+        let flow_fixture = Arc::new(CredentialStoreFixture::new(&cx).await);
+        let (grant, consumed) = resumed_protected_code(
+            &cx, &flow_fixture, configuration, mappings.snapshot(), now(), now(),
+        ).await;
+        let credential_fixture = CredentialStoreFixture::new(&cx).await;
+        let (provider, _) = protected_exchange_provider(
+            &cx, &credential_fixture, &selected, mappings.snapshot(),
+            EnterpriseCredentialRole::Idp, "independently-live-client-secret",
+        ).await;
+        let fetcher = test_fetcher();
+        let mut response = ok_exchange_response(
+            "idp.example", fetcher.root_identity(), br#"{"error":"invalid_grant"}"#.to_vec(),
+        );
+        response.status = 400;
+        let poster = Arc::new(QuarantinePoster {
+            flow: flow_fixture, consumed, response: std::sync::Mutex::new(Some(response)),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut driver = EnterpriseExchangeDriver::new(
+            selected, fetcher, EnterpriseResponsePolicy::default(),
+        ).unwrap();
+        Arc::get_mut(&mut driver.inner).unwrap().test_post = Some(poster.clone());
+        let result = driver.exchange_oidc_code_for_identity_with_provider(
+            &cx, grant, &provider, mappings.snapshot(), &oidc_keys, now(),
+        ).await;
+        assert_eq!(result.err(), Some(EnterpriseExchangeError::CodeFlowRejected(
+            OidcCodeFlowError::PersistentCustodyUnavailable,
+        )));
+        assert_eq!(poster.calls.load(Ordering::SeqCst), 1);
+        assert!(!credential_fixture.store().is_quarantined());
+        assert!(!driver.inner.busy.load(Ordering::Acquire));
+    });
+}
+
+#[test]
+fn enterprise_persisted_oidc_original_expiry_caps_native_timer_despite_stale_wall_sample() {
+    let clock = Arc::new(asupersync::time::VirtualClock::new());
+    let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+        .with_timer_driver(timer).build().unwrap();
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+    runtime.block_on(async {
+        let (configuration, selected) =
+            crate::http_auth::enterprise::oidc::tests::configuration_and_profile();
+        let mappings = subject_mappings(&selected);
+        let flow_fixture = CredentialStoreFixture::new(&cx).await;
+        let (grant, _) = resumed_protected_code(
+            &cx, &flow_fixture, configuration, mappings.snapshot(),
+            now() + Duration::from_secs(280), now(),
+        ).await;
+        let credential_fixture = CredentialStoreFixture::new(&cx).await;
+        let (provider, _) = protected_exchange_provider(
+            &cx, &credential_fixture, &selected, mappings.snapshot(),
+            EnterpriseCredentialRole::Idp, "still-live-secret",
+        ).await;
+        let policy = fastmcp_transport::GuardedHttpFetchPolicy::new(
+            MAX_ENTERPRISE_EXCHANGE_RESPONSE_BYTES, Duration::from_secs(30),
+            Duration::from_secs(2), "original-flow-expiry",
+        ).unwrap();
+        let fetcher = GuardedHttpFetcher::new(policy).unwrap();
+        let poster = Arc::new(ParkedCodePoster {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            held_lifetime: std::sync::Mutex::new(None),
+        });
+        let mut driver = EnterpriseExchangeDriver::new(
+            selected, fetcher, EnterpriseResponsePolicy::default(),
+        ).unwrap();
+        Arc::get_mut(&mut driver.inner).unwrap().test_post = Some(poster.clone());
+        let (oidc_keys, _) = keys();
+        {
+            let mut exchange = std::pin::pin!(driver.exchange_oidc_code_for_identity_with_provider(
+                &cx, grant, &provider, mappings.snapshot(), &oidc_keys, now(),
+            ));
+            poll_fn(|task| {
+                assert!(exchange.as_mut().poll(task).is_pending());
+                Poll::Ready(())
+            }).await;
+            assert_eq!(poster.calls.load(Ordering::SeqCst), 1);
+            // Earlier than the 30s network/credential deadline but later than
+            // the original pending flow's remaining 20s. No socket wake occurs.
+            clock.advance(21_000_000_000);
+            poll_fn(|task| {
+                let Poll::Ready(result) = exchange.as_mut().poll(task) else {
+                    panic!("persisted flow expiry did not wake its parked token exchange");
+                };
+                assert_eq!(result.err(), Some(EnterpriseExchangeError::TimedOut));
+                Poll::Ready(())
+            }).await;
+        }
+        assert!(driver.inner.busy.load(Ordering::Acquire));
+        drop(poster.held_lifetime.lock().unwrap().take());
+        assert!(!driver.inner.busy.load(Ordering::Acquire));
+    });
+}
