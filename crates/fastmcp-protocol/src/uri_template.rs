@@ -395,28 +395,36 @@ impl ReversibleResourceTemplate {
                         });
                     }
 
-                    let next_boundary = match template.parts.get(index + 1) {
-                        Some(UriTemplatePart::Literal(literal)) => {
-                            let mut encoded = String::new();
-                            append_encoded_literal(
-                                &mut encoded,
-                                literal,
-                                UriTemplateExpansionLimits::default(),
-                            )?;
-                            Some(ReversibleBoundary::Literal(encoded))
+                    // Any following expression may be undefined. Retain every
+                    // boundary reachable through those omissions, stopping at
+                    // the first literal because that part is mandatory.
+                    let mut next_boundaries = Vec::new();
+                    for next_part in &template.parts[index + 1..] {
+                        match next_part {
+                            UriTemplatePart::Literal(literal) => {
+                                let mut encoded = String::new();
+                                append_encoded_literal(
+                                    &mut encoded,
+                                    literal,
+                                    UriTemplateExpansionLimits::default(),
+                                )?;
+                                next_boundaries.push(ReversibleBoundary::Literal(encoded));
+                                break;
+                            }
+                            UriTemplatePart::Expression(next) => {
+                                next_boundaries.push(reversible_adjacent_expression_boundary(
+                                    expression, next,
+                                )?);
+                            }
                         }
-                        Some(UriTemplatePart::Expression(next)) => {
-                            Some(reversible_adjacent_expression_boundary(expression, next)?)
-                        }
-                        None => None,
-                    };
+                    }
 
-                    validate_reversible_expression(expression, next_boundary.as_ref())?;
+                    validate_reversible_expression(expression, &next_boundaries)?;
                     parts.push(ReversibleTemplatePart::Expression(
                         ReversibleTemplateExpression {
                             operator: expression.operator(),
                             variables,
-                            next_boundary,
+                            next_boundaries,
                         },
                     ));
                 }
@@ -552,7 +560,7 @@ enum ReversibleTemplatePart {
 struct ReversibleTemplateExpression {
     operator: UriTemplateOperator,
     variables: Vec<ReversibleTemplateVariable>,
-    next_boundary: Option<ReversibleBoundary>,
+    next_boundaries: Vec<ReversibleBoundary>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1792,11 +1800,11 @@ const fn is_reserved(byte: u8) -> bool {
 
 fn validate_reversible_expression(
     expression: &UriTemplateExpression,
-    next_boundary: Option<&ReversibleBoundary>,
+    next_boundaries: &[ReversibleBoundary],
 ) -> Result<(), UriTemplateError> {
     match expression.operator() {
         UriTemplateOperator::Reserved | UriTemplateOperator::Fragment
-            if next_boundary.is_some() =>
+            if !next_boundaries.is_empty() =>
         {
             Err(UriTemplateError::NonReversibleTemplate {
                 reason: UriTemplateMatchRejection::UnboundedReservedCapture,
@@ -1808,7 +1816,7 @@ fn validate_reversible_expression(
         | UriTemplateOperator::PathParameter
         | UriTemplateOperator::Query
         | UriTemplateOperator::QueryContinuation => {
-            if next_boundary.is_some_and(|boundary| {
+            if next_boundaries.iter().any(|boundary| {
                 !boundary
                     .as_str()
                     .as_bytes()
@@ -1830,8 +1838,8 @@ fn reversible_adjacent_expression_boundary(
     next: &UriTemplateExpression,
 ) -> Result<ReversibleBoundary, UriTemplateError> {
     let prefix = match next.operator() {
-        // These expansions emit no leading wire marker, so an adjacent prior
-        // scalar has no unique point at which to stop.
+        // These expansions emit no leading wire marker, so a preceding scalar
+        // cannot find their start, even across omitted optional expressions.
         UriTemplateOperator::Simple | UriTemplateOperator::Reserved => {
             return Err(UriTemplateError::NonReversibleTemplate {
                 reason: UriTemplateMatchRejection::AdjacentCaptures,
@@ -1840,8 +1848,8 @@ fn reversible_adjacent_expression_boundary(
         UriTemplateOperator::Fragment => "#".to_owned(),
         UriTemplateOperator::Label => ".".to_owned(),
         UriTemplateOperator::Path => {
-            // `{/first}{/second}` cannot distinguish a present first value
-            // from a present second value when the other value is absent.
+            // Optional expressions between two path captures do not remove
+            // their ambiguity when those intervening expressions are omitted.
             if expression.operator() == UriTemplateOperator::Path {
                 return Err(UriTemplateError::NonReversibleTemplate {
                     reason: UriTemplateMatchRejection::AmbiguousBoundary,
@@ -1867,38 +1875,38 @@ fn reverse_match_expression(
     let variable = expression.variables.first()?;
     let (capture, consumed) = match expression.operator {
         UriTemplateOperator::Simple => {
-            reverse_match_unprefixed(remainder, expression.next_boundary.as_ref())
+            reverse_match_unprefixed(remainder, &expression.next_boundaries)
         }
-        UriTemplateOperator::Reserved => reverse_match_unprefixed(remainder, None),
+        UriTemplateOperator::Reserved => reverse_match_unprefixed(remainder, &[]),
         UriTemplateOperator::Fragment => {
-            reverse_match_prefixed(remainder, "#", expression.next_boundary.as_ref())
+            reverse_match_prefixed(remainder, "#", &expression.next_boundaries)
         }
         UriTemplateOperator::Label => {
-            reverse_match_prefixed(remainder, ".", expression.next_boundary.as_ref())
+            reverse_match_prefixed(remainder, ".", &expression.next_boundaries)
         }
         UriTemplateOperator::Path => {
-            reverse_match_prefixed(remainder, "/", expression.next_boundary.as_ref())
+            reverse_match_prefixed(remainder, "/", &expression.next_boundaries)
         }
         UriTemplateOperator::PathParameter => reverse_match_named(
             remainder,
             ";",
             variable,
             false,
-            expression.next_boundary.as_ref(),
+            &expression.next_boundaries,
         ),
         UriTemplateOperator::Query => reverse_match_named(
             remainder,
             "?",
             variable,
             true,
-            expression.next_boundary.as_ref(),
+            &expression.next_boundaries,
         ),
         UriTemplateOperator::QueryContinuation => reverse_match_named(
             remainder,
             "&",
             variable,
             true,
-            expression.next_boundary.as_ref(),
+            &expression.next_boundaries,
         ),
     }?;
     let captures = capture
@@ -1909,9 +1917,9 @@ fn reverse_match_expression(
 
 fn reverse_match_unprefixed(
     remainder: &str,
-    next_boundary: Option<&ReversibleBoundary>,
+    next_boundaries: &[ReversibleBoundary],
 ) -> Option<(Option<String>, usize)> {
-    let (capture, consumed) = reverse_capture_to_boundary(remainder, next_boundary)?;
+    let (capture, consumed) = reverse_capture_to_boundary(remainder, next_boundaries)?;
     if capture.is_empty() {
         return Some((None, 0));
     }
@@ -1921,15 +1929,14 @@ fn reverse_match_unprefixed(
 fn reverse_match_prefixed(
     remainder: &str,
     prefix: &str,
-    next_boundary: Option<&ReversibleBoundary>,
+    next_boundaries: &[ReversibleBoundary],
 ) -> Option<(Option<String>, usize)> {
     let Some(after_prefix) = remainder.strip_prefix(prefix) else {
         return Some((None, 0));
     };
-    let Some((capture, consumed)) = reverse_capture_to_boundary(after_prefix, next_boundary) else {
-        // A path expression and its following literal may both begin with
-        // `/`. If no complete literal boundary follows the consumed marker,
-        // leave it for the literal part: the expression is undefined.
+    let Some((capture, consumed)) = reverse_capture_to_boundary(after_prefix, next_boundaries) else {
+        // A path expression and a later mandatory literal may both begin
+        // with '/'. Leave the literal untouched when the capture is absent.
         return Some((None, 0));
     };
     Some((
@@ -1943,7 +1950,7 @@ fn reverse_match_named(
     marker: &str,
     variable: &ReversibleTemplateVariable,
     requires_equals: bool,
-    next_boundary: Option<&ReversibleBoundary>,
+    next_boundaries: &[ReversibleBoundary],
 ) -> Option<(Option<String>, usize)> {
     let mut prefix = String::with_capacity(marker.len() + variable.encoded_name.len() + 1);
     prefix.push_str(marker);
@@ -1964,14 +1971,16 @@ fn reverse_match_named(
         (after_equals, 1)
     } else if after_name.is_empty()
         || after_name.starts_with(';')
-        || next_boundary.is_some_and(|boundary| after_name.starts_with(boundary.as_str()))
+        || next_boundaries
+            .iter()
+            .any(|boundary| after_name.starts_with(boundary.as_str()))
     {
-        // Empty matrix values omit '=', even immediately before the next part.
+        // Empty matrix values omit '=', even immediately before a later part.
         (after_name, 0)
     } else {
         return Some((None, 0));
     };
-    let Some((capture, consumed)) = reverse_capture_to_boundary(after_equals, next_boundary) else {
+    let Some((capture, consumed)) = reverse_capture_to_boundary(after_equals, next_boundaries) else {
         return Some((None, 0));
     };
     Some((
@@ -2015,7 +2024,7 @@ fn reverse_match_named_expression(
         let (after_equals, equals_len) = if requires_equals {
             let Some(after_equals) = after_name.strip_prefix('=') else {
                 // A shared name prefix does not bind this variable. For example,
-                // absent `id` must not prevent `identifier` from being matched.
+                // absent 'id' must not prevent 'identifier' from being matched.
                 continue;
             };
             (after_equals, 1)
@@ -2024,9 +2033,9 @@ fn reverse_match_named_expression(
         } else if after_name.is_empty()
             || after_name.starts_with(properties.separator)
             || expression
-                .next_boundary
-                .as_ref()
-                .is_some_and(|boundary| after_name.starts_with(boundary.as_str()))
+                .next_boundaries
+                .iter()
+                .any(|boundary| after_name.starts_with(boundary.as_str()))
         {
             // Leave the following literal or expression marker unconsumed.
             (after_name, 0)
@@ -2037,7 +2046,7 @@ fn reverse_match_named_expression(
         let capture_len = reversible_named_capture_len(
             after_equals,
             properties.separator,
-            expression.next_boundary.as_ref(),
+            &expression.next_boundaries,
         );
         let capture = after_equals.get(..capture_len)?;
         let value = decode_percent_triplets_once(capture)?;
@@ -2056,33 +2065,32 @@ fn reverse_match_named_expression(
 fn reversible_named_capture_len(
     remainder: &str,
     separator: &str,
-    next_boundary: Option<&ReversibleBoundary>,
+    next_boundaries: &[ReversibleBoundary],
 ) -> usize {
-    let mut capture_len = remainder.len();
-    if let Some(offset) = remainder.find(separator) {
-        capture_len = capture_len.min(offset);
-    }
-    if let Some(offset) = next_boundary.and_then(|boundary| remainder.find(boundary.as_str())) {
-        capture_len = capture_len.min(offset);
-    }
-    capture_len
+    std::iter::once(separator)
+        .chain(next_boundaries.iter().map(ReversibleBoundary::as_str))
+        .filter_map(|boundary| remainder.find(boundary))
+        .min()
+        .unwrap_or(remainder.len())
 }
 
 fn reverse_capture_to_boundary<'a>(
     remainder: &'a str,
-    next_boundary: Option<&ReversibleBoundary>,
+    next_boundaries: &[ReversibleBoundary],
 ) -> Option<(&'a str, usize)> {
-    match next_boundary {
-        Some(boundary) => {
-            if let Some(offset) = remainder.find(boundary.as_str()) {
-                Some((&remainder[..offset], offset))
-            } else if boundary.permits_absent_following_expression() {
-                Some((remainder, remainder.len()))
-            } else {
-                None
-            }
-        }
-        None => Some((remainder, remainder.len())),
+    if let Some(offset) = next_boundaries
+        .iter()
+        .filter_map(|boundary| remainder.find(boundary.as_str()))
+        .min()
+    {
+        Some((&remainder[..offset], offset))
+    } else if next_boundaries
+        .iter()
+        .all(ReversibleBoundary::permits_absent_following_expression)
+    {
+        Some((remainder, remainder.len()))
+    } else {
+        None
     }
 }
 
@@ -2114,6 +2122,127 @@ fn contains_pct_encoded_triplet(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reversible_optional_expression_runs_preserve_each_defined_capture() {
+        let matcher = UriTemplate::parse("mcp://resource{/collection}{?revision}{#fragment}")
+            .expect("optional expressions parse")
+            .compile_reversible()
+            .expect("distinct markers remain reversible through omissions");
+        for collection in [None, Some(""), Some("books/fiction")] {
+            for revision in [None, Some(""), Some("2/next")] {
+                for fragment in [None, Some(""), Some("intro?draft=true")] {
+                    let values: TemplateValues = [
+                        ("collection", collection),
+                        ("revision", revision),
+                        ("fragment", fragment),
+                    ]
+                    .into_iter()
+                    .filter_map(|(name, value)| {
+                        value.map(|value| (name.to_owned(), TemplateValue::scalar(value)))
+                    })
+                    .collect();
+                    let uri = matcher.expand(&values).expect("defined scalars expand");
+                    assert_eq!(
+                        matcher.match_uri(&uri).expect("matching is bounded"),
+                        Some(values),
+                        "omitting a query must not swallow the fragment: {uri}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reversible_optional_expression_runs_retain_mandatory_literal_boundaries() {
+        let matcher = UriTemplate::parse("mcp://resource{/collection}{?revision}/manifest")
+            .expect("optional expressions and literal parse")
+            .compile_reversible()
+            .expect("the mandatory literal is a reachable boundary");
+        for collection in [None, Some(""), Some("books/fiction")] {
+            for revision in [None, Some(""), Some("2/next")] {
+                let values: TemplateValues =
+                    [("collection", collection), ("revision", revision)]
+                        .into_iter()
+                        .filter_map(|(name, value)| {
+                            value.map(|value| (name.to_owned(), TemplateValue::scalar(value)))
+                        })
+                        .collect();
+                let uri = matcher.expand(&values).expect("defined scalars expand");
+                assert_eq!(
+                    matcher.match_uri(&uri).expect("matching is bounded"),
+                    Some(values),
+                    "omitting the query must leave the mandatory literal intact: {uri}",
+                );
+            }
+        }
+        for uri in [
+            "mcp://resource/books",
+            "mcp://resource/books/other",
+            "mcp://resource/books/manifest/extra",
+            "mcp://resource/books?unknown=2/manifest",
+            "mcp://resource/books?revision=%GG/manifest",
+            "mcp://resource/books?revision=%FF/manifest",
+        ] {
+            assert_eq!(
+                matcher.match_uri(uri).expect("invalid candidates are bounded"),
+                None,
+                "omission support must not accept a changed suffix or invalid query: {uri}",
+            );
+        }
+    }
+
+    #[test]
+    fn reversible_empty_named_values_stop_after_omitted_expressions() {
+        for names in ["flag", "unused,flag", "flag,unused"] {
+            for suffix in ["/manifest", "{#fragment}"] {
+                let source = format!("mcp://resource{{;{names}}}{{?revision}}{suffix}");
+                let matcher = UriTemplate::parse(&source)
+                    .expect("named expressions parse")
+                    .compile_reversible()
+                    .expect("all reachable markers are distinct");
+                for revision in [None, Some("2")] {
+                    let mut values =
+                        TemplateValues::from([("flag".to_owned(), TemplateValue::scalar(""))]);
+                    if let Some(revision) = revision {
+                        values.insert("revision".to_owned(), TemplateValue::scalar(revision));
+                    }
+                    if suffix == "{#fragment}" {
+                        values.insert("fragment".to_owned(), TemplateValue::scalar("intro"));
+                    }
+                    let uri = matcher.expand(&values).expect("empty matrix value expands");
+                    assert_eq!(
+                        matcher.match_uri(&uri).expect("matching is bounded"),
+                        Some(values),
+                        "single and multiple named captures share the reachable boundaries: {uri}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reversible_omitted_expressions_cannot_hide_ambiguous_boundaries() {
+        for source in [
+            "mcp://resource{/first}{?revision}{/second}",
+            "mcp://resource{/first}{?revision}.suffix",
+            "mcp://resource{/first}{?revision}{second}",
+        ] {
+            let template = UriTemplate::parse(source).expect("valid RFC 6570 syntax");
+            let before = template.clone();
+            assert!(
+                matches!(
+                    template.compile_reversible(),
+                    Err(UriTemplateError::NonReversibleTemplate {
+                        reason: UriTemplateMatchRejection::AmbiguousBoundary
+                            | UriTemplateMatchRejection::AdjacentCaptures,
+                    })
+                ),
+                "omitting revision exposes the ambiguous capture boundary: {source}",
+            );
+            assert_eq!(template, before, "refused compilation leaves its input unchanged");
+        }
+    }
 
     #[test]
     fn reversible_named_expressions_round_trip_optional_prefix_names() {

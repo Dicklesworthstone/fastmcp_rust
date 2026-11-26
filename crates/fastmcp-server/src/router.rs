@@ -21674,6 +21674,178 @@ mod router_tests {
     }
 
     #[test]
+    fn final_resource_reads_route_across_omitted_template_expressions() {
+        struct OptionalTemplateResource {
+            template: &'static str,
+            read_calls: Arc<AtomicUsize>,
+        }
+
+        impl ResourceHandler for OptionalTemplateResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "mcp://optional-template-fixture".to_owned(),
+                    name: "optional-template".to_owned(),
+                    description: None,
+                    mime_type: Some("application/json".to_owned()),
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                }
+            }
+
+            fn template(&self) -> Option<ResourceTemplate> {
+                Some(marked_template(self.template, "optional-template"))
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                unreachable!("template reads receive the exact URI and captures")
+            }
+
+            fn read_with_uri(
+                &self,
+                _ctx: &McpContext,
+                uri: &str,
+                params: &UriParams,
+            ) -> McpResult<Vec<ResourceContent>> {
+                self.read_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![ResourceContent {
+                    uri: uri.to_owned(),
+                    mime_type: Some("application/json".to_owned()),
+                    text: Some(
+                        serde_json::json!({
+                            "collection": params.get("collection"),
+                            "revision": params.get("revision"),
+                            "fragment": params.get("fragment"),
+                        })
+                        .to_string(),
+                    ),
+                    blob: None,
+                }])
+            }
+        }
+
+        let cases = [
+            (
+                "mcp://resource{/collection}{?revision}{#fragment}",
+                [
+                    (
+                        "mcp://resource/books%2Ffiction#intro?notes",
+                        serde_json::json!({
+                            "collection": "books/fiction", "revision": null,
+                            "fragment": "intro?notes",
+                        }),
+                    ),
+                    (
+                        "mcp://resource#intro",
+                        serde_json::json!({
+                            "collection": null, "revision": null, "fragment": "intro",
+                        }),
+                    ),
+                    (
+                        "mcp://resource/books?revision=2#intro",
+                        serde_json::json!({
+                            "collection": "books", "revision": "2", "fragment": "intro",
+                        }),
+                    ),
+                ],
+                [
+                    "mcp://resource/books%GG#intro",
+                    "mcp://resource/books?unknown=2#intro",
+                ],
+            ),
+            (
+                "mcp://resource{/collection}{?revision}/manifest",
+                [
+                    (
+                        "mcp://resource/books/manifest",
+                        serde_json::json!({
+                            "collection": "books", "revision": null, "fragment": null,
+                        }),
+                    ),
+                    (
+                        "mcp://resource/manifest",
+                        serde_json::json!({
+                            "collection": null, "revision": null, "fragment": null,
+                        }),
+                    ),
+                    (
+                        "mcp://resource/books?revision=2/manifest",
+                        serde_json::json!({
+                            "collection": "books", "revision": "2", "fragment": null,
+                        }),
+                    ),
+                ],
+                ["mcp://resource/books/other", "mcp://resource/books"],
+            ),
+        ];
+        for (template, reads, rejected) in cases {
+            let mut router = Router::new();
+            let read_calls = Arc::new(AtomicUsize::new(0));
+            router
+                .add_resource_with_behavior(
+                    OptionalTemplateResource {
+                        template,
+                        read_calls: Arc::clone(&read_calls),
+                    },
+                    crate::DuplicateBehavior::Replace,
+                )
+                .expect("the template has unambiguous reachable boundaries");
+            let cx = Cx::for_testing();
+            let state = SessionState::new();
+            let request_ctx = request_context(&cx, 29_100, Budget::INFINITE, &state);
+            for (index, (uri, expected)) in reads.into_iter().enumerate() {
+                let request = template_catalog_request(
+                    "resources/read",
+                    serde_json::json!({"uri": uri}),
+                );
+                let result = block_on(router.dispatch_stateless(&request_ctx, &request))
+                    .expect("the modern route matches across omitted expressions");
+                assert_eq!(result["resultType"], "complete");
+                assert_eq!(result["contents"][0]["uri"], uri);
+                let captures: serde_json::Value = serde_json::from_str(
+                    result["contents"][0]["text"]
+                        .as_str()
+                        .expect("the handler returned its captures"),
+                )
+                .expect("capture data is JSON");
+                assert_eq!(captures, expected, "the handler receives exact bindings for {uri}");
+                assert_eq!(read_calls.load(Ordering::SeqCst), index + 1);
+            }
+            for uri in rejected {
+                let request = template_catalog_request(
+                    "resources/read",
+                    serde_json::json!({"uri": uri}),
+                );
+                assert!(
+                    block_on(router.dispatch_stateless(&request_ctx, &request)).is_err(),
+                    "invalid URI must not reach the template handler: {uri}",
+                );
+                assert_eq!(read_calls.load(Ordering::SeqCst), 3);
+            }
+
+            let templates_before = serde_json::to_vec(&router.resource_templates())
+                .expect("the admitted catalog serializes");
+            let error = router
+                .add_resource_with_behavior(
+                    OptionalTemplateResource {
+                        template: "mcp://resource{/first}{?revision}{/second}",
+                        read_calls: Arc::clone(&read_calls),
+                    },
+                    crate::DuplicateBehavior::Replace,
+                )
+                .expect_err("an omitted query cannot hide ambiguous path captures");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(
+                serde_json::to_vec(&router.resource_templates())
+                    .expect("the catalog remains serializable"),
+                templates_before,
+                "failed registration cannot replace a working template",
+            );
+            assert_eq!(read_calls.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[test]
     fn resource_template_registration_is_final_visible_via_protocol_rfc6570_matcher() {
         struct AmbiguousTemplateResource;
 
