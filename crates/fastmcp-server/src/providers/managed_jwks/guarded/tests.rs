@@ -1195,10 +1195,10 @@ mod enterprise {
                             let fresh_owner = owner();
                             let fresh_provider =
                                 fresh_owner.guarded_provider(verifier.clone()).unwrap();
-                            let facts = ready(fresh_provider.authenticate_async(
-                                &sibling,
-                                request(&params, &authorization),
-                            ))
+                            let facts = ready(
+                                fresh_provider
+                                    .authenticate_async(&sibling, request(&params, &authorization)),
+                            )
                             .unwrap();
                             assert_eq!(facts.subject.as_deref(), Some("alice"));
                             assert!(facts.verification_is_current());
