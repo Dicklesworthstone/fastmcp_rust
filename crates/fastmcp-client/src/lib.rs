@@ -20575,11 +20575,13 @@ impl StdioRequestExecutor {
     }
 
     /// Commits a modern listener with bounded subscription-specific deadlines.
-    fn execute_subscription_with_timeout_policy(
+    fn execute_subscription_with_retained_lifetime(
         &self,
         cx: &Cx,
         parameters: serde_json::Value,
         timeout_policy: SubscriptionTimeoutPolicy,
+        cancellation: Option<&McpRequestCancellation>,
+        absolute_deadline: Option<Instant>,
     ) -> McpResult<StdioRequestExecution> {
         timeout_policy.validate()?;
         let parameters = self
@@ -20587,9 +20589,13 @@ impl StdioRequestExecutor {
         let id = next_stdio_request_id(&self.next_id)?;
         let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
         let request = JsonRpcRequest::new("subscriptions/listen", parameters, id);
-        let execution =
-            self.executor
-                .execute_subscription_with_timeout_policy(cx, request, timeout_policy)?;
+        let execution = self.executor.execute_subscription_with_retained_lifetime(
+            cx,
+            request,
+            timeout_policy,
+            cancellation,
+            absolute_deadline,
+        )?;
         Ok(StdioRequestExecution {
             execution,
             require_result_source: false,
@@ -29580,6 +29586,26 @@ impl Client {
         notifications: impl Into<SubscriptionListenRequest>,
         timeout_policy: SubscriptionTimeoutPolicy,
     ) -> McpResult<()> {
+        let cx = self.cx.clone();
+        self.open_subscriptions_listener_with_retained_lifetime(
+            &cx,
+            notifications,
+            timeout_policy,
+            None,
+            None,
+        )
+    }
+
+    /// Private supervisor seam: a replacement retains the first listener's
+    /// caller, cancellation token and absolute cutoff, including downtime.
+    fn open_subscriptions_listener_with_retained_lifetime(
+        &mut self,
+        cx: &Cx,
+        notifications: impl Into<SubscriptionListenRequest>,
+        timeout_policy: SubscriptionTimeoutPolicy,
+        cancellation: Option<&McpRequestCancellation>,
+        absolute_deadline: Option<Instant>,
+    ) -> McpResult<()> {
         let (notifications, resource_relations) = notifications.into().into_parts()?;
         timeout_policy.validate()?;
         self.ensure_initialized()?;
@@ -29638,11 +29664,13 @@ impl Client {
                 )
             })?;
         let executor = self.multiplexed_stdio_executor()?;
-        executor.service(&self.cx)?;
-        let execution = executor.execute_subscription_with_timeout_policy(
-            &self.cx,
+        executor.service(cx)?;
+        let execution = executor.execute_subscription_with_retained_lifetime(
+            cx,
             params_value,
             timeout_policy,
+            cancellation,
+            absolute_deadline,
         )?;
         self.live_catalog_subscription = Some(LiveStdioCatalogSubscription {
             executor,

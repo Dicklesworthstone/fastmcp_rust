@@ -952,26 +952,77 @@ struct PendingExecution {
 #[derive(Clone, Copy, Debug)]
 enum ExecutionTimeoutPolicy {
     Request(RequestTimeoutPolicy),
-    Subscription(SubscriptionTimeoutPolicy),
+    Subscription {
+        policy: SubscriptionTimeoutPolicy,
+        retained_absolute_deadline: Option<Instant>,
+    },
 }
 
 impl ExecutionTimeoutPolicy {
     fn idle_timeout(self) -> Duration {
         match self {
             Self::Request(policy) => policy.idle_timeout(),
-            Self::Subscription(policy) => policy.idle_timeout(),
+            Self::Subscription { policy, .. } => policy.idle_timeout(),
         }
     }
 
     fn absolute_timeout(self) -> Duration {
         match self {
             Self::Request(policy) => policy.absolute_timeout(),
-            Self::Subscription(policy) => policy.absolute_timeout(),
+            Self::Subscription { policy, .. } => policy.absolute_timeout(),
         }
+    }
+
+    fn retained_absolute_deadline(self) -> Option<Instant> {
+        match self {
+            Self::Subscription {
+                retained_absolute_deadline,
+                ..
+            } => retained_absolute_deadline,
+            Self::Request(_) => None,
+        }
+    }
+
+    fn check_retained_lifetime(self) -> McpResult<()> {
+        if self
+            .retained_absolute_deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(request_timeout_error(RequestTimeoutSource::Absolute));
+        }
+        Ok(())
     }
 
     fn resets_idle_on_matching_progress(self) -> bool {
         matches!(self, Self::Request(policy) if policy.resets_idle_on_matching_progress())
+    }
+}
+
+/// The first committed listener's non-renewable lifetime. A replacement
+/// process cannot replace this caller's clock/cancellation or restart its
+/// absolute timer while re-establishing a subscription.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub(crate) struct SubscriptionLifetime {
+    pub(crate) caller: Cx,
+    pub(crate) request_cancellation: Option<McpRequestCancellation>,
+    pub(crate) absolute_deadline: Instant,
+}
+
+#[cfg(unix)]
+impl SubscriptionLifetime {
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.caller.checkpoint().is_err()
+            || self
+                .caller
+                .budget()
+                .deadline
+                .is_some_and(|deadline| self.caller.now() >= deadline)
+            || self
+                .request_cancellation
+                .as_ref()
+                .is_some_and(McpRequestCancellation::is_cancel_requested)
+            || Instant::now() >= self.absolute_deadline
     }
 }
 
@@ -1938,7 +1989,10 @@ where
         self.execute_with_commit(
             cx,
             request,
-            ExecutionTimeoutPolicy::Subscription(timeout_policy),
+            ExecutionTimeoutPolicy::Subscription {
+                policy: timeout_policy,
+                retained_absolute_deadline: None,
+            },
             Some(cancellation.clone()),
             None,
             |_, _, message| commit(message).map_err(TransportSendError::Uncertain),
@@ -2312,6 +2366,26 @@ where
         request: Request,
         timeout_policy: SubscriptionTimeoutPolicy,
     ) -> McpResult<RequestExecution<T>> {
+        self.execute_subscription_with_retained_lifetime(
+            cx,
+            request,
+            timeout_policy,
+            None,
+            None,
+        )
+    }
+
+    /// Re-establishes a listener without renewing its original authority.
+    /// The owner supplies the original caller, token and send-commit deadline;
+    /// a stopped lifetime is rejected before any application write.
+    pub(crate) fn execute_subscription_with_retained_lifetime(
+        &self,
+        cx: &Cx,
+        request: Request,
+        timeout_policy: SubscriptionTimeoutPolicy,
+        cancellation: Option<&McpRequestCancellation>,
+        absolute_deadline: Option<Instant>,
+    ) -> McpResult<RequestExecution<T>> {
         timeout_policy.validate()?;
         if self.protocol_era() != ProtocolEra::Modern2026 || request.method != SUBSCRIPTIONS_LISTEN
         {
@@ -2328,8 +2402,11 @@ where
         self.execute_with_deadline_policy(
             cx,
             request,
-            ExecutionTimeoutPolicy::Subscription(timeout_policy),
-            None,
+            ExecutionTimeoutPolicy::Subscription {
+                policy: timeout_policy,
+                retained_absolute_deadline: absolute_deadline,
+            },
+            cancellation,
             None,
         )
     }
@@ -2367,6 +2444,7 @@ where
         extension_result: Option<ClientExtensionResultAdmission>,
         commit: impl FnOnce(&mut T, &Cx, &JsonRpcMessage) -> Result<(), TransportSendError>,
     ) -> McpResult<Option<RequestExecution<T>>> {
+        timeout_policy.check_retained_lifetime()?;
         let turn = ExecutionTurn::new(cx);
         let cx = &turn;
         if cx.checkpoint().is_err()
@@ -2471,6 +2549,9 @@ where
         }) {
             return Err(McpError::request_cancelled());
         }
+        // Maintenance or admission may have consumed the retained lifetime.
+        // A fresh process is not authority for another listen after its cutoff.
+        timeout_policy.check_retained_lifetime()?;
         commit(&mut state.transport, cx, &message)
             .map_err(|error| self.handle_application_send_error_locked(cx.cx, &mut state, error))?;
         state.next_generation = generation;
@@ -2488,7 +2569,19 @@ where
                     "Client execution absolute deadline exceeds the clock range",
                 )
             })?;
+        let absolute_deadline = timeout_policy
+            .retained_absolute_deadline()
+            .map_or(absolute_deadline, |retained| absolute_deadline.min(retained));
         let owner_dropped = OwnerDropped::new();
+        #[cfg(unix)]
+        let subscription_lifetime =
+            matches!(timeout_policy, ExecutionTimeoutPolicy::Subscription { .. }).then(|| {
+                Arc::new(SubscriptionLifetime {
+                    caller: cx.cx.clone(),
+                    request_cancellation: request_cancellation.clone(),
+                    absolute_deadline,
+                })
+            });
         state.pending.insert(
             correlation_key.clone(),
             PendingExecution {
@@ -2520,6 +2613,8 @@ where
             generation,
             owner_dropped,
             state: self.state.clone(),
+            #[cfg(unix)]
+            subscription_lifetime,
             #[cfg(feature = "tasks")]
             method: request.method,
             #[cfg(feature = "tasks")]
@@ -2666,7 +2761,7 @@ where
     ) -> McpResult<bool> {
         if !matches!(
             pending.timeout_policy,
-            ExecutionTimeoutPolicy::Subscription(_)
+            ExecutionTimeoutPolicy::Subscription { .. }
         ) || observed_at >= pending.record.idle_deadline
             || observed_at >= pending.record.absolute_deadline
         {
@@ -3687,7 +3782,7 @@ where
                         pending.method == "subscriptions/listen"
                             && matches!(
                                 pending.timeout_policy,
-                                ExecutionTimeoutPolicy::Subscription(_)
+                                ExecutionTimeoutPolicy::Subscription { .. }
                             )
                     }))
         );
@@ -4977,6 +5072,10 @@ pub struct RequestExecution<T> {
     generation: u64,
     owner_dropped: OwnerDropped,
     state: SharedExecutorState<T>,
+    /// Captured in the send-commit transaction, before another driver can
+    /// retire this owner. Ordinary executions allocate no lifetime snapshot.
+    #[cfg(unix)]
+    subscription_lifetime: Option<Arc<SubscriptionLifetime>>,
     // Only the Tasks decoders re-read the request that opened an execution.
     #[cfg(feature = "tasks")]
     method: String,
@@ -4989,6 +5088,14 @@ pub struct RequestExecution<T> {
 }
 
 impl<T> RequestExecution<T> {
+    /// Returns the lifetime captured at send commitment, including after a
+    /// racing driver retires the pending record. The supervisor separately
+    /// checks the terminal disposition before permitting restoration.
+    #[cfg(unix)]
+    pub(crate) fn subscription_lifetime(&self) -> Option<SubscriptionLifetime> {
+        self.subscription_lifetime.as_deref().cloned()
+    }
+
     /// Whether this exact generation still owns a live subscription request.
     pub(crate) fn is_pending_subscription(&self) -> bool {
         if self.completed {
@@ -12215,6 +12322,243 @@ mod tests {
         );
         assert!(executor.pending_records().is_empty());
         assert!(executor.state.borrow().transport.sent.is_empty());
+    }
+
+    #[cfg(unix)]
+    fn catalog_subscription_request(id: i64) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            SUBSCRIPTIONS_LISTEN,
+            Some(serde_json::json!({
+                "_meta": fastmcp_protocol::FinalRequestMeta::new(
+                    fastmcp_protocol::ClientCapabilities::default()
+                ),
+                "notifications": {"toolsListChanged": true},
+            })),
+            id,
+        )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn subscription_restoration_preserves_original_absolute_deadline_and_terminal() {
+        let caller = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let policy = SubscriptionTimeoutPolicy::new(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let original = RequestExecutor::with_protocol_era(
+            ScriptedTransport::new([]),
+            ProtocolEra::Modern2026,
+        );
+        let first = original
+            .execute_subscription_with_retained_lifetime(
+                &caller,
+                catalog_subscription_request(71),
+                policy,
+                Some(&cancellation),
+                None,
+            )
+            .unwrap();
+        let lifetime = first.subscription_lifetime().unwrap();
+        let replacement = RequestExecutor::with_protocol_era(
+            ScriptedTransport::new([]),
+            ProtocolEra::Modern2026,
+        );
+        let mut restored = replacement
+            .execute_subscription_with_retained_lifetime(
+                &lifetime.caller,
+                catalog_subscription_request(72),
+                policy,
+                lifetime.request_cancellation.as_ref(),
+                Some(lifetime.absolute_deadline),
+            )
+            .unwrap();
+        assert_eq!(
+            replacement.pending_records()[0].absolute_deadline,
+            lifetime.absolute_deadline,
+            "replacement send time cannot renew the first committed deadline"
+        );
+        // Accepted activity at N-1 resets idle only, and N elects the original
+        // absolute bound. The next service turn cannot emit a second control.
+        {
+            let mut state = replacement.state.borrow_mut();
+            let pending = state.pending.values_mut().next().unwrap();
+            assert!(RequestExecutor::<ScriptedTransport>::record_subscription_activity_at(
+                pending,
+                lifetime.absolute_deadline - Duration::from_nanos(1),
+            )
+            .unwrap());
+        }
+        replacement
+            .poll_timeouts_at(
+                &caller,
+                lifetime.absolute_deadline - Duration::from_nanos(1),
+            )
+            .unwrap();
+        assert_eq!(replacement.pending_records().len(), 1);
+        replacement
+            .poll_timeouts_at(&caller, lifetime.absolute_deadline)
+            .unwrap();
+        replacement
+            .poll_timeouts_at(&caller, lifetime.absolute_deadline + Duration::from_nanos(1))
+            .unwrap();
+        let events = replacement.take_cancellation_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, ExecutionTerminalReason::AbsoluteTimeout);
+        assert_eq!(
+            replacement.try_take_response(&mut restored).unwrap_err().data,
+            Some(serde_json::json!({"timeoutSource": "absolute"}))
+        );
+        assert!(replacement.pending_records().is_empty());
+        assert_eq!(replacement.state.borrow().transport.sent.len(), 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn subscription_restoration_refuses_expired_lifetime_without_sending() {
+        let caller = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let executor = RequestExecutor::with_protocol_era(
+            ScriptedTransport::new([]),
+            ProtocolEra::Modern2026,
+        );
+        let before = executor.pending_records();
+        let error = executor
+            .execute_subscription_with_retained_lifetime(
+                &caller,
+                catalog_subscription_request(73),
+                SubscriptionTimeoutPolicy::default(),
+                Some(&cancellation),
+                Some(Instant::now()),
+            )
+            .unwrap_err();
+        assert_eq!(error.data, Some(serde_json::json!({"timeoutSource": "absolute"})));
+        assert_eq!(executor.pending_records(), before);
+        assert!(executor.state.borrow().transport.sent.is_empty());
+        assert_eq!(executor.state.borrow().next_generation, 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn subscription_restoration_preserves_original_caller_clock() {
+        use asupersync::runtime::RuntimeBuilder;
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use asupersync::{Budget, Time};
+
+        let clock = Arc::new(VirtualClock::new());
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(TimerDriverHandle::with_virtual_clock(Arc::clone(&clock)))
+            .build()
+            .unwrap();
+        let originating = runtime.request_cx_with_budget(
+            Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+        );
+        let fresh = Cx::for_testing();
+        let original = RequestExecutor::with_protocol_era(
+            ScriptedTransport::new([]),
+            ProtocolEra::Modern2026,
+        );
+        let cancellation = McpRequestCancellation::new();
+        let first = original
+            .execute_subscription_with_retained_lifetime(
+                &originating,
+                catalog_subscription_request(74),
+                SubscriptionTimeoutPolicy::default(),
+                Some(&cancellation),
+                None,
+            )
+            .unwrap();
+        let lifetime = first.subscription_lifetime().unwrap();
+        let replacement = RequestExecutor::with_protocol_era(
+            ScriptedTransport::new([]),
+            ProtocolEra::Modern2026,
+        );
+        let mut restored = replacement
+            .execute_subscription_with_retained_lifetime(
+                &lifetime.caller,
+                catalog_subscription_request(75),
+                SubscriptionTimeoutPolicy::default(),
+                lifetime.request_cancellation.as_ref(),
+                Some(lifetime.absolute_deadline),
+            )
+            .unwrap();
+        let observed_at = Instant::now();
+        clock.advance(9_999_999);
+        replacement.poll_timeouts_at(&fresh, observed_at).unwrap();
+        assert_eq!(replacement.pending_records().len(), 1);
+        clock.advance(1);
+        assert!(lifetime.is_stopped());
+        replacement.poll_timeouts_at(&fresh, observed_at).unwrap();
+        assert!(replacement.pending_records().is_empty());
+        assert_eq!(
+            replacement.try_take_response(&mut restored).unwrap_err().code,
+            McpErrorCode::RequestCancelled
+        );
+        let sent = replacement.state.borrow().transport.sent.len();
+        assert!(
+            replacement
+                .execute_subscription_with_retained_lifetime(
+                    &lifetime.caller,
+                    catalog_subscription_request(76),
+                    SubscriptionTimeoutPolicy::default(),
+                    lifetime.request_cancellation.as_ref(),
+                    Some(lifetime.absolute_deadline),
+                )
+                .is_err()
+        );
+        assert_eq!(replacement.state.borrow().transport.sent.len(), sent);
+        assert!(fresh.checkpoint().is_ok());
+        drop(restored);
+        drop(replacement);
+        drop(lifetime);
+        drop(first);
+        drop(original);
+        drop(originating);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn subscription_restoration_preserves_original_cancellation_token() {
+        let caller = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let original = RequestExecutor::with_protocol_era(
+            ScriptedTransport::new([]),
+            ProtocolEra::Modern2026,
+        );
+        let first = original
+            .execute_subscription_with_retained_lifetime(
+                &caller,
+                catalog_subscription_request(77),
+                SubscriptionTimeoutPolicy::default(),
+                Some(&cancellation),
+                None,
+            )
+            .unwrap();
+        let lifetime = first.subscription_lifetime().unwrap();
+        cancellation.cancel();
+        assert!(lifetime.is_stopped());
+        let replacement = RequestExecutor::with_protocol_era(
+            ScriptedTransport::new([]),
+            ProtocolEra::Modern2026,
+        );
+        assert!(
+            replacement
+                .execute_subscription_with_retained_lifetime(
+                    &lifetime.caller,
+                    catalog_subscription_request(78),
+                    SubscriptionTimeoutPolicy::default(),
+                    lifetime.request_cancellation.as_ref(),
+                    Some(lifetime.absolute_deadline),
+                )
+                .is_err()
+        );
+        assert!(replacement.pending_records().is_empty());
+        assert!(replacement.state.borrow().transport.sent.is_empty());
+        assert!(caller.checkpoint().is_ok());
     }
 
     #[test]

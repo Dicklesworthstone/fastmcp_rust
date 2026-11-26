@@ -21,6 +21,7 @@ use fastmcp_core::{McpError, McpErrorCode, McpRequestCancellation, McpResult};
 use fastmcp_protocol::RequestId;
 use serde::{Deserialize, Serialize};
 
+use crate::execution::SubscriptionLifetime;
 use crate::{
     Client, ClientBuilder, StdioSubscriptionEvent, SubscriptionListenRequest,
     SubscriptionTimeoutPolicy, is_cleanup_unverified,
@@ -327,6 +328,7 @@ struct ConfiguredCatalogSubscription {
     request: SubscriptionListenRequest,
     timeout_policy: SubscriptionTimeoutPolicy,
     request_id: RequestId,
+    lifetime: SubscriptionLifetime,
 }
 
 /// A caller-owned Unix subprocess connection with explicit crash recovery.
@@ -517,8 +519,11 @@ impl SupervisedStdioClient {
     /// The request and local resource relationships are bounded by the ordinary
     /// subscription admission rules. This commits the initial listen; consume
     /// its acknowledgement through [`Self::next_subscription_event_with_cx`].
-    /// Every replacement uses the same requested filter and timeout policy,
+    /// Every replacement uses the same requested filter and idle policy,
     /// but negotiates a new accepted subset and reports a gap in [`StdioRecovery`].
+    /// The original caller, cancellation token and absolute deadline remain
+    /// authoritative, including time spent disconnected or in recovery. An
+    /// expired or cancelled listener is never re-established by a fresh caller.
     /// Tasks listeners and application requests are never replayed.
     pub async fn open_subscriptions_listener(
         &mut self,
@@ -539,21 +544,33 @@ impl SupervisedStdioClient {
             if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
                 return Err(StdioRestartError::Cancelled);
             }
+            let caller =
+                with_caller_context(cx, || Cx::current().expect("explicit caller installed"));
             self.client
-                .open_subscriptions_listener_with_timeout_policy(request.clone(), timeout_policy)
+                .open_subscriptions_listener_with_retained_lifetime(
+                    &caller,
+                    request.clone(),
+                    timeout_policy,
+                    Some(cancellation),
+                    None,
+                )
                 .map_err(StdioRestartError::Subscription)?;
-            let request_id = self
+            let live = self
                 .client
                 .live_catalog_subscription
                 .as_ref()
-                .expect("a successful listen installs its owner")
+                .expect("a successful listen installs its owner");
+            let request_id = live.execution.request_id().clone();
+            let lifetime = live
                 .execution
-                .request_id()
-                .clone();
+                .execution
+                .subscription_lifetime()
+                .expect("a committed listener retains its original lifetime");
             self.catalog_subscription = Some(ConfiguredCatalogSubscription {
                 request,
                 timeout_policy,
                 request_id: request_id.clone(),
+                lifetime,
             });
             self.retain_request_id_floor();
             Ok(request_id)
@@ -663,7 +680,8 @@ impl SupervisedStdioClient {
             .catalog_subscription
             .as_ref()
             .is_some_and(|configured| {
-                self.client
+                !configured.lifetime.is_stopped()
+                    && self.client
                     .live_catalog_subscription
                     .as_ref()
                     .is_some_and(|live| {
@@ -680,6 +698,65 @@ impl SupervisedStdioClient {
         if !restartable {
             self.catalog_subscription = None;
         }
+    }
+
+    /// Retires a stopped opt-in without granting a new subscription lifetime.
+    /// A provisional listener already sent before expiry still owns its one
+    /// cancellation control; complete that control before publishing recovery.
+    fn retire_stopped_catalog_subscription(&mut self, cx: &Cx) -> McpResult<bool> {
+        if !self
+            .catalog_subscription
+            .as_ref()
+            .is_some_and(|configured| configured.lifetime.is_stopped())
+        {
+            return Ok(false);
+        }
+        if self
+            .recovery
+            .as_ref()
+            .is_some_and(|incident| matches!(incident.phase, RecoveryPhase::Restoring))
+        {
+            self.client.cancel_live_catalog_subscription(cx)?;
+        }
+        self.catalog_subscription = None;
+        if let Some(incident) = self.recovery.as_mut() {
+            incident.acknowledgement_deadline = None;
+        }
+        Ok(true)
+    }
+
+    /// A local listener stop may race the supervisor's preflight check. It
+    /// does not make a healthy provisional connection unusable. Peer errors,
+    /// failed control writes and cleanup failures retain their terminal path.
+    fn retire_local_subscription_stop(
+        &mut self,
+        cx: &Cx,
+        error: &McpError,
+    ) -> McpResult<bool> {
+        let local_stop = error.code == McpErrorCode::RequestCancelled
+            || (error.code == McpErrorCode::InternalError
+                && error.message == "Request timed out at the absolute deadline"
+                && error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("timeoutSource"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("absolute"));
+        if !local_stop
+            || !matches!(
+                self.client.stdio_restart_observation,
+                Some(StdioRestartObservation::Provisional)
+            )
+            || self.client.transport_is_closed()
+            || self.client.has_pending_cleanup_error()
+            || self.client.cleanup_error.is_some()
+            || self.client.multiplexed_executor.as_ref().is_none_or(|executor| {
+                executor.executor.terminal_error().is_some()
+            })
+        {
+            return Ok(false);
+        }
+        self.retire_stopped_catalog_subscription(cx)
     }
 
     /// Recovers only a child exit proven before cleanup began. Protocol errors,
@@ -783,6 +860,17 @@ impl SupervisedStdioClient {
                 return Err(StdioRestartError::Cancelled);
             }
             let caller = admit_caller(cx, Some(cancellation))?;
+            match self.retire_stopped_catalog_subscription(&caller) {
+                Ok(true) if matches!(phase, RecoveryPhase::Restoring) => {
+                    return self.publish_recovery(&caller, cancellation, None).await;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Err(self
+                        .fail_and_close(&caller, StdioRestartError::Subscription(error))
+                        .await);
+                }
+            }
             let remaining = caller.budget().remaining_time(caller.now());
             let incident = self.recovery.as_mut().expect("recovery incident retained");
             if let Some(remaining) = remaining {
@@ -885,13 +973,42 @@ impl SupervisedStdioClient {
                                     .fail_and_close(&caller, StdioRestartError::WindowExpired)
                                     .await);
                             }
+                            // Discovery can outlive the original subscription
+                            // even when this recovery caller is still live.
+                            if let Err(error) = self.retire_stopped_catalog_subscription(&caller) {
+                                return Err(self
+                                    .fail_and_close(
+                                        &caller,
+                                        StdioRestartError::Subscription(error),
+                                    )
+                                    .await);
+                            }
                             if let Some(configured) = &self.catalog_subscription {
                                 if let Err(error) =
-                                    self.client.open_subscriptions_listener_with_timeout_policy(
+                                    self.client.open_subscriptions_listener_with_retained_lifetime(
+                                        &configured.lifetime.caller,
                                         configured.request.clone(),
                                         configured.timeout_policy,
+                                        configured.lifetime.request_cancellation.as_ref(),
+                                        Some(configured.lifetime.absolute_deadline),
                                     )
                                 {
+                                    match self.retire_local_subscription_stop(&caller, &error) {
+                                        Ok(true) => {
+                                            return self
+                                                .publish_recovery(&caller, cancellation, None)
+                                                .await;
+                                        }
+                                        Ok(false) => {}
+                                        Err(cleanup) => {
+                                            return Err(self
+                                                .fail_and_close(
+                                                    &caller,
+                                                    StdioRestartError::Subscription(cleanup),
+                                                )
+                                                .await);
+                                        }
+                                    }
                                     return Err(self
                                         .fail_and_close(
                                             &caller,
@@ -1024,6 +1141,22 @@ impl SupervisedStdioClient {
                                 .await);
                         }
                         Err(error) => {
+                            match self.retire_local_subscription_stop(&caller, &error) {
+                                Ok(true) => {
+                                    return self
+                                        .publish_recovery(&caller, cancellation, None)
+                                        .await;
+                                }
+                                Ok(false) => {}
+                                Err(cleanup) => {
+                                    return Err(self
+                                        .fail_and_close(
+                                            &caller,
+                                            StdioRestartError::Subscription(cleanup),
+                                        )
+                                        .await);
+                                }
+                            }
                             // Discovery alone does not publish a replacement.
                             // A natural exit while restoring its listener may
                             // spend another attempt in this same incident, but
@@ -1071,7 +1204,7 @@ impl SupervisedStdioClient {
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
-        catalog_subscription: Option<StdioSubscriptionRecovery>,
+        mut catalog_subscription: Option<StdioSubscriptionRecovery>,
     ) -> Result<StdioRecovery, StdioRestartError> {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             if let Err(error) = self.client.close_with_cx(cx).await {
@@ -1091,6 +1224,17 @@ impl SupervisedStdioClient {
             }
             self.schedule_backoff();
             return Err(StdioRestartError::Cancelled);
+        }
+        if catalog_subscription.is_some() {
+            match self.retire_stopped_catalog_subscription(cx) {
+                Ok(true) => catalog_subscription = None,
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(self
+                        .fail_and_close(cx, StdioRestartError::Subscription(error))
+                        .await);
+                }
+            }
         }
         let incident = self
             .recovery
@@ -1555,23 +1699,37 @@ done
     }
 
     async fn open_catalog(owner: &mut SupervisedStdioClient, cx: &Cx) -> RequestId {
-        let cancellation = McpRequestCancellation::new();
+        open_catalog_with_lifetime(
+            owner,
+            cx,
+            cx,
+            &McpRequestCancellation::new(),
+        )
+        .await
+    }
+
+    async fn open_catalog_with_lifetime(
+        owner: &mut SupervisedStdioClient,
+        observer: &Cx,
+        caller: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> RequestId {
         let id = owner
             .open_subscriptions_listener(
-                cx,
-                &cancellation,
+                caller,
+                cancellation,
                 catalog_filter(),
                 SubscriptionTimeoutPolicy::default(),
             )
             .await
             .unwrap();
         assert!(matches!(
-            owner.next_subscription_event_with_cx(cx, &cancellation).await.unwrap(),
+            owner.next_subscription_event_with_cx(observer, cancellation).await.unwrap(),
             StdioSubscriptionEvent::Acknowledged(filter) if filter == catalog_filter(),
         ));
         assert!(matches!(
             owner
-                .next_subscription_event_with_cx(cx, &cancellation)
+                .next_subscription_event_with_cx(observer, cancellation)
                 .await
                 .unwrap(),
             StdioSubscriptionEvent::Notification(crate::ServerNotification::ToolsListChanged(_)),
@@ -1683,6 +1841,166 @@ done
                 );
                 owner.close_with_cx(&cx).await.unwrap();
             });
+    }
+
+    #[test]
+    fn supervised_stdio_subscription_repeated_recovery_preserves_absolute_deadline() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let fixture = Fixture::new();
+                let mut owner = fixture.connect(&cx, "effect", quick_policy(3)).await;
+                open_catalog(&mut owner, &cx).await;
+                let original_deadline = owner
+                    .catalog_subscription
+                    .as_ref()
+                    .unwrap()
+                    .lifetime
+                    .absolute_deadline;
+                let cancellation = McpRequestCancellation::new();
+                for generation in 2..=3 {
+                    let _ = crash(&mut owner, &cx).await;
+                    let recovered = owner.recover(&cx, &cancellation).await.unwrap();
+                    assert_eq!(recovered.generation, generation);
+                    assert!(recovered.catalog_subscription.is_some());
+                    let live = owner.client.live_catalog_subscription.as_ref().unwrap();
+                    let restored = live.execution.execution.subscription_lifetime().unwrap();
+                    assert_eq!(
+                        restored.absolute_deadline,
+                        original_deadline,
+                        "restarting the process must not renew the listener lifetime"
+                    );
+                    assert_eq!(
+                        owner.catalog_subscription.as_ref().unwrap().lifetime.absolute_deadline,
+                        original_deadline
+                    );
+                    assert!(matches!(
+                        owner.next_subscription_event_with_cx(&cx, &cancellation).await.unwrap(),
+                        StdioSubscriptionEvent::Acknowledged(_)
+                    ));
+                    assert!(matches!(
+                        owner.next_subscription_event_with_cx(&cx, &cancellation).await.unwrap(),
+                        StdioSubscriptionEvent::Notification(_)
+                    ));
+                }
+                assert_eq!(fixture.count("listen"), 3);
+                assert_eq!(fixture.count("effect"), 2);
+                owner.close_with_cx(&cx).await.unwrap();
+            });
+    }
+
+    #[test]
+    fn supervised_stdio_subscription_original_cancellation_during_disconnect_is_terminal() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let subscription_caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            for cancel_caller in [false, true] {
+                let fixture = Fixture::new();
+                let mut owner = fixture.connect(&cx, "effect", quick_policy(3)).await;
+                let cancellation = McpRequestCancellation::new();
+                open_catalog_with_lifetime(
+                    &mut owner,
+                    &cx,
+                    &subscription_caller,
+                    &cancellation,
+                )
+                .await;
+                let _ = crash(&mut owner, &cx).await;
+                if cancel_caller {
+                    subscription_caller.set_cancel_requested(true);
+                } else {
+                    cancellation.cancel();
+                }
+                let recovered = owner
+                    .recover(&cx, &McpRequestCancellation::new())
+                    .await
+                    .unwrap();
+                assert_eq!(recovered.generation, 2);
+                assert!(recovered.catalog_subscription.is_none());
+                assert!(owner.catalog_subscription.is_none());
+                assert!(owner.client.live_catalog_subscription.is_none());
+                assert_eq!(
+                    fixture.count("listen"),
+                    1,
+                    "fresh recovery authority cannot revive the original cancelled listener"
+                );
+                assert!(cx.checkpoint().is_ok());
+                owner.close_with_cx(&cx).await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn supervised_stdio_subscription_original_clock_expiring_during_discovery_is_terminal() {
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use asupersync::{Budget, Time};
+        use std::sync::Arc;
+
+        let clock = Arc::new(VirtualClock::new());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_timer_driver(TimerDriverHandle::with_virtual_clock(Arc::clone(&clock)))
+            .build()
+            .unwrap();
+        let original_deadline = Time::from_nanos(3_600_000_000_000);
+        let subscription_caller =
+            runtime.request_cx_with_budget(Budget::INFINITE.with_deadline(original_deadline));
+        let mut scenario = Box::pin(async {
+            let cx = Cx::current().unwrap();
+            let fixture = Fixture::new();
+            let mut owner = fixture.connect(&cx, "gated", quick_policy(3)).await;
+            let cancellation = McpRequestCancellation::new();
+            open_catalog_with_lifetime(
+                &mut owner,
+                &cx,
+                &subscription_caller,
+                &cancellation,
+            )
+            .await;
+            let _ = crash(&mut owner, &cx).await;
+            let recovery_cancellation = McpRequestCancellation::new();
+            let mut recovery = Box::pin(owner.recover(&cx, &recovery_cancellation));
+            let fixture_deadline = Instant::now() + Duration::from_secs(3);
+            while fixture.count("discovery") < 2 {
+                poll_fn(|task_cx| {
+                    assert!(recovery.as_mut().poll(task_cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert!(Instant::now() < fixture_deadline);
+                asupersync::time::sleep(cx.now(), Duration::from_millis(2)).await;
+            }
+            // Both contexts use one runtime. Only the original has this
+            // finite budget; the fresh recovery caller cannot replace it.
+            assert!(subscription_caller.now() < original_deadline);
+            clock.advance(original_deadline.duration_since(subscription_caller.now()));
+            assert!(subscription_caller.now() >= original_deadline);
+            std::fs::write(&fixture.gate, b"discovery").unwrap();
+            let recovered = recovery.await.unwrap();
+            assert_eq!(recovered.generation, 2);
+            assert!(recovered.catalog_subscription.is_none());
+            assert!(owner.client.live_catalog_subscription.is_none());
+            assert_eq!(fixture.count("listen"), 1);
+            assert!(cx.checkpoint().is_ok());
+            owner.close_with_cx(&cx).await.unwrap();
+        });
+        // This test owns virtual time. Advance between polls while the real
+        // subprocess reaches each gate; no second runtime lends I/O authority.
+        runtime.block_on(poll_fn(|task_cx| {
+            let result = scenario.as_mut().poll(task_cx);
+            if result.is_pending() {
+                clock.advance(1_000_000);
+                task_cx.waker().wake_by_ref();
+            }
+            result
+        }));
+        drop(scenario);
+        drop(subscription_caller);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 
     #[test]
