@@ -5430,7 +5430,7 @@ def respond(request):
         output.write(json.dumps(event, separators=(",", ":")) + "\n")
     if method == "server/discover":
         capabilities = {"tools": {}}
-        if mode != "core_only":
+        if mode not in ("core_only", "accept_core_only"):
             capabilities["extensions"] = {"io.modelcontextprotocol/tasks": {}}
         result = json.dumps({
             "resultType": "complete", "supportedVersions": ["2026-07-28"],
@@ -5446,8 +5446,9 @@ def respond(request):
         assert params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]["io.modelcontextprotocol/tasks"] == {}
         assert "task" not in params and "ttlMs" not in params
         called_at = time.monotonic()
-        if mode == "sync":
-            result = '{"resultType":"complete","content":[{"type":"text","text":"immediate"}]}'
+        if mode in ("sync", "accept_sync", "accept_tool_error"):
+            result = json.dumps({"resultType":"complete","content":[{"type":"text","text":"immediate"}],
+                                 "isError": mode == "accept_tool_error"})
         else:
             result = task("completed" if mode == "immediate" else "working", "task")
     elif method == "subscriptions/listen" and mode.startswith("listen_"):
@@ -5517,7 +5518,8 @@ def respond(request):
     elif method == "tasks/get":
         assert called_at is not None, "observation must follow creation"
         assert request["params"]["taskId"] == task_id
-        assert event["elapsed_ms"] >= 70, "creation pollIntervalMs was shortened"
+        if mode != "accept_followup":
+            assert event["elapsed_ms"] >= 70, "creation pollIntervalMs was shortened"
         status = mode if mode in ("failed", "cancelled", "input_required", "working") else "completed"
         result = task(status, "complete")
     else:
@@ -5614,7 +5616,7 @@ else:
             command.args([
                 "call",
                 "background",
-                "--wait",
+                if mode.starts_with("accept_") { "--accept-task" } else { "--wait" },
                 "--protocol-policy",
                 "modern-only",
                 "--timeout",
@@ -5662,6 +5664,25 @@ else:
         command.args(extra);
         let output =
             run_with_deadline(command, Duration::from_secs(15)).expect("bounded call --wait");
+        if mode == "accept_followup" {
+            assert!(output.status.success(), "{}", stderr_str(&output));
+            let receipt: Value = serde_json::from_slice(&output.stdout).expect("one receipt");
+            let id = receipt["taskId"].as_str().unwrap();
+            let endpoint = std::fs::read_to_string(&ready).unwrap();
+            for action in ["get", "watch"] {
+                let mut followup = Command::new(get_binary_path());
+                followup.args(["tasks", action, id, "--http-url", &endpoint, "--json", "--timeout", "5"]);
+                let result = run_with_deadline(followup, Duration::from_secs(15)).unwrap();
+                assert!(result.status.success(), "{action}: {}", stderr_str(&result));
+                let entries = documents(&result);
+                assert_eq!(entries[0]["event"], "snapshot");
+                assert_eq!(entries[0]["data"]["taskId"], id);
+                assert_eq!(entries[0]["data"]["status"], "completed");
+                if action == "watch" {
+                    assert_eq!(entries[1]["data"]["reason"], "task-terminal");
+                }
+            }
+        }
         if let Some(peer) = peer.as_mut() {
             peer.kill_and_reap().expect("HTTP peer cleanup");
         }
@@ -6019,6 +6040,41 @@ else:
     }
 
     #[test]
+    fn call_accept_task_returns_receipt_without_polling_or_replaying() {
+        for http in [false, true] {
+            let (out, events) = call("accept_receipt", http, true, &[]);
+            assert!(out.status.success(), "{}", stderr_str(&out));
+            assert_exchange(&events, &["server/discover", "tools/call"]);
+            let receipt: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(receipt["resultType"], "task");
+            assert_eq!(receipt["status"], "working");
+            assert_eq!(receipt["_meta"]["com.example/receipt"], "accepted");
+            assert_eq!(receipt["com.example/creation"]["kept"], true);
+
+            for mode in ["accept_sync", "accept_tool_error"] {
+                let (out, events) = call(mode, http, true, &[]);
+                assert_eq!(out.status.success(), mode == "accept_sync");
+                assert_exchange(&events, &["server/discover", "tools/call"]);
+                let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(result["resultType"], "complete");
+                assert_eq!(result["content"][0]["text"], "immediate");
+            }
+            let (out, events) = call("accept_core_only", http, true, &[]);
+            assert!(!out.status.success());
+            assert_exchange(&events, &["server/discover"]);
+        }
+    }
+
+    #[test]
+    fn call_accept_task_receipt_can_be_used_by_separate_http_task_commands() {
+        let (_, events) = call("accept_followup", true, true, &[]);
+        let methods = events.iter().map(|e| e["request"]["method"].as_str().unwrap()).collect::<Vec<_>>();
+        assert_eq!(methods, [
+            "server/discover", "tools/call", "server/discover", "tasks/get", "server/discover", "tasks/get",
+        ]);
+    }
+
+    #[test]
     fn call_wait_requires_tasks_negotiation_before_tools_call_on_both_transports() {
         for http in [false, true] {
             let (output, events) = call("core_only", http, true, &[]);
@@ -6123,6 +6179,10 @@ fn call_wait_without_tasks_feature_is_hidden_and_fails_before_connecting() {
     let help = run_cli(&["call", "--help"]);
     assert!(help.status.success());
     assert!(!stdout_str(&help).contains("--wait"));
+    assert!(!stdout_str(&help).contains("--accept-task"));
+    let rejected = run_cli(&["call", "background", "--accept-task", "--http-url", "http://127.0.0.1:1/mcp", "--json"]);
+    assert!(stderr_str(&rejected).contains("--features tasks"));
+    assert!(!rejected.status.success());
 }
 
 #[cfg(all(not(unix), feature = "tasks"))]

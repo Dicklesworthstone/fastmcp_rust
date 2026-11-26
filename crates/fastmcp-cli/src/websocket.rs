@@ -131,19 +131,19 @@ pub(super) async fn operation(
     operation: CoreOperation<'_>,
     parameters: serde_json::Value,
     budget: OperationBudget,
-    wait: bool,
+    mode: CallTaskMode,
 ) -> McpResult<Option<CoreResult>> {
     let mut client = Connection::connect(cx, url, budget).await?;
     let acquisition = match &mut client {
         Connection::Plain(client) => {
             Box::pin(execute(
-                cx, client, connection, operation, parameters, budget, wait,
+                cx, client, connection, operation, parameters, budget, mode,
             ))
             .await
         }
         Connection::Tls(client) => {
             Box::pin(execute(
-                cx, client, connection, operation, parameters, budget, wait,
+                cx, client, connection, operation, parameters, budget, mode,
             ))
             .await
         }
@@ -158,20 +158,20 @@ async fn execute<IO>(
     operation: CoreOperation<'_>,
     parameters: serde_json::Value,
     budget: OperationBudget,
-    wait: bool,
+    mode: CallTaskMode,
 ) -> McpResult<Option<CoreResult>>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let cancellation = McpRequestCancellation::new();
     #[cfg(feature = "tasks")]
-    if wait {
-        return waiting_tool_call(cx, client, connection, parameters, budget, &cancellation).await;
+    if mode != CallTaskMode::Core {
+        return task_aware_tool_call(cx, client, connection, parameters, budget, mode, &cancellation).await;
     }
     #[cfg(not(feature = "tasks"))]
     {
         let _ = connection;
-        debug_assert!(!wait);
+        debug_assert!(mode == CallTaskMode::Core);
     }
     let request = async {
         match operation {
@@ -224,12 +224,13 @@ where
 }
 
 #[cfg(feature = "tasks")]
-async fn waiting_tool_call<IO>(
+async fn task_aware_tool_call<IO>(
     cx: &Cx,
     client: &mut WebSocketClient<IO>,
     connection: &OperationConnection,
     parameters: serde_json::Value,
     budget: OperationBudget,
+    mode: CallTaskMode,
     cancellation: &McpRequestCancellation,
 ) -> McpResult<Option<CoreResult>>
 where
@@ -258,9 +259,10 @@ where
     .map_err(|error| {
         operation_failure(error, "MCP WebSocket request failed; no action was retried")
     })?;
-    let result = operation_final_tool_result(created);
-    let Some(mut task) = prepare_operation_task_wait(connection, &result)? else {
-        return Ok(Some(result));
+    let mut task = match prepare_task_call_result(connection, created, mode)? {
+        TaskCallResult::Core(result) => return Ok(Some(result)),
+        TaskCallResult::Published => return Ok(None),
+        TaskCallResult::Observe(task) => task,
     };
     if !matches!(
         task.task(),
@@ -786,6 +788,49 @@ mod tests {
         let mut params = task.clone();
         params["_meta"] = json!({"io.modelcontextprotocol/subscriptionId": 3});
         json!({"jsonrpc": "2.0", "method": "notifications/tasks", "params": params})
+    }
+
+    #[test]
+    fn websocket_call_accept_task_finishes_without_an_observation_request() {
+        build_cli_runtime().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let (client_io, peer_io) = VirtualTcpStream::pair(
+                "127.0.0.1:45251".parse().unwrap(),
+                "127.0.0.1:45252".parse().unwrap(),
+            );
+            let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+            let discovery = json!({"jsonrpc":"2.0", "id":1, "result":{
+                "resultType":"complete", "supportedVersions":["2026-07-28"],
+                "capabilities":{"tools":{}, "extensions":{"io.modelcontextprotocol/tasks":{}}},
+                "ttlMs":0, "cacheScope":"private"
+            }});
+            let mut created = task("2026-07-28T00:00:00Z", "accepted", false);
+            created["resultType"] = json!("task");
+            // There is deliberately no response to any observation request.
+            for frame in [discovery, json!({"jsonrpc":"2.0", "id":2, "result":created})] {
+                peer.send(&cx, &serde_json::from_value(frame).unwrap()).await.unwrap();
+            }
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
+                .await.unwrap();
+            let cli = Cli::try_parse_from([
+                "fastmcp", "call", "background", "--accept-task", "--json",
+                "--protocol-policy", "modern-only", "--websocket-url", "ws://localhost/mcp",
+            ]).unwrap();
+            let Commands::Call { connection, .. } = cli.command else { panic!("call expected") };
+            let result = execute(&cx, &mut client, &connection, CoreOperation::Call("background"),
+                json!({"name":"background","arguments":{}}), OperationBudget::new(2).unwrap(),
+                CallTaskMode::Receipt).await.unwrap();
+            assert!(result.is_none(), "the creation receipt was already emitted");
+            client.close(&cx).await.unwrap();
+            for expected in ["server/discover", "tools/call"] {
+                let message = asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(1),
+                    Box::pin(peer.recv(&cx))).await.unwrap().unwrap();
+                let JsonRpcMessage::Request(request) = message else { panic!("request expected") };
+                assert_eq!(request.method, expected);
+            }
+        });
     }
 
     #[test]

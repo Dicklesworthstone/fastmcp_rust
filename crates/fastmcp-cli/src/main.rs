@@ -725,6 +725,15 @@ enum Commands {
         /// settlement bound; regular files/devices follow OS blocking behavior.
         #[arg(long, hide = !cfg!(feature = "tasks"))]
         wait: bool,
+
+        /// Advertise Tasks support and return the first result without polling.
+        /// The server chooses whether to return a normal tool result or a Task.
+        /// --json emits one document. For a Task, keep its taskId for tasks get
+        /// or tasks watch against the same server and identity. Requires
+        /// modern-only and a peer advertising Tasks. A stdio server
+        /// is stopped on exit and must persist Tasks for a later process.
+        #[arg(long, hide = !cfg!(feature = "tasks"), conflicts_with = "wait")]
+        accept_task: bool,
         #[command(flatten)]
         connection: OperationConnection,
         #[command(flatten)]
@@ -1441,10 +1450,13 @@ fn main() -> ExitCode {
     };
     let machine_output = cli.command.machine_output();
     #[cfg(not(feature = "tasks"))]
-    if matches!(&cli.command, Commands::Call { wait: true, .. }) {
-        let error = fastmcp_core::McpError::invalid_params(
-            "FeatureUnavailable: call --wait requires fastmcp-cli built with --features tasks",
-        );
+    if let Commands::Call { wait, accept_task, .. } = &cli.command
+        && (*wait || *accept_task)
+    {
+        let flag = if *wait { "--wait" } else { "--accept-task" };
+        let error = fastmcp_core::McpError::invalid_params(format!(
+            "FeatureUnavailable: call {flag} requires fastmcp-cli built with --features tasks",
+        ));
         return report_cli_failure(machine_output, CliFailureCategory::CommandFailed, &error);
     }
     // An unavailable policy is refused before the runtime, reactor, child,
@@ -1535,13 +1547,20 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
             connection,
             arguments,
             wait,
+            accept_task,
         } => {
             Box::pin(cmd_operation(
                 cx,
                 &connection,
                 CoreOperation::Call(&name),
                 &arguments,
-                wait,
+                if wait {
+                    CallTaskMode::Wait
+                } else if accept_task {
+                    CallTaskMode::Receipt
+                } else {
+                    CallTaskMode::Core
+                },
             ))
             .await
         }
@@ -1551,7 +1570,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                 &connection,
                 CoreOperation::Read(&uri),
                 &OperationArguments::default(),
-                false,
+                CallTaskMode::Core,
             ))
             .await
         }
@@ -1565,7 +1584,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                 &connection,
                 CoreOperation::Prompt(&name),
                 &arguments,
-                false,
+                CallTaskMode::Core,
             ))
             .await
         }
@@ -1578,7 +1597,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                 &connection,
                 CoreOperation::Complete(&completion),
                 &OperationArguments::default(),
-                false,
+                CallTaskMode::Core,
             ))
             .await
         }
@@ -7118,12 +7137,19 @@ fn operation_failure(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallTaskMode {
+    Core,
+    Receipt,
+    Wait,
+}
+
 async fn cmd_operation(
     cx: &Cx,
     connection: &OperationConnection,
     operation: CoreOperation<'_>,
     arguments: &OperationArguments,
-    wait: bool,
+    mode: CallTaskMode,
 ) -> McpResult<()> {
     let budget = OperationBudget::new(connection.timeout)?;
     budget.remaining(cx)?;
@@ -7150,12 +7176,12 @@ async fn cmd_operation(
     }
     validate_operation_input_policy(connection)?;
     #[cfg(not(unix))]
-    if wait {
+    if mode == CallTaskMode::Wait {
         return Err(fastmcp_core::McpError::invalid_params(
             "call --wait requires Unix bounded Task receipt output; ordinary HTTP calls remain available",
         ));
     }
-    if wait
+    if mode != CallTaskMode::Core
         && (!cfg!(feature = "tasks")
             || !matches!(operation, CoreOperation::Call(_))
             || connection.protocol_policy != CliProtocolPolicy::ModernOnly
@@ -7163,9 +7189,10 @@ async fn cmd_operation(
             || connection.resume_result_file.is_some()
             || connection.input_responses_file.is_some())
     {
-        return Err(fastmcp_core::McpError::invalid_params(
-            "call --wait requires Tasks support and --protocol-policy modern-only, without manual input capabilities or resume files",
-        ));
+        let flag = if mode == CallTaskMode::Wait { "--wait" } else { "--accept-task" };
+        return Err(fastmcp_core::McpError::invalid_params(format!(
+            "call {flag} requires Tasks support and --protocol-policy modern-only, without manual input capabilities or resume files",
+        )));
     }
     let mut parameters = operation.parameters(arguments)?;
     let has_http = connection.http_url.is_some()
@@ -7196,7 +7223,7 @@ async fn cmd_operation(
                 operation.method(),
                 parameters,
                 budget,
-                wait,
+                mode,
             ))
             .await?
         }
@@ -7217,7 +7244,7 @@ async fn cmd_operation(
                 operation,
                 parameters,
                 budget,
-                wait,
+                mode,
             ))
             .await?
         }
@@ -7233,14 +7260,14 @@ async fn cmd_operation(
             operation.method(),
             parameters,
             budget,
-            wait,
+            mode,
         ))
         .await?
     };
     let Some(result) = result else {
         return Ok(());
     };
-    let outcome = operation_outcome(operation.method(), &result, wait)?;
+    let outcome = operation_outcome(operation.method(), &result, mode == CallTaskMode::Wait)?;
     let output = render_operation_result(&result, outcome, connection.json)?;
     write_operation_output(cx, budget, &output)?;
     match outcome {
@@ -7272,7 +7299,7 @@ async fn stdio_operation(
     method: &'static str,
     parameters: serde_json::Value,
     budget: OperationBudget,
-    wait: bool,
+    mode: CallTaskMode,
 ) -> McpResult<Option<fastmcp_protocol::CoreResult>> {
     let remaining = budget.remaining(cx)?;
     let args = connection
@@ -7303,19 +7330,20 @@ async fn stdio_operation(
         client.set_request_timeout_policy(OperationBudget::request_policy(remaining)?)?;
         let cancellation = fastmcp_core::McpRequestCancellation::new();
         #[cfg(feature = "tasks")]
-        if wait {
-            return Box::pin(waiting_stdio_tool_call(
+        if mode != CallTaskMode::Core {
+            return Box::pin(task_aware_stdio_tool_call(
                 cx,
                 &mut client,
                 connection,
                 parameters,
                 budget,
+                mode,
                 &cancellation,
             ))
             .await;
         }
         #[cfg(not(feature = "tasks"))]
-        debug_assert!(!wait);
+        debug_assert!(mode == CallTaskMode::Core);
         asupersync::time::timeout(
             cx.now(),
             remaining,
@@ -7350,7 +7378,7 @@ async fn http_operation(
     method: &'static str,
     parameters: serde_json::Value,
     budget: OperationBudget,
-    wait: bool,
+    mode: CallTaskMode,
 ) -> McpResult<Option<fastmcp_protocol::CoreResult>> {
     let plan = http_inspect_protocol_plan(
         connection.http_url.as_deref(),
@@ -7378,19 +7406,20 @@ async fn http_operation(
     let remaining = budget.remaining(cx)?;
     let cancellation = fastmcp_core::McpRequestCancellation::new();
     #[cfg(feature = "tasks")]
-    if wait {
-        return Box::pin(waiting_http_tool_call(
+    if mode != CallTaskMode::Core {
+        return Box::pin(task_aware_http_tool_call(
             cx,
             &mut client,
             connection,
             parameters,
             budget,
+            mode,
             &cancellation,
         ))
         .await;
     }
     #[cfg(not(feature = "tasks"))]
-    debug_assert!(!wait);
+    debug_assert!(mode == CallTaskMode::Core);
     // One core dispatch; no MRTR retry, authentication retry, or fallback after
     // this action starts. Recompute from the original deadline after connect.
     let result = asupersync::time::timeout(
@@ -7415,12 +7444,13 @@ async fn http_operation(
 /// created it. The ordinary core stdio API intentionally does not advertise
 /// Tasks, so a waiting tool call must select the Tasks-aware typed API.
 #[cfg(all(unix, feature = "tasks"))]
-async fn waiting_stdio_tool_call(
+async fn task_aware_stdio_tool_call(
     cx: &Cx,
     client: &mut Client,
     connection: &OperationConnection,
     parameters: serde_json::Value,
     budget: OperationBudget,
+    mode: CallTaskMode,
     cancellation: &fastmcp_core::McpRequestCancellation,
 ) -> McpResult<Option<fastmcp_protocol::CoreResult>> {
     let name = parameters
@@ -7442,9 +7472,10 @@ async fn waiting_stdio_tool_call(
     .await
     .map_err(|_| OperationBudget::timeout_error())?
     .map_err(|error| operation_failure(error, "MCP request failed; no action was retried"))?;
-    let result = operation_final_tool_result(created);
-    let Some(mut task) = prepare_operation_task_wait(connection, &result)? else {
-        return Ok(Some(result));
+    let mut task = match prepare_task_call_result(connection, created, mode)? {
+        TaskCallResult::Core(result) => return Ok(Some(result)),
+        TaskCallResult::Published => return Ok(None),
+        TaskCallResult::Observe(task) => task,
     };
     if !matches!(
         task.task(),
@@ -7472,12 +7503,13 @@ async fn waiting_stdio_tool_call(
 }
 
 #[cfg(feature = "tasks")]
-async fn waiting_http_tool_call(
+async fn task_aware_http_tool_call(
     cx: &Cx,
     client: &mut fastmcp_client::HttpClient,
     connection: &OperationConnection,
     parameters: serde_json::Value,
     budget: OperationBudget,
+    mode: CallTaskMode,
     cancellation: &fastmcp_core::McpRequestCancellation,
 ) -> McpResult<Option<fastmcp_protocol::CoreResult>> {
     let name = parameters
@@ -7505,9 +7537,10 @@ async fn waiting_http_tool_call(
     .map_err(|_| {
         fastmcp_core::McpError::internal_error("MCP HTTP request failed; no action was retried")
     })?;
-    let result = operation_final_tool_result(created);
-    let Some(mut task) = prepare_operation_task_wait(connection, &result)? else {
-        return Ok(Some(result));
+    let mut task = match prepare_task_call_result(connection, created, mode)? {
+        TaskCallResult::Core(result) => return Ok(Some(result)),
+        TaskCallResult::Published => return Ok(None),
+        TaskCallResult::Observe(task) => task,
     };
     if !matches!(
         task.task(),
@@ -7559,16 +7592,38 @@ fn operation_task_wait_policy(
     fastmcp_client::FinalTaskWaitPolicy::new(remaining, 4096, std::time::Duration::from_secs(1))
 }
 
+#[cfg(feature = "tasks")]
+enum TaskCallResult {
+    Core(fastmcp_protocol::CoreResult),
+    Published,
+    Observe(fastmcp_client::FinalTaskHandle),
+}
+
 /// Publish every admitted creation receipt before any local cancellation,
 /// deadline or handle-validation check can discard the caller's only task ID.
 /// Settlement does not use Cx and cannot extend an RPC deadline. Adoption does
 /// no immediate tasks/get, preserving the first poll interval and original TTL.
 #[cfg(feature = "tasks")]
-fn prepare_operation_task_wait(
+fn prepare_task_call_result(
     connection: &OperationConnection,
-    result: &fastmcp_protocol::CoreResult,
-) -> McpResult<Option<fastmcp_client::FinalTaskHandle>> {
-    prepare_operation_task_wait_with(result, connection.json, write_operation_task_receipt)
+    created: fastmcp_client::FinalToolCallOutcome,
+    mode: CallTaskMode,
+) -> McpResult<TaskCallResult> {
+    let result = operation_final_tool_result(created);
+    if mode == CallTaskMode::Receipt {
+        let fastmcp_protocol::CoreResult::Final(fastmcp_protocol::FinalCoreResult::ToolsCallTask { .. }) = &result else {
+            return Ok(TaskCallResult::Core(result));
+        };
+        // Publish before transport cleanup. This command accepts custody of the
+        // receipt but does not adopt a handle, issue a read, or cancel the Task.
+        let output = render_operation_result(&result, OperationOutcome::TaskAccepted, connection.json)?;
+        write_operation_task_receipt(&output)?;
+        return Ok(TaskCallResult::Published);
+    }
+    match prepare_operation_task_wait_with(&result, connection.json, write_operation_task_receipt)? {
+        Some(task) => Ok(TaskCallResult::Observe(task)),
+        None => Ok(TaskCallResult::Core(result)),
+    }
 }
 
 #[cfg(feature = "tasks")]
@@ -7606,11 +7661,12 @@ fn write_operation_task_receipt(output: &str) -> McpResult<()> {
         }
         #[cfg(not(unix))]
         {
-            let _ = (bytes, bound);
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "bounded Task receipt output requires Unix",
-            ))
+            // Receipt-only network calls support ordinary blocking stdout here.
+            // The waiting mode requires Unix and is rejected before connecting.
+            let _ = bound;
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(bytes)?;
+            stdout.flush()
         }
     })
 }
@@ -7629,9 +7685,11 @@ fn write_operation_task_receipt_with(
     bytes.push(b'\n');
     STDOUT_STARTED.store(true, std::sync::atomic::Ordering::Release);
     write(&bytes, std::time::Duration::from_millis(250)).map_err(|_| {
-        fastmcp_core::McpError::internal_error(
-            "could not emit the admitted Task snapshot within its bounded output settlement; no action was retried",
-        )
+        #[cfg(unix)]
+        let detail = "could not emit the admitted Task snapshot within its bounded output settlement; no action was retried";
+        #[cfg(not(unix))]
+        let detail = "could not emit the admitted Task snapshot; no action was retried";
+        fastmcp_core::McpError::internal_error(detail)
     })
 }
 
@@ -7804,7 +7862,7 @@ fn render_operation_result(
         OperationOutcome::ToolError => "tool error",
         OperationOutcome::InputRequired => "input required; no continuation submitted",
         #[cfg(feature = "tasks")]
-        OperationOutcome::TaskAccepted => "task accepted; completion has not been observed",
+        OperationOutcome::TaskAccepted => "task accepted; see receipt for current status",
         #[cfg(feature = "tasks")]
         OperationOutcome::TaskCompleted => "task completed",
         #[cfg(feature = "tasks")]
