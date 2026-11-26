@@ -2245,11 +2245,11 @@ fn middleware_may_complete_final_core_from_cache(
 
 // Each response callback sees the previous callback's output, including
 // middleware that may store it. Enforce the ceiling at each handoff.
-fn check_resource_read_cache_step(
+fn check_private_cache_step(
     value: &serde_json::Value,
     ceiling: Option<&CacheTtl>,
 ) -> McpResult<Option<CacheTtl>> {
-    let invalid = || McpError::internal_error("middleware violated resource-read cache policy");
+    let invalid = || McpError::internal_error("middleware violated private response cache policy");
     match (ceiling, value.get("resultType").and_then(serde_json::Value::as_str)) {
         (None, Some("input_required")) => Ok(None),
         (Some(ceiling), Some("complete"))
@@ -26198,25 +26198,48 @@ impl Server {
         if enforce_liveness && let Some(error) = Self::request_context_error(ctx) {
             return Err(error);
         }
-        let protect_read = !stack.is_empty()
-            && matches!(core_request, Some(CoreRequest::Final(FinalCoreRequest::ResourcesRead(_))));
-        let mut read_ttl = if protect_read {
-            // Also check a response supplied by cache middleware before the
-            // first response callback can observe or store it.
-            let ceiling = (value.get("resultType").and_then(serde_json::Value::as_str)
-                != Some("input_required"))
-                .then(|| self.router.final_cache_hint_policy().1);
-            check_resource_read_cache_step(&value, ceiling)?
+        if stack.is_empty() {
+            return Ok(value);
+        }
+        let mut response = value;
+        let (protect_cache, ceiling) = match core_request {
+            Some(CoreRequest::Final(FinalCoreRequest::ResourcesRead(_))) => {
+                let ceiling = (response.get("resultType").and_then(serde_json::Value::as_str)
+                    != Some("input_required"))
+                    .then(|| self.router.final_cache_hint_policy().1);
+                (true, ceiling)
+            }
+            Some(CoreRequest::Final(
+                FinalCoreRequest::ToolsList(_)
+                | FinalCoreRequest::ResourcesList(_)
+                | FinalCoreRequest::ResourceTemplatesList(_)
+                | FinalCoreRequest::PromptsList(_),
+            )) => {
+                // The immutable registry can produce a public catalog. A
+                // response callback receives the caller's context and can
+                // personalize that catalog, so narrow it before any callback
+                // (including a cache) observes it.
+                if let Some(scope) = response.get_mut("cacheScope")
+                    && scope.as_str() == Some("public")
+                {
+                    *scope = serde_json::Value::String("private".to_owned());
+                }
+                (true, Some(self.router.final_cache_hint_policy().0))
+            }
+            _ => (false, None),
+        };
+        let mut ttl = if protect_cache {
+            // Cache hits take this path as well as freshly dispatched results.
+            check_private_cache_step(&response, ceiling)?
         } else {
             None
         };
-        let mut response = value;
         for m in stack.iter().rev() {
             let invocation = catch_extension_unwind(|| m.on_response(ctx, request, response));
             match invocation {
                 Ok(Ok(next)) => {
-                    if protect_read {
-                        read_ttl = check_resource_read_cache_step(&next, read_ttl.as_ref())?;
+                    if protect_cache {
+                        ttl = check_private_cache_step(&next, ttl.as_ref())?;
                     }
                     response = next;
                     if enforce_liveness && let Some(error) = Self::request_context_error(ctx) {
@@ -34427,16 +34450,131 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn public_catalogs_become_private_before_caller_aware_middleware() {
+        #[derive(Clone, Copy)]
+        enum Change {
+            Personalize,
+            Publish,
+            Extend,
+        }
+        struct CatalogMiddleware {
+            cache_hit: bool,
+            change: Change,
+        }
+
+        impl Middleware for CatalogMiddleware {
+            fn on_request(
+                &self,
+                ctx: &McpContext,
+                request: &JsonRpcRequest,
+            ) -> McpResult<MiddlewareDecision> {
+                if !self.cache_hit {
+                    return Ok(MiddlewareDecision::Continue);
+                }
+                let field = match request.method.as_str() {
+                    "tools/list" => "tools",
+                    "resources/list" => "resources",
+                    "resources/templates/list" => "resourceTemplates",
+                    "prompts/list" => "prompts",
+                    _ => unreachable!("test sends only list methods"),
+                };
+                assert!(ctx.mark_response_cache_hit(1));
+                let mut value = serde_json::json!({
+                    "resultType": "complete", "ttlMs": 10, "cacheScope": "public",
+                });
+                value[field] = serde_json::json!([]);
+                Ok(MiddlewareDecision::Respond(value))
+            }
+
+            fn on_response(
+                &self,
+                ctx: &McpContext,
+                _request: &JsonRpcRequest,
+                mut value: serde_json::Value,
+            ) -> McpResult<serde_json::Value> {
+                assert_eq!(value["cacheScope"], "private");
+                value["_meta"]["com.example/request"] = ctx.request_id().into();
+                match self.change {
+                    Change::Personalize => value["ttlMs"] = 8.into(),
+                    Change::Publish => value["cacheScope"] = "public".into(),
+                    Change::Extend => value["ttlMs"] = 11.into(),
+                }
+                Ok(value)
+            }
+        }
+
+        for change in [None, Some(Change::Personalize), Some(Change::Publish), Some(Change::Extend)] {
+            for cache_hit in [false, true] {
+                if change.is_none() && cache_hit {
+                    continue;
+                }
+                let builder = Server::new("public-catalog", "1.0");
+                let mut server = match change {
+                    None => builder,
+                    Some(change) => builder.middleware(CatalogMiddleware { cache_hit, change }),
+                }.build();
+                Arc::get_mut(&mut server.router).unwrap().set_final_cache_hint_policy(
+                    CacheTtl::milliseconds(10),
+                    CacheTtl::milliseconds(10),
+                    fastmcp_protocol::CacheScope::Public,
+                );
+                let server = Arc::new(server);
+                for method in ["tools/list", "resources/list", "resources/templates/list", "prompts/list"] {
+                    for owned in [false, true] {
+                        let inbound = InboundRequestContext::new(
+                            Cx::for_testing(), 11, InboundRequestTransport::Memory,
+                        );
+                        let request = JsonRpcRequest::new(method, Some(serde_json::json!({
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                            },
+                        })), 11_i64);
+                        let response = if owned {
+                            block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                                ProtocolPolicy::ModernOnly, &inbound, request, None, None, None, None,
+                                McpRequestCancellation::new(), None, Arc::new(|_| {}),
+                            ))
+                        } else {
+                            block_on(server.dispatch_stateless(&inbound, &request))
+                        }.expect("catalog request has a response");
+                        match change {
+                            None => {
+                                let result = response.result.unwrap();
+                                assert_eq!(result["cacheScope"], "public");
+                                assert_eq!(result["ttlMs"], 10);
+                            }
+                            Some(Change::Personalize) => {
+                                let result = response.result.unwrap();
+                                assert_eq!(result["cacheScope"], "private");
+                                assert_eq!(result["ttlMs"], 8);
+                                assert_eq!(result["_meta"]["com.example/request"], 11);
+                            }
+                            Some(Change::Publish | Change::Extend) => {
+                                assert!(response.result.is_none());
+                                assert_eq!(
+                                    response.error.unwrap().code,
+                                    i32::from(McpErrorCode::InternalError).into(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn input_required_resource_middleware_has_no_ttl_authority() {
         let challenge = serde_json::json!({
             "resultType": "input_required", "ttlMs": 100, "cacheScope": "public",
         });
-        assert_eq!(check_resource_read_cache_step(&challenge, None).unwrap(), None);
-        assert!(check_resource_read_cache_step(&challenge, Some(&CacheTtl::milliseconds(1))).is_err());
+        assert_eq!(check_private_cache_step(&challenge, None).unwrap(), None);
+        assert!(check_private_cache_step(&challenge, Some(&CacheTtl::milliseconds(1))).is_err());
         let complete = serde_json::json!({
             "resultType": "complete", "ttlMs": 0, "cacheScope": "private",
         });
-        assert!(check_resource_read_cache_step(&complete, None).is_err());
+        assert!(check_private_cache_step(&complete, None).is_err());
     }
 
     #[cfg(feature = "tasks")]
