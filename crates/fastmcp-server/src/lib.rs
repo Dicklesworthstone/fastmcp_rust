@@ -612,7 +612,7 @@ use fastmcp_protocol::tasks_extension::{
     TaskStatusNotification as FinalTaskStatusNotification, set_task_subscription_ids,
 };
 use fastmcp_protocol::{
-    CallToolParams, CancellationSender, CancellationWireMessage, CancelledParams,
+    CacheTtl, CallToolParams, CancellationSender, CancellationWireMessage, CancelledParams,
     ClientCapabilities, ClientExtensionDiscovery, ClientNotification, CoreRequest, CoreResult,
     CorrelationKey, DiscoveryCacheHints, ExtensionDescriptor, ExtensionId, ExtensionRegistryError,
     ExtensionRegistryReceipt, ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY,
@@ -2240,6 +2240,32 @@ fn middleware_may_complete_final_core_from_cache(
                     .is_some_and(|state| !state.is_empty())
         }
         _ => false,
+    }
+}
+
+// Each response callback sees the previous callback's output, including
+// middleware that may store it. Enforce the ceiling at each handoff.
+fn check_resource_read_cache_step(
+    value: &serde_json::Value,
+    ceiling: Option<&CacheTtl>,
+) -> McpResult<Option<CacheTtl>> {
+    let invalid = || McpError::internal_error("middleware violated resource-read cache policy");
+    match (ceiling, value.get("resultType").and_then(serde_json::Value::as_str)) {
+        (None, Some("input_required")) => Ok(None),
+        (Some(ceiling), Some("complete"))
+            if value.get("cacheScope").and_then(serde_json::Value::as_str) == Some("private") =>
+        {
+            let number = value
+                .get("ttlMs")
+                .and_then(serde_json::Value::as_number)
+                .ok_or_else(invalid)?;
+            let ttl = serde_json::from_str::<CacheTtl>(number.as_str()).map_err(|_| invalid())?;
+            if ttl.capped_by(ceiling) != &ttl {
+                return Err(invalid());
+            }
+            Ok(Some(ttl))
+        }
+        _ => Err(invalid()),
     }
 }
 
@@ -18575,6 +18601,7 @@ impl Server {
                     &notification,
                     serde_json::Value::Null,
                     true,
+                    None,
                 )
                 .map(|_| ()),
             Err(error) => {
@@ -19519,11 +19546,13 @@ impl Server {
                 };
                 metadata_seal
                     .and_then(|metadata_seal| {
-                        self.apply_middleware_response(
+                        self.apply_middleware_response_with_liveness(
                             &entered_middleware,
                             &request_ctx,
                             &request,
                             value,
+                            true,
+                            final_core_request.as_ref(),
                         )
                         .and_then(|value| {
                             validate_final_core_middleware_response(
@@ -20017,6 +20046,7 @@ impl Server {
                             &request,
                             value,
                             !raw_graceful_completion,
+                            final_core_request.as_ref(),
                         )
                         .and_then(|value| {
                             validate_final_core_middleware_response(
@@ -26153,7 +26183,7 @@ impl Server {
         request: &JsonRpcRequest,
         value: serde_json::Value,
     ) -> Result<serde_json::Value, McpError> {
-        self.apply_middleware_response_with_liveness(stack, ctx, request, value, true)
+        self.apply_middleware_response_with_liveness(stack, ctx, request, value, true, None)
     }
 
     fn apply_middleware_response_with_liveness(
@@ -26163,15 +26193,31 @@ impl Server {
         request: &JsonRpcRequest,
         value: serde_json::Value,
         enforce_liveness: bool,
+        core_request: Option<&CoreRequest>,
     ) -> Result<serde_json::Value, McpError> {
         if enforce_liveness && let Some(error) = Self::request_context_error(ctx) {
             return Err(error);
         }
+        let protect_read = !stack.is_empty()
+            && matches!(core_request, Some(CoreRequest::Final(FinalCoreRequest::ResourcesRead(_))));
+        let mut read_ttl = if protect_read {
+            // Also check a response supplied by cache middleware before the
+            // first response callback can observe or store it.
+            let ceiling = (value.get("resultType").and_then(serde_json::Value::as_str)
+                != Some("input_required"))
+                .then(|| self.router.final_cache_hint_policy().1);
+            check_resource_read_cache_step(&value, ceiling)?
+        } else {
+            None
+        };
         let mut response = value;
         for m in stack.iter().rev() {
             let invocation = catch_extension_unwind(|| m.on_response(ctx, request, response));
             match invocation {
                 Ok(Ok(next)) => {
+                    if protect_read {
+                        read_ttl = check_resource_read_cache_step(&next, read_ttl.as_ref())?;
+                    }
                     response = next;
                     if enforce_liveness && let Some(error) = Self::request_context_error(ctx) {
                         return Err(error);
@@ -34272,6 +34318,125 @@ mod lib_unit_tests {
             Some(i32::from(McpErrorCode::InternalError).into())
         );
         assert!(response.result.is_none());
+    }
+
+    #[test]
+    fn resource_read_cache_ceiling_survives_hits_and_each_response_callback() {
+        struct CachedRead(&'static str, u64);
+        impl Middleware for CachedRead {
+            fn on_request(
+                &self,
+                ctx: &McpContext,
+                _request: &JsonRpcRequest,
+            ) -> McpResult<MiddlewareDecision> {
+                assert!(ctx.mark_response_cache_hit(1));
+                Ok(MiddlewareDecision::Respond(serde_json::json!({
+                    "resultType": "complete", "contents": [],
+                    "cacheScope": self.0, "ttlMs": self.1,
+                })))
+            }
+
+            fn on_response(
+                &self,
+                _ctx: &McpContext,
+                _request: &JsonRpcRequest,
+                mut value: serde_json::Value,
+            ) -> McpResult<serde_json::Value> {
+                // A later callback must respect this shorter lifetime.
+                value["ttlMs"] = 9.into();
+                Ok(value)
+            }
+        }
+
+        struct Rewrite(&'static str, u64);
+        impl Middleware for Rewrite {
+            fn on_response(
+                &self,
+                _ctx: &McpContext,
+                _request: &JsonRpcRequest,
+                mut value: serde_json::Value,
+            ) -> McpResult<serde_json::Value> {
+                value["cacheScope"] = self.0.into();
+                value["ttlMs"] = self.1.into();
+                Ok(value)
+            }
+        }
+
+        struct Observe(Arc<AtomicUsize>);
+        impl Middleware for Observe {
+            fn on_response(
+                &self,
+                _ctx: &McpContext,
+                _request: &JsonRpcRequest,
+                value: serde_json::Value,
+            ) -> McpResult<serde_json::Value> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(value)
+            }
+        }
+
+        for owned in [false, true] {
+            for (cached_scope, cached_ttl, new_scope, new_ttl, allowed) in [
+                ("private", 100, "private", 8, true),
+                ("private", 100, "private", 9, true),
+                ("private", 100, "private", 10, false),
+                ("private", 100, "public", 8, false),
+                ("public", 100, "private", 8, false),
+                ("private", crate::handler::DEFAULT_FINAL_RESOURCE_TTL_MS + 1, "private", 8, false),
+            ] {
+                let observed = Arc::new(AtomicUsize::new(0));
+                let server = Arc::new(
+                    Server::new("private-resource-middleware", "1.0")
+                        .middleware(Observe(Arc::clone(&observed)))
+                        .middleware(Rewrite(new_scope, new_ttl))
+                        .middleware(CachedRead(cached_scope, cached_ttl))
+                        .build(),
+                );
+                let inbound = InboundRequestContext::new(
+                    Cx::for_testing(), 1, InboundRequestTransport::Memory,
+                );
+                let request = JsonRpcRequest::new("resources/read", Some(serde_json::json!({
+                    "uri": "file:///report",
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                })), 1_i64);
+                let response = if owned {
+                    block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                        ProtocolPolicy::ModernOnly, &inbound, request, None, None, None, None,
+                        McpRequestCancellation::new(), None, Arc::new(|_| {}),
+                    ))
+                } else {
+                    block_on(server.dispatch_stateless(&inbound, &request))
+                }.expect("the read has a response");
+                assert_eq!(observed.load(Ordering::SeqCst), usize::from(allowed));
+                if allowed {
+                    let value = response.result.unwrap();
+                    assert_eq!(value["ttlMs"], new_ttl);
+                    assert_eq!(value["cacheScope"], "private");
+                } else {
+                    assert!(response.result.is_none());
+                    assert_eq!(
+                        response.error.unwrap().code,
+                        i32::from(McpErrorCode::InternalError).into(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn input_required_resource_middleware_has_no_ttl_authority() {
+        let challenge = serde_json::json!({
+            "resultType": "input_required", "ttlMs": 100, "cacheScope": "public",
+        });
+        assert_eq!(check_resource_read_cache_step(&challenge, None).unwrap(), None);
+        assert!(check_resource_read_cache_step(&challenge, Some(&CacheTtl::milliseconds(1))).is_err());
+        let complete = serde_json::json!({
+            "resultType": "complete", "ttlMs": 0, "cacheScope": "private",
+        });
+        assert!(check_resource_read_cache_step(&complete, None).is_err());
     }
 
     #[cfg(feature = "tasks")]
