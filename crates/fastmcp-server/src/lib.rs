@@ -670,7 +670,7 @@ const MAX_DISPATCH_QUEUE_DEPTH: usize = 64;
 const RETURNING_PUMP_WATCHDOG_NANOS: u64 = 30_000_000_000;
 const MAX_DISPATCH_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const DISPATCH_QUEUE_CAPACITY_MESSAGE: &str = "Server request queue capacity exhausted";
-const DISCOVERY_CACHE_MAX_AGE_SECONDS: u32 = 60;
+const DISCOVERY_CACHE_TTL_MS: u64 = 60_000;
 const MODERN_ONLY_INITIALIZE_MESSAGE: &str = "Initialization-based MCP is not enabled";
 /// Typed refusal for a modern (discovery-era) request on a `LegacyOnly`
 /// endpoint. Plan §1.7: a `LegacyOnly` endpoint exposes no modern method, so
@@ -2246,11 +2246,18 @@ fn middleware_may_complete_final_core_from_cache(
 // Each response callback sees the previous callback's output, including
 // middleware that may store it. Enforce the ceiling at each handoff.
 fn check_private_cache_step(
+    method: &str,
     value: &serde_json::Value,
     ceiling: Option<&CacheTtl>,
 ) -> McpResult<Option<CacheTtl>> {
     let invalid = || McpError::internal_error("middleware violated private response cache policy");
-    match (ceiling, value.get("resultType").and_then(serde_json::Value::as_str)) {
+    // Discovery accepts an omitted discriminator as complete. A present
+    // non-string remains invalid, just as it is in the discovery wire parser.
+    let kind = match value.get("resultType") {
+        None if method == SERVER_DISCOVER_METHOD => Some("complete"),
+        other => other.and_then(serde_json::Value::as_str),
+    };
+    match (ceiling, kind) {
         (None, Some("input_required")) => Ok(None),
         (Some(ceiling), Some("complete"))
             if value.get("cacheScope").and_then(serde_json::Value::as_str) == Some("private") =>
@@ -18222,7 +18229,7 @@ impl Server {
             capabilities,
             self.info.clone(),
             instructions,
-            DiscoveryCacheHints::private_ttl_ms(u64::from(DISCOVERY_CACHE_MAX_AGE_SECONDS) * 1_000),
+            DiscoveryCacheHints::private_ttl_ms(DISCOVERY_CACHE_TTL_MS),
         );
         let Some(mut implementation) = fastmcp_protocol::common_types::Implementation::try_new(
             self.info.name.clone(),
@@ -26202,7 +26209,15 @@ impl Server {
             return Ok(value);
         }
         let mut response = value;
+        let discovery_ceiling;
         let (protect_cache, ceiling) = match core_request {
+            Some(core) if core.method() == SERVER_DISCOVER_METHOD => {
+                // Public discovery scope can originate on the peer wire. The
+                // local discovery authority issues private hints only, even
+                // when middleware serves a cached response on its behalf.
+                discovery_ceiling = CacheTtl::milliseconds(DISCOVERY_CACHE_TTL_MS);
+                (true, Some(&discovery_ceiling))
+            }
             Some(CoreRequest::Final(FinalCoreRequest::ResourcesRead(_))) => {
                 let ceiling = (response.get("resultType").and_then(serde_json::Value::as_str)
                     != Some("input_required"))
@@ -26230,7 +26245,7 @@ impl Server {
         };
         let mut ttl = if protect_cache {
             // Cache hits take this path as well as freshly dispatched results.
-            check_private_cache_step(&response, ceiling)?
+            check_private_cache_step(&request.method, &response, ceiling)?
         } else {
             None
         };
@@ -26239,7 +26254,7 @@ impl Server {
             match invocation {
                 Ok(Ok(next)) => {
                     if protect_cache {
-                        ttl = check_private_cache_step(&next, ttl.as_ref())?;
+                        ttl = check_private_cache_step(&request.method, &next, ttl.as_ref())?;
                     }
                     response = next;
                     if enforce_liveness && let Some(error) = Self::request_context_error(ctx) {
@@ -34344,19 +34359,26 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn resource_read_cache_ceiling_survives_hits_and_each_response_callback() {
-        struct CachedRead(&'static str, u64);
-        impl Middleware for CachedRead {
+    fn private_read_and_discovery_cache_ceilings_survive_hits_and_each_response_callback() {
+        struct CachedResponse(&'static str, u64);
+        impl Middleware for CachedResponse {
             fn on_request(
                 &self,
                 ctx: &McpContext,
-                _request: &JsonRpcRequest,
+                request: &JsonRpcRequest,
             ) -> McpResult<MiddlewareDecision> {
                 assert!(ctx.mark_response_cache_hit(1));
-                Ok(MiddlewareDecision::Respond(serde_json::json!({
-                    "resultType": "complete", "contents": [],
-                    "cacheScope": self.0, "ttlMs": self.1,
-                })))
+                let mut response = if request.method == SERVER_DISCOVER_METHOD {
+                    serde_json::json!({
+                        "supportedVersions": [MODERN_PROTOCOL_VERSION], "capabilities": {},
+                    })
+                } else {
+                    serde_json::json!({"contents": []})
+                };
+                response["resultType"] = "complete".into();
+                response["cacheScope"] = self.0.into();
+                response["ttlMs"] = self.1.into();
+                Ok(MiddlewareDecision::Respond(response))
             }
 
             fn on_response(
@@ -34398,52 +34420,60 @@ mod lib_unit_tests {
             }
         }
 
-        for owned in [false, true] {
-            for (cached_scope, cached_ttl, new_scope, new_ttl, allowed) in [
-                ("private", 100, "private", 8, true),
-                ("private", 100, "private", 9, true),
-                ("private", 100, "private", 10, false),
-                ("private", 100, "public", 8, false),
-                ("public", 100, "private", 8, false),
-                ("private", crate::handler::DEFAULT_FINAL_RESOURCE_TTL_MS + 1, "private", 8, false),
-            ] {
-                let observed = Arc::new(AtomicUsize::new(0));
-                let server = Arc::new(
-                    Server::new("private-resource-middleware", "1.0")
-                        .middleware(Observe(Arc::clone(&observed)))
-                        .middleware(Rewrite(new_scope, new_ttl))
-                        .middleware(CachedRead(cached_scope, cached_ttl))
-                        .build(),
-                );
-                let inbound = InboundRequestContext::new(
-                    Cx::for_testing(), 1, InboundRequestTransport::Memory,
-                );
-                let request = JsonRpcRequest::new("resources/read", Some(serde_json::json!({
-                    "uri": "file:///report",
-                    "_meta": {
-                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                    },
-                })), 1_i64);
-                let response = if owned {
-                    block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
-                        ProtocolPolicy::ModernOnly, &inbound, request, None, None, None, None,
-                        McpRequestCancellation::new(), None, Arc::new(|_| {}),
-                    ))
-                } else {
-                    block_on(server.dispatch_stateless(&inbound, &request))
-                }.expect("the read has a response");
-                assert_eq!(observed.load(Ordering::SeqCst), usize::from(allowed));
-                if allowed {
-                    let value = response.result.unwrap();
-                    assert_eq!(value["ttlMs"], new_ttl);
-                    assert_eq!(value["cacheScope"], "private");
-                } else {
-                    assert!(response.result.is_none());
-                    assert_eq!(
-                        response.error.unwrap().code,
-                        i32::from(McpErrorCode::InternalError).into(),
+        for (method, ceiling) in [
+            ("resources/read", crate::handler::DEFAULT_FINAL_RESOURCE_TTL_MS),
+            (SERVER_DISCOVER_METHOD, DISCOVERY_CACHE_TTL_MS),
+        ] {
+            for owned in [false, true] {
+                for (cached_scope, cached_ttl, new_scope, new_ttl, allowed) in [
+                    ("private", 100, "private", 8, true),
+                    ("private", 100, "private", 9, true),
+                    ("private", 100, "private", 10, false),
+                    ("private", 100, "public", 8, false),
+                    ("public", 100, "private", 8, false),
+                    ("private", ceiling + 1, "private", 8, false),
+                ] {
+                    let observed = Arc::new(AtomicUsize::new(0));
+                    let server = Arc::new(
+                        Server::new("private-resource-middleware", "1.0")
+                            .middleware(Observe(Arc::clone(&observed)))
+                            .middleware(Rewrite(new_scope, new_ttl))
+                            .middleware(CachedResponse(cached_scope, cached_ttl))
+                            .build(),
                     );
+                    let inbound = InboundRequestContext::new(
+                        Cx::for_testing(), 1, InboundRequestTransport::Memory,
+                    );
+                    let mut params = serde_json::json!({
+                        "_meta": {
+                            MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                            FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                        },
+                    });
+                    if method == "resources/read" {
+                        params["uri"] = "file:///report".into();
+                    }
+                    let request = JsonRpcRequest::new(method, Some(params), 1_i64);
+                    let response = if owned {
+                        block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                            ProtocolPolicy::ModernOnly, &inbound, request, None, None, None, None,
+                            McpRequestCancellation::new(), None, Arc::new(|_| {}),
+                        ))
+                    } else {
+                        block_on(server.dispatch_stateless(&inbound, &request))
+                    }.expect("the request has a response");
+                    assert_eq!(observed.load(Ordering::SeqCst), usize::from(allowed));
+                    if allowed {
+                        let value = response.result.unwrap();
+                        assert_eq!(value["ttlMs"], new_ttl);
+                        assert_eq!(value["cacheScope"], "private");
+                    } else {
+                        assert!(response.result.is_none());
+                        assert_eq!(
+                            response.error.unwrap().code,
+                            i32::from(McpErrorCode::InternalError).into(),
+                        );
+                    }
                 }
             }
         }
@@ -34565,16 +34595,28 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn discovery_response_cache_accepts_only_a_missing_or_complete_discriminator() {
+        let ceiling = CacheTtl::milliseconds(DISCOVERY_CACHE_TTL_MS);
+        let mut value = serde_json::json!({"ttlMs": 5, "cacheScope": "private"});
+        assert!(check_private_cache_step(SERVER_DISCOVER_METHOD, &value, Some(&ceiling)).is_ok());
+        assert!(check_private_cache_step("resources/read", &value, Some(&ceiling)).is_err());
+        for invalid in [serde_json::Value::Null, serde_json::json!(false), serde_json::json!("task")] {
+            value["resultType"] = invalid;
+            assert!(check_private_cache_step(SERVER_DISCOVER_METHOD, &value, Some(&ceiling)).is_err());
+        }
+    }
+
+    #[test]
     fn input_required_resource_middleware_has_no_ttl_authority() {
         let challenge = serde_json::json!({
             "resultType": "input_required", "ttlMs": 100, "cacheScope": "public",
         });
-        assert_eq!(check_private_cache_step(&challenge, None).unwrap(), None);
-        assert!(check_private_cache_step(&challenge, Some(&CacheTtl::milliseconds(1))).is_err());
+        assert_eq!(check_private_cache_step("resources/read", &challenge, None).unwrap(), None);
+        assert!(check_private_cache_step("resources/read", &challenge, Some(&CacheTtl::milliseconds(1))).is_err());
         let complete = serde_json::json!({
             "resultType": "complete", "ttlMs": 0, "cacheScope": "private",
         });
-        assert!(check_private_cache_step(&complete, None).is_err());
+        assert!(check_private_cache_step("resources/read", &complete, None).is_err());
     }
 
     #[cfg(feature = "tasks")]
