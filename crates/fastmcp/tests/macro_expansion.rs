@@ -6120,6 +6120,7 @@ mod internally_tagged_newtypes {
         #[serde(rename = "resume-job")]
         Resume(Box<CommandFields>),
         Counters(BTreeMap<String, u8>),
+        Labels(BTreeMap<String, String>),
         Finished,
     }
 
@@ -6351,6 +6352,35 @@ mod internally_tagged_newtypes {
         ctx.checkpoint()?;
         COMMAND_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(value)
+    }
+
+    #[tool(output_schema = Command, error_mapper = command_error)]
+    async fn command_labels(ctx: &McpContext, collide: bool) -> McpResult<Command> {
+        ctx.checkpoint()?;
+        let name = if collide { "kind" } else { "label" };
+        Ok(Command::Labels(BTreeMap::from([(name.to_owned(), "finished".to_owned())])))
+    }
+
+    #[test]
+    fn tagged_tool_output_refuses_a_map_member_that_would_change_its_variant() {
+        on_caller_runtime(async {
+            let server = Server::new("tagged-map-output", "1.0")
+                .tool(CommandLabels)
+                .try_build()
+                .unwrap();
+            let connection = ModernConnection::new();
+            let valid = schema_bound_complete(
+                schema_bound_wire_call(&server, &connection, "command_labels", json!({"collide": false}))
+                    .await,
+            );
+            assert_schema_bound_success(&valid, &json!({"kind":"labels", "label":"finished"}));
+            let refused = schema_bound_wire_call(
+                &server, &connection, "command_labels", json!({"collide": true}),
+            )
+            .await;
+            assert!(refused.result.is_none(), "a different valid variant must never be published");
+            assert_eq!(refused.error.unwrap().code.as_i32(), Some(-32603));
+        });
     }
 
     #[test]

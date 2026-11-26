@@ -79,6 +79,27 @@ pub const MAX_SCHEMA_INSTANCE_DEPTH: usize = 64;
 /// member names, and container punctuation. Matches the LIMIT-01 default.
 pub const MAX_SCHEMA_INSTANCE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Encodes schema-bound tool output once and checks its member names before
+/// any conversion into a JSON map. Legacy tools use the admitted text directly.
+#[doc(hidden)]
+pub fn encode_tool_output<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<String> {
+    let bytes = crate::jsonrpc::encode_admitted_json(value, MAX_SCHEMA_INSTANCE_BYTES)
+        .map_err(<serde_json::Error as serde::ser::Error>::custom)?;
+    String::from_utf8(bytes).map_err(<serde_json::Error as serde::ser::Error>::custom)
+}
+
+/// Converts admitted tool output using the final result codec. Its exact
+/// object representation preserves ordinary keys even when they resemble
+/// serde_json's private arbitrary-precision number marker.
+#[doc(hidden)]
+pub fn serialize_tool_output<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<Value> {
+    let text = encode_tool_output(value)?;
+    let exact = crate::result::parse_exact_json(&text)
+        .map_err(<serde_json::Error as serde::ser::Error>::custom)?;
+    crate::result::exact_json_to_serde(&exact)
+        .map_err(<serde_json::Error as serde::ser::Error>::custom)
+}
+
 /// Maximum UTF-8 bytes in one instance string. The complete instance must also
 /// fit [`MAX_SCHEMA_INSTANCE_BYTES`] after JSON encoding.
 pub const MAX_SCHEMA_INSTANCE_STRING_BYTES: usize = MAX_SCHEMA_INSTANCE_BYTES;
@@ -6372,6 +6393,22 @@ fn validate_exact_number(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn structured_output_preserves_literal_members_and_refuses_nested_duplicates() {
+        let literal = BTreeMap::from([("$serde_json::private::Number", "123")]);
+        let structured = serialize_tool_output(&literal).unwrap();
+        assert_eq!(structured.as_object().unwrap()["$serde_json::private::Number"], "123");
+
+        let duplicate = serde_json::value::RawValue::from_string(
+            r#"{"entries":[{"kind":"first","kind":"second"}]}"#.to_owned(),
+        ).unwrap();
+        assert!(encode_tool_output(&duplicate).is_err());
+        assert!(serialize_tool_output(&duplicate).is_err());
+        for value in [json!(null), json!(true), json!(42), json!([{}, "text"])] {
+            assert_eq!(serialize_tool_output(&value).unwrap(), value);
+        }
+    }
 
     struct GeneratedText;
 

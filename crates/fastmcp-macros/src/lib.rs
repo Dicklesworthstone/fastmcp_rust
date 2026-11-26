@@ -941,6 +941,11 @@ fn generate_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
 /// surface. Final results retain the JSON value's exact root shape, including
 /// an explicit null, and mirror the same value in their text content.
 fn generate_schema_bound_content(value: TokenStream2, final_result: bool) -> TokenStream2 {
+    let encode = if final_result {
+        quote! { fastmcp_protocol::schema::serialize_tool_output }
+    } else {
+        quote! { fastmcp_protocol::schema::encode_tool_output }
+    };
     let content = if final_result {
         quote! {
             Ok(fastmcp_protocol::CompleteResult::new(
@@ -955,12 +960,12 @@ fn generate_schema_bound_content(value: TokenStream2, final_result: bool) -> Tok
     } else {
         quote! {
             Ok(vec![fastmcp_protocol::Content::Text {
-                text: result_value.to_string(),
+                text: result_value,
             }])
         }
     };
     quote! {
-        let result_value = serde_json::to_value(&(#value)).map_err(|error| {
+        let result_value = #encode(&(#value)).map_err(|error| {
             fastmcp_core::McpError::internal_error(format!(
                 "failed to serialize schema-bound tool result: {error}",
             ))
@@ -5071,7 +5076,7 @@ mod schema_bound_tool_expansion_tests {
         ));
         let conversion = generate_tool_result_conversion(&return_type, true).to_string();
         assert!(
-            conversion.contains("serde_json :: to_value"),
+            conversion.contains("schema :: encode_tool_output"),
             "{conversion}"
         );
         assert!(conversion.contains("result ?"), "{conversion}");

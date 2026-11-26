@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::io::{self, Write};
 
 use serde::de::Error as _;
 use serde::ser::{Error as _, SerializeMap};
@@ -180,6 +181,48 @@ impl std::fmt::Display for JsonRpcAdmissionError {
 }
 
 impl std::error::Error for JsonRpcAdmissionError {}
+
+/// Serializes one bounded wire value and checks the bytes before conversion
+/// to a map could erase duplicate member names. The application serializer
+/// is called once, including for custom Serialize implementations.
+pub(crate) fn encode_admitted_json<T: Serialize + ?Sized>(
+    value: &T,
+    max: usize,
+) -> Result<Vec<u8>, RawJsonAdmissionError> {
+    struct Buffer {
+        bytes: Vec<u8>,
+        max: usize,
+        exceeded: bool,
+    }
+    impl Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.max.saturating_sub(self.bytes.len()) {
+                self.exceeded = true;
+                return Err(io::Error::other("JSON encoding exceeds the configured byte limit"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = Buffer {
+        bytes: Vec::new(),
+        max,
+        exceeded: false,
+    };
+    if serde_json::to_writer(&mut buffer, value).is_err() {
+        return Err(if buffer.exceeded {
+            RawJsonAdmissionError::DocumentTooLarge
+        } else {
+            RawJsonAdmissionError::InvalidSyntax
+        });
+    }
+    admit_raw_json_document(&buffer.bytes, max, RawJsonTopLevel::AnyValue)
+        .map_err(RawJsonAdmissionError::from)?;
+    Ok(buffer.bytes)
+}
 
 /// Admit one complete raw JSON-RPC document before any typed decoding.
 ///

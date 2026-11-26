@@ -8,7 +8,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::io::{self, Write};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -16,8 +15,8 @@ use serde_json::Value;
 use crate::common_types::SamplingContentBlock;
 use crate::{
     AdmittedSchema, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams,
-    FinalSamplingMessage, FinalSamplingMessageContent, FinalToolChoiceMode, RawJsonTopLevel, Role,
-    admit_final_schema, admit_raw_json_document,
+    FinalSamplingMessage, FinalSamplingMessageContent, FinalToolChoiceMode, Role,
+    admit_final_schema,
 };
 
 /// Immutable local work limits. These restrict orchestration, not model billing
@@ -458,38 +457,12 @@ fn admit_results(
 
 // Never serialize an unbounded intermediate String just to measure its size.
 fn bounded_wire(value: &impl Serialize, max: usize) -> Result<(), SamplingToolLoopError> {
-    struct Buffer {
-        bytes: Vec<u8>,
-        max: usize,
-        exceeded: bool,
-    }
-    impl Write for Buffer {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if bytes.len() > self.max.saturating_sub(self.bytes.len()) {
-                self.exceeded = true;
-                return Err(io::Error::other("sampling byte limit"));
-            }
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut buffer = Buffer {
-        bytes: Vec::new(),
-        max,
-        exceeded: false,
-    };
-    if serde_json::to_writer(&mut buffer, value).is_err() {
-        return Err(if buffer.exceeded {
-            SamplingToolLoopError::ByteLimit
-        } else {
-            SamplingToolLoopError::InvalidRequest
-        });
-    }
-    admit_raw_json_document(&buffer.bytes, max, RawJsonTopLevel::AnyValue)
-        .map_err(|_| SamplingToolLoopError::InvalidRequest)
+    crate::jsonrpc::encode_admitted_json(value, max)
+        .map(|_| ())
+        .map_err(|error| match error {
+            crate::RawJsonAdmissionError::DocumentTooLarge => SamplingToolLoopError::ByteLimit,
+            _ => SamplingToolLoopError::InvalidRequest,
+        })
 }
 
 #[cfg(test)]
