@@ -871,16 +871,25 @@ mod memory {
 }
 
 struct Reply {
-    task: Value,
+    task: Option<Value>,
     minimum_delay: Duration,
     hold: Duration,
     cancel: Option<McpRequestCancellation>,
 }
 
 impl Reply {
+    fn disconnect(minimum_ms: u64) -> Self {
+        Self {
+            task: None,
+            minimum_delay: Duration::from_millis(minimum_ms),
+            hold: Duration::ZERO,
+            cancel: None,
+        }
+    }
+
     fn new(task: Value, minimum_ms: u64) -> Self {
         Self {
-            task,
+            task: Some(task),
             minimum_delay: Duration::from_millis(minimum_ms),
             hold: Duration::ZERO,
             cancel: None,
@@ -1066,9 +1075,11 @@ fn peer(initial: Value, replies: Vec<Reply>) -> (String, JoinHandle<Vec<Duration
             if !reply.hold.is_zero() {
                 std::thread::sleep(reply.hold);
             }
-            let result = write(&mut poll, &response(3 + index as u64, reply.task));
-            if reply.hold.is_zero() {
-                result.unwrap();
+            if let Some(task) = reply.task {
+                let result = write(&mut poll, &response(3 + index as u64, task));
+                if reply.hold.is_zero() {
+                    result.unwrap();
+                }
             }
             sent = Instant::now();
         }
@@ -1119,6 +1130,20 @@ fn run(
     cancel_after: Option<Duration>,
     expected: Result<FinalTaskWaitOutcome, ()>,
 ) -> (FinalTask, Vec<Duration>) {
+    run_http_wait(
+        initial, replies, policy, cancellation, cancel_after, None, expected,
+    )
+}
+
+fn run_http_wait(
+    initial: Value,
+    replies: Vec<Reply>,
+    policy: FinalTaskWaitPolicy,
+    cancellation: McpRequestCancellation,
+    cancel_after: Option<Duration>,
+    maximum_retries: Option<u8>,
+    expected: Result<FinalTaskWaitOutcome, ()>,
+) -> (FinalTask, Vec<Duration>) {
     let before = serde_json::to_vec(&snapshot(&initial)).unwrap();
     let (target, peer) = peer(initial, replies);
     let retained = RuntimeBuilder::current_thread()
@@ -1152,7 +1177,12 @@ fn run(
                     cancellation.cancel();
                 })
             });
-            let result = handle.wait(&cx, &mut client, &cancellation, policy).await;
+            let result = match maximum_retries {
+                Some(limit) => handle
+                    .wait_with_http_recovery(&cx, &mut client, &cancellation, policy, limit)
+                    .await,
+                None => handle.wait(&cx, &mut client, &cancellation, policy).await,
+            };
             match expected {
                 Ok(expected) => {
                     assert_eq!(result.unwrap(), expected);
@@ -1202,6 +1232,104 @@ fn policy(timeout_ms: u64, polls: usize, fallback_ms: u64) -> FinalTaskWaitPolic
         Duration::from_millis(fallback_ms),
     )
     .unwrap()
+}
+
+#[test]
+fn public_http_wait_recovers_dropped_reads_with_bounded_backoff() {
+    let (retained, _) = run_http_wait(
+        task("working", Some(120)),
+        vec![
+            Reply::disconnect(120),
+            Reply::disconnect(120),
+            Reply::new(task("completed", None), 200),
+        ],
+        policy(5000, 3, 1),
+        McpRequestCancellation::new(),
+        None,
+        Some(2),
+        Ok(FinalTaskWaitOutcome::Completed),
+    );
+    assert!(matches!(retained, FinalTask::Completed { .. }));
+}
+
+#[test]
+fn public_http_wait_recovery_stops_at_attempt_limits() {
+    // Each scripted peer expects a sibling tools/list immediately after the
+    // last permitted read, including when the original fail-fast API is used.
+    for (polls, retries) in [(10, Some(0)), (1, Some(5)), (10, None)] {
+        run_http_wait(
+            task("working", Some(1)),
+            vec![Reply::disconnect(1)],
+            policy(5000, polls, 1),
+            McpRequestCancellation::new(),
+            None,
+            retries,
+            Err(()),
+        );
+    }
+}
+
+#[test]
+fn cancelling_during_task_recovery_backoff_stops_before_another_read() {
+    use std::cell::Cell;
+
+    struct Disconnected<'a>(&'a Cell<usize>);
+
+    impl TaskWaitTransport for Disconnected<'_> {
+        type Error = McpError;
+
+        async fn read_task(
+            &mut self,
+            _: &Cx,
+            _: &McpRequestCancellation,
+            _: FinalTaskId,
+        ) -> McpResult<FinalTask> {
+            self.0.set(self.0.get() + 1);
+            Err(McpError::internal_error("scripted read failed"))
+        }
+    }
+
+    RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+        let cx = Cx::current().unwrap();
+        let cancellation = McpRequestCancellation::new();
+        let reads = Cell::new(0);
+        let mut transport = Disconnected(&reads);
+        let mut handle = FinalTaskHandle::new(snapshot(&task("working", Some(1))));
+        let outcome = {
+            let mut wait = std::pin::pin!(wait_for_task_with_retries(
+                &mut handle, &cx, &mut transport, &cancellation, policy(5000, 3, 1), 2, |_| true,
+            ));
+            std::future::poll_fn(|task_cx| {
+                let result = wait.as_mut().poll(task_cx);
+                if result.is_pending() && reads.get() == 1 && !cancellation.is_cancel_requested() {
+                    // The failed read returned synchronously; the wait just
+                    // yielded on its recovery timer. Cancel at that boundary.
+                    cancellation.cancel();
+                    task_cx.waker().wake_by_ref();
+                }
+                result
+            }).await.unwrap()
+        };
+        assert_eq!(outcome, FinalTaskWaitOutcome::ObservationCancelled);
+        assert_eq!(reads.get(), 1);
+        assert!(matches!(handle.task(), FinalTask::Working(_)));
+        assert!(cx.checkpoint().is_ok());
+    });
+}
+
+#[test]
+fn public_http_wait_recovery_refuses_invalid_task_replies() {
+    let mut changed = task("completed", None);
+    changed["taskId"] = json!("unrelated-task");
+    run_http_wait(
+        task("working", Some(1)),
+        vec![Reply::new(changed, 1)],
+        policy(5000, 10, 1),
+        McpRequestCancellation::new(),
+        None,
+        Some(3),
+        Err(()),
+    );
 }
 
 #[test]

@@ -517,6 +517,39 @@ impl FinalTaskHandle {
         wait_for_task(self, cx, client, cancellation, policy).await
     }
 
+    /// Waits for an existing Task across transient native HTTP connection failures.
+    ///
+    /// Only a read-only `tasks/get` can be repeated. Each attempt uses a fresh
+    /// request ID and consumes one of the original policy's polls. At most
+    /// `maximum_retries` additional reads are permitted across the entire wait.
+    /// The last transport error is returned when another attempt is unavailable.
+    /// TLS, HTTP status, protocol, credential and capability errors return immediately.
+    ///
+    /// Consecutive failures apply a 100 ms exponential backoff capped at five
+    /// seconds, always respecting a longer server poll interval. A successful
+    /// read restores ordinary pacing. The original caller deadline, cancellation
+    /// and Task retention also apply during recovery.
+    pub async fn wait_with_http_recovery(
+        &mut self,
+        cx: &Cx,
+        client: &mut HttpClient,
+        cancellation: &McpRequestCancellation,
+        policy: FinalTaskWaitPolicy,
+        maximum_retries: u8,
+    ) -> Result<FinalTaskWaitOutcome, HttpClientError> {
+        self.ensure_task_owner(&client.task_owner)?;
+        wait_for_task_with_retries(
+            self,
+            cx,
+            client,
+            cancellation,
+            policy,
+            maximum_retries,
+            transient_http_poll_error,
+        )
+        .await
+    }
+
     /// The same bounded observation over the caller-owned Unix stdio client.
     ///
     /// Reads use the existing yielding stdio request owner. Cancelling,
@@ -2876,6 +2909,56 @@ async fn wait_for_task<T: TaskWaitTransport>(
     cancellation: &McpRequestCancellation,
     policy: FinalTaskWaitPolicy,
 ) -> Result<FinalTaskWaitOutcome, T::Error> {
+    wait_for_task_with_retries(handle, cx, client, cancellation, policy, 0, |_| false).await
+}
+
+fn transient_http_poll_error(error: &HttpClientError) -> bool {
+    use crate::http_executor::{
+        ClientHttpConnectionError, ModernHttpClientError, ModernHttpExecutorError,
+    };
+    use asupersync::http::h1::{ClientError, HttpError};
+    use std::io::ErrorKind;
+
+    let HttpClientError::Connection(ClientHttpConnectionError::Modern(
+        ModernHttpClientError::Executor(
+            ModernHttpExecutorError::Transport(cause)
+            | ModernHttpExecutorError::DispatchUncertain(cause),
+        ),
+    )) = error
+    else {
+        return false;
+    };
+    match cause {
+        ClientError::ConnectError(e)
+        | ClientError::DnsError(e)
+        | ClientError::Io(e)
+        | ClientError::HttpError(HttpError::Io(e)) => matches!(
+            e.kind(),
+            ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionReset
+                | ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::NotConnected
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::TimedOut
+                | ErrorKind::WouldBlock
+                | ErrorKind::NetworkUnreachable
+                | ErrorKind::HostUnreachable
+        ),
+        ClientError::PoolExhausted { .. } => true,
+        _ => false,
+    }
+}
+
+async fn wait_for_task_with_retries<T: TaskWaitTransport>(
+    handle: &mut FinalTaskHandle,
+    cx: &Cx,
+    client: &mut T,
+    cancellation: &McpRequestCancellation,
+    policy: FinalTaskWaitPolicy,
+    mut remaining_retries: u8,
+    retryable: fn(&T::Error) -> bool,
+) -> Result<FinalTaskWaitOutcome, T::Error> {
     // Already delivered terminal data is not remote work to observe. Preserve
     // the existing immediate-return behavior without silently erasing results.
     if let Some(outcome) = ready_outcome(handle.task())
@@ -2896,8 +2979,9 @@ async fn wait_for_task<T: TaskWaitTransport>(
     if cx.timer_driver().is_none() {
         return Ok(FinalTaskWaitOutcome::TimerUnavailable);
     }
-    for _ in 0..policy.maximum_polls {
-        let delay = next_delay(handle.task(), policy)?;
+    let mut backoff = Duration::ZERO;
+    for attempt in 1..=policy.maximum_polls {
+        let delay = next_delay(handle.task(), policy)?.max(backoff);
         // A peer minimum beyond the remaining budget/retention has no legal
         // next poll. Never shorten it to squeeze a read in before expiry.
         if delay >= budget.remaining(cx) {
@@ -2926,9 +3010,18 @@ async fn wait_for_task<T: TaskWaitTransport>(
             )
             .await
         {
-            Ok(result) => result?,
+            Ok(Ok(task)) => task,
+            Ok(Err(error))
+                if remaining_retries > 0 && attempt < policy.maximum_polls && retryable(&error) =>
+            {
+                remaining_retries -= 1;
+                backoff = (backoff * 2).clamp(Duration::from_millis(100), Duration::from_secs(5));
+                continue;
+            }
+            Ok(Err(error)) => return Err(error),
             Err(outcome) => return Ok(outcome),
         };
+        backoff = Duration::ZERO;
         admit_identity(handle.task(), &task)?;
         if let Some(outcome) = budget.stop(cx, cancellation) {
             return Ok(outcome);

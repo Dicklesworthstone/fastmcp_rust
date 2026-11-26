@@ -7901,6 +7901,23 @@ pub mod modern {
             handle.wait(cx, &mut self.inner, cancellation, policy).await
         }
 
+        /// Observes an existing Task across transient native HTTP connection failures.
+        /// Each retry uses one of the original wait policy's polls; cancellation,
+        /// deadline and Task retention remain in force throughout backoff.
+        #[cfg(feature = "tasks")]
+        pub async fn wait_final_task_with_recovery(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            handle: &mut FinalTaskHandle,
+            policy: FinalTaskWaitPolicy,
+            maximum_retries: u8,
+        ) -> Result<FinalTaskWaitOutcome, HttpClientError> {
+            handle
+                .wait_with_http_recovery(cx, &mut self.inner, cancellation, policy, maximum_retries)
+                .await
+        }
+
         /// Drives an existing Task through this client's installed input
         /// callbacks and authoritative reads. Keep the same driver across calls
         /// to retain acknowledged keys and interrupted-input custody.
