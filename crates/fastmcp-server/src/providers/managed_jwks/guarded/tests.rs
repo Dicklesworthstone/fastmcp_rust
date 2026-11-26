@@ -914,7 +914,8 @@ mod enterprise {
                 assert!(authentication.as_mut().poll(&mut task).is_pending());
                 assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
                 assert_eq!(verifier.source.admission.active.lock().unwrap().len(), 1);
-                assert_eq!(timer.pending_count(), 1);
+                // Key-fetch deadline and enterprise metadata expiry.
+                assert_eq!(timer.pending_count(), 2);
                 let wake_count = wakes.0.load(Ordering::SeqCst);
 
                 match change {
@@ -1038,7 +1039,8 @@ mod enterprise {
             assert!(authentication.as_mut().poll(&mut task).is_pending());
             assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
             assert_eq!(verifier.source.admission.active.lock().unwrap().len(), 1);
-            assert_eq!(timer.pending_count(), 1);
+            // Key-fetch deadline and enterprise metadata expiry.
+            assert_eq!(timer.pending_count(), 2);
 
             delayed.release();
             let facts = match authentication.as_mut().poll(&mut task) {
@@ -1057,6 +1059,160 @@ mod enterprise {
                     .unwrap();
             assert_eq!(again.session_owner(), facts.session_owner());
             assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
+        });
+        assert_eq!(timer.pending_count(), 0);
+        drop(caller);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn enterprise_guarded_provider_metadata_expiry_interrupts_suspended_refresh() {
+        let clock = Arc::new(VirtualClock::new());
+        let timer = TimerDriverHandle::with_virtual_clock(clock.clone());
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        let caller = runtime.request_cx_with_budget(Budget::INFINITE);
+        runtime.block_on(async {
+            // A foreign clock is already past every caller deadline. Only the
+            // explicit caller's driver may register or wake these timers.
+            let foreign_clock = Arc::new(VirtualClock::new());
+            foreign_clock.advance(1_000_000_000_000);
+            let foreign_timer = TimerDriverHandle::with_virtual_clock(foreign_clock);
+            let foreign_runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(foreign_timer.clone())
+                .build()
+                .unwrap();
+            let foreign_caller = foreign_runtime.request_cx_with_budget(Budget::INFINITE);
+            let ambient = Cx::set_current(Some(foreign_caller.clone()));
+            let context = McpContext::new(caller.clone(), 1);
+            let sibling = McpContext::new(caller.clone(), 2);
+            let documents = documents();
+            let params = params();
+            // Signing precedes short-lived policy construction; expensive key
+            // setup must not consume the metadata lifetime under test.
+            let authorization = format!("Bearer {}", token("one").token);
+            for idp_expires_first in [true, false] {
+                for fresh in [false, true] {
+                    for reply_ready in [false, true] {
+                        let (mut verifier, _, elapsed) = fixture(vec![]);
+                        let delayed = Arc::new(DelayedExchange {
+                            released: AtomicBool::new(false),
+                            calls: AtomicUsize::new(0),
+                            waker: Mutex::new(None),
+                        });
+                        verifier.source.test_exchange = Some(delayed.clone());
+                        let long = Instant::now() + Duration::from_secs(120);
+                        let short = if fresh {
+                            long
+                        } else {
+                            Instant::now() + Duration::from_secs(1)
+                        };
+                        let (idp_deadline, resource_deadline) = if idp_expires_first {
+                            (short, long)
+                        } else {
+                            (long, short)
+                        };
+                        let policy_owner = EnterpriseResourcePolicy::new(
+                            configuration(1),
+                            &documents[0],
+                            &documents[1],
+                            idp_deadline,
+                            resource_deadline,
+                        )
+                        .unwrap();
+                        let provider = policy_owner.guarded_provider(verifier.clone()).unwrap();
+                        let selected = if fresh { &sibling } else { &context };
+                        let mut authentication =
+                            provider.authenticate_async(selected, request(&params, &authorization));
+                        let wakes = Arc::new(AuthenticationWake::default());
+                        let waker = Waker::from(wakes.clone());
+                        let mut task = Context::from_waker(&waker);
+                        assert!(authentication.as_mut().poll(&mut task).is_pending());
+                        assert_eq!(delayed.calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(verifier.source.admission.active.lock().unwrap().len(), 1);
+                        assert_eq!(timer.pending_count(), 2);
+                        assert_eq!(foreign_timer.pending_count(), 0);
+                        assert_eq!(Cx::current().unwrap().now(), foreign_caller.now());
+
+                        // Polling again must not restart the original expiry.
+                        clock.advance(600_000_000);
+                        assert_eq!(timer.process_timers(), 0);
+                        assert!(authentication.as_mut().poll(&mut task).is_pending());
+                        let wake_count = wakes.0.load(Ordering::SeqCst);
+                        clock.advance(500_000_000);
+                        assert_eq!(timer.process_timers(), usize::from(!fresh));
+                        assert_eq!(wakes.0.load(Ordering::SeqCst) > wake_count, !fresh);
+                        assert!(!delayed.released.load(Ordering::SeqCst));
+                        if reply_ready {
+                            // A response ready on the same turn cannot publish
+                            // keys after this request's metadata has expired.
+                            delayed.release();
+                        }
+                        let outcome = authentication.as_mut().poll(&mut task);
+                        if fresh {
+                            let outcome = if reply_ready {
+                                outcome
+                            } else {
+                                assert!(outcome.is_pending());
+                                delayed.release();
+                                authentication.as_mut().poll(&mut task)
+                            };
+                            let Poll::Ready(Ok(facts)) = outcome else {
+                                panic!("fresh policy must retain successful authentication");
+                            };
+                            assert_eq!(facts.subject.as_deref(), Some("alice"));
+                            assert!(facts.verification_is_current());
+                        } else {
+                            let Poll::Ready(Err(error)) = outcome else {
+                                panic!("metadata expiry must interrupt the pending key fetch");
+                            };
+                            assert_eq!(error.code, McpErrorCode::ResourceForbidden);
+                            let state = verifier.managed.shared.state.read().unwrap();
+                            assert!(state.flight.is_none());
+                            assert!(state.active.is_none());
+                        }
+                        // Capacity and timers are released as authentication
+                        // returns, even before its completed future is dropped.
+                        assert!(verifier.source.admission.active.lock().unwrap().is_empty());
+                        assert_eq!(timer.pending_count(), 0);
+                        assert_eq!(foreign_timer.pending_count(), 0);
+                        drop(authentication);
+                        assert!(context.checkpoint().is_ok());
+                        assert!(sibling.checkpoint().is_ok());
+                        assert!(caller.checkpoint().is_ok());
+                        assert!(foreign_caller.checkpoint().is_ok());
+                        assert_eq!(Cx::current().unwrap().now(), foreign_caller.now());
+
+                        if !fresh {
+                            // The same caller and fetch capacity remain usable
+                            // by a current policy after the unchanged backoff.
+                            delayed.release();
+                            elapsed.store(3, Ordering::SeqCst);
+                            let fresh_owner = owner();
+                            let fresh_provider =
+                                fresh_owner.guarded_provider(verifier.clone()).unwrap();
+                            let facts = ready(fresh_provider.authenticate_async(
+                                &sibling,
+                                request(&params, &authorization),
+                            ))
+                            .unwrap();
+                            assert_eq!(facts.subject.as_deref(), Some("alice"));
+                            assert!(facts.verification_is_current());
+                            assert_eq!(delayed.calls.load(Ordering::SeqCst), 2);
+                            assert!(verifier.source.admission.active.lock().unwrap().is_empty());
+                            assert_eq!(timer.pending_count(), 0);
+                            assert_eq!(foreign_timer.pending_count(), 0);
+                        }
+                    }
+                }
+            }
+            drop(ambient);
+            drop(foreign_caller);
+            assert!(foreign_runtime.shutdown_timeout(Duration::from_secs(1)));
         });
         assert_eq!(timer.pending_count(), 0);
         drop(caller);

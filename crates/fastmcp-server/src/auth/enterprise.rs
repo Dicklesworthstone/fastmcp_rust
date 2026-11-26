@@ -21,6 +21,7 @@ use std::sync::{Arc, RwLock, Weak};
 use std::task::Poll;
 use std::time::Instant;
 
+use asupersync::time::Sleep;
 use fastmcp_core::runtime::{ProcessBoundToken, ProcessGenerationGuard};
 use fastmcp_core::{
     AuthContext, CanonicalHttpUrl, CanonicalResourceId, McpContext, McpError, McpErrorCode,
@@ -488,14 +489,33 @@ impl AuthProvider for EnterpriseAuthProvider {
         Box::pin(async move {
             let snapshot = self.snapshot()?;
             admit_request(request)?;
+            // Preserve the admitted metadata deadline across every suspension.
+            // Sample the caller clock first so conversion cannot extend it.
+            let now = ctx.cx().now();
+            let remaining = snapshot
+                .metadata_valid_until
+                .checked_duration_since(Instant::now())
+                .ok_or_else(denied)?;
+            let nanos = u64::try_from(remaining.as_nanos()).unwrap_or(u64::MAX);
+            let mut expiry = std::pin::pin!(Sleep::new(now.saturating_add_nanos(nanos)));
             let mut retired = std::pin::pin!(snapshot.cancellation.cancelled());
             let mut authentication = self.verifier.authenticate_async(ctx, request);
             let auth = poll_fn(|task| {
+                let ceiling = crate::auth::ambient_auth_capability_ceiling();
+                let _current = asupersync::Cx::set_current(Some(ctx.cx().clone()));
+                let _restriction = asupersync::Cx::push_restriction(ceiling);
+                let current = asupersync::Cx::current().expect("caller context installed");
                 snapshot.check().map_err(|_| denied())?;
                 // Register the policy wakeup before polling the verifier. A
                 // suspended key fetch must not delay revocation until its own
                 // socket, timeout or caller-cancellation wakeup arrives.
                 if retired.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(Err(denied()));
+                }
+                // Expiry must wake this attempt even when its key endpoint is
+                // silent. Never fall back to an ambient or global timer.
+                let can_wait = current.capabilities().time && current.timer_driver().is_some();
+                if can_wait && expiry.as_mut().poll(task).is_ready() {
                     return Poll::Ready(Err(denied()));
                 }
                 let result = authentication.as_mut().poll(task);
@@ -504,6 +524,11 @@ impl AuthProvider for EnterpriseAuthProvider {
                 // snapshot. Dropping the request-owned verifier future retires
                 // only this attempt, leaving shared caller authority intact.
                 snapshot.check().map_err(|_| denied())?;
+                // Provisioned or already-fresh keys can finish without a timer;
+                // suspended authentication requires the caller's own driver.
+                if result.is_pending() && !can_wait {
+                    return Poll::Ready(Err(denied()));
+                }
                 result
             })
             .await?;
