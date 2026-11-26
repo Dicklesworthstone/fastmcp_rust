@@ -2450,7 +2450,7 @@ impl Router {
         serde_json::to_writer(
             &mut context,
             &(
-                "fastmcp/catalog/2026-07-28/registration-order/v1",
+                "fastmcp/catalog/2026-07-28/registration-order/v2",
                 catalog,
                 self.final_catalog_revision,
                 self.list_page_size,
@@ -2551,44 +2551,73 @@ impl Router {
         Ok(cursor)
     }
 
-    fn page_modern_catalog<T: Clone>(
+    fn page_modern_catalog<'a, T, U>(
         &self,
         request_ctx: &McpContext,
-        items: Vec<T>,
-        cursor: Option<&str>,
+        params: &FinalListParams,
         catalog: FinalCatalogKind,
-        query: &FinalCatalogQuery,
-    ) -> McpResult<(Vec<T>, Option<String>, Option<Instant>)> {
-        let Some(page_size) = self.list_page_size else {
-            return if cursor.is_none() {
-                Ok((items, None, None))
-            } else {
-                Err(invalid_modern_catalog_cursor())
-            };
-        };
-        let initial_expiry = Instant::now()
-            .checked_add(MODERN_CATALOG_CURSOR_LIFETIME)
-            .ok_or_else(|| McpError::internal_error("catalog cursor lifetime is out of range"))?;
-        if cursor.is_none() && items.len() <= page_size {
-            return Ok((items, None, Some(initial_expiry)));
+        order: &[String],
+        mut lookup: impl FnMut(&str) -> Option<(&'a [String], T)>,
+        mut project: impl FnMut(T) -> McpResult<U>,
+    ) -> McpResult<(Vec<U>, Option<String>, Option<Instant>)> {
+        if let Some(error) = budget_error(request_ctx) {
+            return Err(error);
         }
-        let binding = self.final_catalog_binding(request_ctx, catalog, query)?;
-        let (offset, expires_at) = cursor
-            .map(|cursor| {
-                self.decode_modern_catalog_cursor(request_ctx, cursor, &binding, items.len())
-            })
-            .transpose()?
-            .unwrap_or((0, initial_expiry));
-        let end = offset
-            .checked_add(page_size)
-            .ok_or_else(invalid_modern_catalog_cursor)?
-            .min(items.len());
-        // Re-sealing a later page uses the authenticated original deadline.
-        // Following or replaying a cursor can never start a fresh lifetime.
-        let next_cursor = (end < items.len())
-            .then(|| self.encode_modern_catalog_cursor(request_ctx, &binding, end, expires_at))
-            .transpose()?;
-        Ok((items[offset..end].to_vec(), next_cursor, Some(expires_at)))
+        if self.list_page_size.is_none() && params.cursor.is_some() {
+            return Err(invalid_modern_catalog_cursor());
+        }
+        let bind = || {
+            self.final_catalog_binding(
+                request_ctx,
+                catalog,
+                &FinalCatalogQuery::from_final_list_params(params),
+            )
+        };
+        // The protected position addresses the immutable registration order.
+        // Authenticate before any lookup, then seek past registrations already
+        // inspected on earlier pages.
+        let (offset, expiry, binding) = if let Some(cursor) = params.cursor.as_deref() {
+            let binding = bind()?;
+            let (offset, expiry) =
+                self.decode_modern_catalog_cursor(request_ctx, cursor, &binding, order.len())?;
+            (offset, Some(expiry), Some(binding))
+        } else {
+            let expiry = self.list_page_size
+                .map(|_| {
+                    Instant::now().checked_add(MODERN_CATALOG_CURSOR_LIFETIME)
+                        .ok_or_else(|| McpError::internal_error("catalog cursor lifetime is out of range"))
+                })
+                .transpose()?;
+            (0, expiry, None)
+        };
+        let filters = (params.include_tags.is_some() || params.exclude_tags.is_some())
+            .then(|| TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref()));
+        let mut page = Vec::new();
+        for (position, key) in order.iter().enumerate().skip(offset) {
+            let Some((tags, entry)) = lookup(key) else {
+                continue;
+            };
+            if filters.as_ref().is_some_and(|filters| !filters.matches(tags)) {
+                continue;
+            }
+            if self.list_page_size == Some(page.len()) {
+                // One matching lookahead suffices. Its definition (and any
+                // large tool schema) is copied only when its page is returned.
+                let binding = match binding {
+                    Some(binding) => binding,
+                    None => bind()?,
+                };
+                let deadline = expiry.expect("paged catalogs have a cursor deadline");
+                let cursor =
+                    self.encode_modern_catalog_cursor(request_ctx, &binding, position, deadline)?;
+                return Ok((page, Some(cursor), expiry));
+            }
+            page.push(project(entry)?);
+        }
+        if params.cursor.is_some() && page.is_empty() {
+            return Err(invalid_modern_catalog_cursor());
+        }
+        Ok((page, None, expiry))
     }
 
     fn final_catalog_cache_hints(
@@ -5697,75 +5726,24 @@ impl Router {
         request_ctx: &McpContext,
         params: FinalListParams,
     ) -> McpResult<FinalListToolsResult> {
-        if let Some(error) = budget_error(request_ctx) {
-            return Err(error);
-        }
-
-        let query = FinalCatalogQuery::from_final_list_params(&params);
-        let tag_filters =
-            TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
-        let tag_filters = if params.include_tags.is_some() || params.exclude_tags.is_some() {
-            Some(&tag_filters)
-        } else {
-            None
-        };
-        let tools = crate::catch_extension_unwind(|| {
-            self.tool_order
-                .iter()
-                .filter_map(|name| self.tools.get(name))
-                .filter(|entry| entry.final_registration.is_some())
-                .map(|entry| entry.definition.clone())
-                .filter(|tool| tag_filters.is_none_or(|filters| filters.matches(&tool.tags)))
-                .collect::<Vec<_>>()
-        })
-        .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
-
-        let (tools, next_cursor, cursor_expires_at) = self.page_modern_catalog(
+        let (tools, next_cursor, expiry) = self.page_modern_catalog(
             request_ctx,
-            tools,
-            params.cursor.as_deref(),
+            &params,
             FinalCatalogKind::Tools,
-            &query,
+            &self.tool_order,
+            |key| {
+                let tool = self.tools.get(key)?;
+                let registration = tool.final_registration.as_ref()?;
+                Some((tool.definition.tags.as_slice(), &registration.final_definition))
+            },
+            |definition| Ok(definition.clone()),
         )?;
-        let result = ListToolsResult { tools, next_cursor };
-        self.project_final_tools_list(
-            request_ctx,
-            result,
-            self.final_catalog_cache_hints(
-                FinalCatalogKind::Tools,
-                cursor_expires_at,
-                Instant::now(),
-            ),
-        )
-    }
-
-    fn project_final_tools_list(
-        &self,
-        _request_ctx: &McpContext,
-        result: ListToolsResult,
-        cache_hints: FinalCacheHintPolicy,
-    ) -> McpResult<FinalListToolsResult> {
-        let tools = result
-            .tools
-            .into_iter()
-            .map(|tool| {
-                let entry = self.tools.get(&tool.name).ok_or_else(|| {
-                    McpError::internal_error("listed tool is absent from the router catalog")
-                })?;
-                let final_registration = entry.final_registration.as_ref().ok_or_else(|| {
-                    McpError::internal_error(
-                        "legacy-only tool reached the final catalog projection",
-                    )
-                })?;
-
-                Ok(final_registration.final_definition.clone())
-            })
-            .collect::<McpResult<Vec<_>>>()?;
+        let hints = self.final_catalog_cache_hints(FinalCatalogKind::Tools, expiry, Instant::now());
         Ok(FinalListToolsResult {
             tools,
-            next_cursor: result.next_cursor,
-            ttl_ms: cache_hints.list_ttl_ms,
-            cache_scope: cache_hints.scope,
+            next_cursor,
+            ttl_ms: hints.list_ttl_ms,
+            cache_scope: hints.scope,
         })
     }
 
@@ -5774,43 +5752,26 @@ impl Router {
         request_ctx: &McpContext,
         params: FinalListParams,
     ) -> McpResult<FinalListResourcesResult> {
-        if let Some(error) = budget_error(request_ctx) {
-            return Err(error);
-        }
-        let query = FinalCatalogQuery::from_final_list_params(&params);
-        let filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
-        let filters =
-            (params.include_tags.is_some() || params.exclude_tags.is_some()).then_some(filters);
-        let resources = self
-            .resource_order
-            .iter()
-            .filter_map(|uri| self.final_resources.get(uri).map(|entry| (uri, entry)))
-            .filter(|(_, entry)| {
-                filters
-                    .as_ref()
-                    .is_none_or(|filters| filters.matches(&entry.tags))
-            })
-            .map(|(_, entry)| {
+        let (resources, next_cursor, expiry) = self.page_modern_catalog(
+            request_ctx,
+            &params,
+            FinalCatalogKind::Resources,
+            &self.resource_order,
+            |key| {
+                let resource = self.final_resources.get(key)?;
+                Some((resource.tags.as_slice(), resource))
+            },
+            |resource| {
                 admit_final_resource_uri(
-                    entry.uri_use_policy,
-                    &entry.definition.uri,
+                    resource.uri_use_policy,
+                    &resource.definition.uri,
                     FinalResourceUriUse::CatalogResource,
                 )?;
-                Ok(entry.definition.clone())
-            })
-            .collect::<McpResult<Vec<_>>>()?;
-        let (resources, next_cursor, cursor_expires_at) = self.page_modern_catalog(
-            request_ctx,
-            resources,
-            params.cursor.as_deref(),
-            FinalCatalogKind::Resources,
-            &query,
+                Ok(resource.definition.clone())
+            },
         )?;
-        let hints = self.final_catalog_cache_hints(
-            FinalCatalogKind::Resources,
-            cursor_expires_at,
-            Instant::now(),
-        );
+        let hints =
+            self.final_catalog_cache_hints(FinalCatalogKind::Resources, expiry, Instant::now());
         Ok(FinalListResourcesResult {
             resources,
             next_cursor,
@@ -5824,41 +5785,23 @@ impl Router {
         request_ctx: &McpContext,
         params: FinalListParams,
     ) -> McpResult<FinalListResourceTemplatesResult> {
-        if let Some(error) = budget_error(request_ctx) {
-            return Err(error);
-        }
-        let query = FinalCatalogQuery::from_final_list_params(&params);
-        let filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
-        let filters =
-            (params.include_tags.is_some() || params.exclude_tags.is_some()).then_some(filters);
-        let resource_templates = self
-            .resource_template_order
-            .iter()
-            .filter_map(|key| self.resource_templates.get(key).map(|entry| (key, entry)))
-            .filter_map(|(_, entry)| {
-                entry
-                    .final_definition
-                    .as_ref()
-                    .map(|definition| (definition, &entry.template.tags, entry.uri_use_policy))
-            })
-            .filter(|(_, tags, _)| filters.as_ref().is_none_or(|filters| filters.matches(tags)))
-            .map(|(definition, _, uri_use_policy)| {
-                admit_final_resource_template_uri(uri_use_policy, &definition.uri_template)?;
-                Ok(definition.clone())
-            })
-            .collect::<McpResult<Vec<_>>>()?;
-        let (resource_templates, next_cursor, cursor_expires_at) = self.page_modern_catalog(
+        let (resource_templates, next_cursor, expiry) = self.page_modern_catalog(
             request_ctx,
-            resource_templates,
-            params.cursor.as_deref(),
+            &params,
             FinalCatalogKind::ResourceTemplates,
-            &query,
+            &self.resource_template_order,
+            |key| {
+                let template = self.resource_templates.get(key)?;
+                let definition = template.final_definition.as_ref()?;
+                Some((template.template.tags.as_slice(), (template.uri_use_policy, definition)))
+            },
+            |(policy, definition)| {
+                admit_final_resource_template_uri(policy, &definition.uri_template)?;
+                Ok(definition.clone())
+            },
         )?;
-        let hints = self.final_catalog_cache_hints(
-            FinalCatalogKind::ResourceTemplates,
-            cursor_expires_at,
-            Instant::now(),
-        );
+        let hints =
+            self.final_catalog_cache_hints(FinalCatalogKind::ResourceTemplates, expiry, Instant::now());
         Ok(FinalListResourceTemplatesResult {
             resource_templates,
             next_cursor,
@@ -5872,36 +5815,18 @@ impl Router {
         request_ctx: &McpContext,
         params: FinalListParams,
     ) -> McpResult<FinalListPromptsResult> {
-        if let Some(error) = budget_error(request_ctx) {
-            return Err(error);
-        }
-        let query = FinalCatalogQuery::from_final_list_params(&params);
-        let filters = TagFilters::new(params.include_tags.as_ref(), params.exclude_tags.as_ref());
-        let filters =
-            (params.include_tags.is_some() || params.exclude_tags.is_some()).then_some(filters);
-        let prompts = self
-            .prompt_order
-            .iter()
-            .filter_map(|name| self.final_prompts.get(name).map(|entry| (name, entry)))
-            .filter(|(_, entry)| {
-                filters
-                    .as_ref()
-                    .is_none_or(|filters| filters.matches(&entry.tags))
-            })
-            .map(|(_, entry)| entry.definition.clone())
-            .collect();
-        let (prompts, next_cursor, cursor_expires_at) = self.page_modern_catalog(
+        let (prompts, next_cursor, expiry) = self.page_modern_catalog(
             request_ctx,
-            prompts,
-            params.cursor.as_deref(),
+            &params,
             FinalCatalogKind::Prompts,
-            &query,
+            &self.prompt_order,
+            |key| {
+                let prompt = self.final_prompts.get(key)?;
+                Some((prompt.tags.as_slice(), &prompt.definition))
+            },
+            |definition| Ok(definition.clone()),
         )?;
-        let hints = self.final_catalog_cache_hints(
-            FinalCatalogKind::Prompts,
-            cursor_expires_at,
-            Instant::now(),
-        );
+        let hints = self.final_catalog_cache_hints(FinalCatalogKind::Prompts, expiry, Instant::now());
         Ok(FinalListPromptsResult {
             prompts,
             next_cursor,
@@ -18068,6 +17993,59 @@ mod router_tests {
     }
 
     #[test]
+    fn modern_catalog_seeks_before_lookup_and_projects_only_the_requested_page() {
+        let mut router = Router::new();
+        router.set_list_page_size(Some(2));
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let order: Vec<_> = (0..4096).map(|i| i.to_string()).collect();
+        let visible = vec!["visible".to_owned()];
+        let hidden = vec!["other".to_owned()];
+        let run = |cursor: Option<&str>| {
+            let request = final_tools_list_request(cursor, Some(vec!["visible"]), None, 1);
+            let params = serde_json::from_value(request.params.unwrap()).unwrap();
+            let mut visited = Vec::new();
+            let mut projected = Vec::new();
+            let result = router.page_modern_catalog(
+                &ctx,
+                &params,
+                FinalCatalogKind::Tools,
+                &order,
+                |key| {
+                    let position = key.parse::<usize>().unwrap();
+                    visited.push(position);
+                    let tags = if position % 3 == 0 { &visible } else { &hidden };
+                    Some((tags.as_slice(), position))
+                },
+                |position| {
+                    projected.push(position);
+                    Ok(position)
+                },
+            );
+            (result, visited, projected)
+        };
+
+        let (first, visited, projected) = run(None);
+        let (page, first_cursor, expiry) = first.unwrap();
+        assert_eq!(page, [0, 3]);
+        assert_eq!(projected, page);
+        assert_eq!(visited, (0..=6).collect::<Vec<_>>());
+        let first_cursor = first_cursor.unwrap();
+
+        let (second, visited, projected) = run(Some(&first_cursor));
+        let (page, next, continued_expiry) = second.unwrap();
+        assert_eq!(page, [6, 9]);
+        assert_eq!(projected, page);
+        assert_eq!(visited, (6..=12).collect::<Vec<_>>());
+        assert!(next.is_some());
+        assert_eq!(continued_expiry, expiry);
+
+        let (refused, visited, projected) = run(Some(&(first_cursor + "!")));
+        assert_eq!(refused.unwrap_err().message, INVALID_MODERN_CATALOG_CURSOR);
+        assert!(visited.is_empty());
+        assert!(projected.is_empty());
+    }
+
+    #[test]
     fn final_mounted_tools_preserve_admitted_order_before_cursor_pagination() {
         let mut router = mounted_tool_router();
         let cx = Cx::for_testing();
@@ -18112,14 +18090,10 @@ mod router_tests {
         let binding = router
             .final_catalog_binding(&request_ctx, FinalCatalogKind::Tools, &query)
             .expect("the current catalog/query binding is available");
-        assert_eq!(
-            router
-                .decode_modern_catalog_cursor(&request_ctx, cursor, &binding, 2)
-                .expect("cursor is router-generated for this exact final catalog revision")
-                .0,
-            1,
-            "the cursor advances across admitted entries"
-        );
+        let (next, _) = router
+            .decode_modern_catalog_cursor(&request_ctx, cursor, &binding, router.tool_order.len())
+            .expect("cursor is router-generated for this exact final catalog revision");
+        assert_eq!(router.tool_order[next], "peer/second");
 
         let query_mismatch = block_on(router.dispatch_stateless(
             &request_ctx,
