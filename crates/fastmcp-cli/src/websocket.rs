@@ -662,12 +662,6 @@ where
         })
         .await;
     }
-    // Task timestamps retain their wire spelling; equivalent UTC offsets or
-    // fractional precision must not look like a changed identity.
-    let created_at = chrono::DateTime::parse_from_rfc3339(latest_task.base().created_at.as_str())
-        .map_err(|_| {
-        McpError::invalid_request("task watch returned an invalid creation timestamp")
-    })?;
     let mut last_poll = std::time::Instant::now();
     output.write_event(cx, "snapshot", &latest_task)?;
     if is_terminal_task_status(latest_task.base().status) {
@@ -702,60 +696,22 @@ where
                 false
             }
             StdioTaskSubscriptionEvent::Notification(notification) => {
-                let task = notification.params.task;
-                let observed_created_at = chrono::DateTime::parse_from_rfc3339(
-                    task.base().created_at.as_str(),
-                )
-                .map_err(|_| {
-                    McpError::invalid_request("task watch returned an invalid creation timestamp")
-                })?;
-                if task.base().task_id != task_id || observed_created_at != created_at {
-                    return Err(McpError::invalid_request(
-                        "task watch returned a different task identity",
-                    ));
-                }
-                let previous = serde_json::to_vec(&latest_task)
-                    .map_err(|_| McpError::internal_error("could not compare task snapshots"))?;
-                let observed = serde_json::to_vec(&task)
-                    .map_err(|_| McpError::internal_error("could not compare task snapshots"))?;
-                if previous == observed {
-                    asupersync::runtime::yield_now().await;
-                    continue;
-                }
-                let previous_update = chrono::DateTime::parse_from_rfc3339(
-                    latest_task.base().last_updated_at.as_str(),
-                )
-                .map_err(|_| {
-                    McpError::invalid_request("task watch returned an invalid update timestamp")
-                })?;
-                let observed_update =
-                    chrono::DateTime::parse_from_rfc3339(task.base().last_updated_at.as_str())
-                        .map_err(|_| {
-                            McpError::invalid_request(
-                                "task watch returned an invalid update timestamp",
-                            )
-                        })?;
-                if observed_update > previous_update {
-                    if reconcile_task_snapshot(
-                        cx,
-                        output,
-                        &latest_task,
-                        &task,
-                        &mut updates,
-                        max_events,
-                    )? {
-                        return Ok(());
+                match observe_task_notification(
+                    cx,
+                    output,
+                    &mut latest_task,
+                    notification.params.task,
+                    &mut updates,
+                    max_events,
+                    &mut last_poll,
+                )? {
+                    TaskWatchStep::Pending => {
+                        asupersync::runtime::yield_now().await;
+                        continue;
                     }
-                    latest_task = task;
-                    last_poll = std::time::Instant::now();
-                    continue;
+                    TaskWatchStep::Finished => return Ok(()),
+                    TaskWatchStep::Reconcile { reconnect } => reconnect,
                 }
-                // Reads may queue notifications from before their authoritative
-                // response. Changed equal/older instants require a fresh read;
-                // never regress emitted state or consume max-events for them.
-                // The timestamp is only a notification hint: an authoritative
-                // read below is admitted even when the server clock regresses.
-                false
             }
             StdioTaskSubscriptionEvent::Terminal => true,
         };

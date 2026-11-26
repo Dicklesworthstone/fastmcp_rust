@@ -5440,6 +5440,37 @@ def respond(request):
             result = '{"resultType":"complete","content":[{"type":"text","text":"immediate"}]}'
         else:
             result = task("completed" if mode == "immediate" else "working", "task")
+    elif method == "subscriptions/listen" and mode.startswith("listen_"):
+        meta = {"io.modelcontextprotocol/subscriptionId": request["id"]}
+        ack = {"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
+               "params": {"_meta": meta, "notifications": {"taskIds": [task_id]}}}
+        duplicate = json.loads(task("working", "complete"))
+        del duplicate["resultType"]
+        duplicate["_meta"] = meta
+        observed = dict(duplicate)
+        observed["statusMessage"] = "unconfirmed queued state"
+        if mode == "listen_replaced":
+            observed["createdAt"] = "2026-11-15T00:00:00Z"
+            observed["lastUpdatedAt"] = "2026-11-17T00:00:00Z"
+        elif mode == "listen_stale":
+            duplicate["lastUpdatedAt"] = "2026-11-16T00:00:01Z"
+        def notify(params):
+            return {"jsonrpc":"2.0", "method":"notifications/tasks", "params":params}
+        frames = [ack, notify(duplicate), notify(observed)]
+        if transport == "http":
+            frames.append({"jsonrpc":"2.0", "id":request["id"],
+                           "result":{"resultType":"complete", "_meta":meta}})
+        return [json.dumps(frame) for frame in frames]
+    elif method == "tasks/get" and mode.startswith("listen_"):
+        assert request["params"]["taskId"] == task_id
+        reads += 1
+        result = task("completed" if reads == 3 else "working", "complete")
+        if mode == "listen_replaced_read" and reads == 2:
+            result = result.replace('"createdAt":"2026-11-16', '"createdAt":"2026-11-15')
+            result = result.replace('public', 'unconfirmed queued state')
+        if mode == "listen_stale" and reads <= 2:
+            result = result.replace('"lastUpdatedAt":"2026-11-16T00:00:00Z"',
+                                    '"lastUpdatedAt":"2026-11-16T00:00:01Z"')
     elif method == "tasks/get" and mode.startswith("poll_"):
         assert request["params"]["taskId"] == task_id
         if called_at is not None:
@@ -5470,7 +5501,8 @@ if transport == "stdio":
     for line in sys.stdin:
         request = json.loads(line)
         if "id" in request:
-            print(respond(request), flush=True)
+            response = respond(request)
+            print("\n".join(response) if isinstance(response, list) else response, flush=True)
         else:
             with open(log_path, "a", encoding="utf-8") as output:
                 output.write(json.dumps({"notification": request, "pid": os.getpid()}) + "\n")
@@ -5482,9 +5514,13 @@ else:
             length = int(self.headers["Content-Length"])
             assert 0 < length <= 65536
             request = json.loads(self.rfile.read(length))
-            payload = respond(request).encode("utf-8")
+            response = respond(request)
+            stream = isinstance(response, list)
+            if stream:
+                response = "".join("data: " + frame + "\n\n" for frame in response)
+            payload = response.encode("utf-8")
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "text/event-stream" if stream else "application/json")
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Connection", "close")
             self.end_headers()
@@ -5515,6 +5551,8 @@ else:
         let mut command = Command::new(get_binary_path());
         if mode.starts_with("poll_") {
             command.args(["tasks", "watch", task_id, "--poll", "--timeout", "5"]);
+        } else if mode.starts_with("listen_") {
+            command.args(["tasks", "watch", task_id, "--max-events", "1", "--timeout", "5"]);
         } else {
             command.args([
                 "call",
@@ -5628,6 +5666,35 @@ else:
                 "no obsolete task request hint"
             );
             assert!(params.get("ttlMs").is_none(), "no undeclared creation TTL");
+        }
+    }
+
+    #[test]
+    fn tasks_watch_listener_reconciles_stale_and_equal_notifications() {
+        for http in [false, true] {
+            for mode in ["listen_stale", "listen_equal", "listen_replaced", "listen_replaced_read"] {
+                let (output, events) = call(mode, http, true, &[]);
+                let docs = documents(&output);
+                assert_eq!(docs[0]["event"], "snapshot", "{mode} http={http}: {output:?}");
+                assert_eq!(docs[1]["event"], "watch-acknowledged");
+                assert!(!stdout_str(&output).contains("unconfirmed queued state"));
+                let reads = events
+                    .iter()
+                    .filter(|event| event["request"]["method"] == "tasks/get")
+                    .count();
+                if mode.starts_with("listen_replaced") {
+                    assert!(!output.status.success());
+                    assert!(stderr_str(&output).contains("identity"), "{output:?}");
+                    assert_eq!(docs.len(), 2);
+                    assert_eq!(reads, 2);
+                } else {
+                    assert!(output.status.success(), "{mode} http={http}: {output:?}");
+                    assert_eq!(reads, 3);
+                    assert_eq!(docs.len(), 4);
+                    assert_eq!(docs[2]["data"]["status"], "completed");
+                    assert_eq!(docs[3]["data"], json!({"reason":"task-terminal","updates":1}));
+                }
+            }
         }
     }
 
