@@ -2058,6 +2058,30 @@ pub trait FinalTaskStore: Send + Sync {
         ))
     }
 
+    /// Creates trusted application work through caller-owned asynchronous I/O.
+    ///
+    /// Retain the task, notification and original descriptor atomically, then
+    /// return the exact snapshot captured by that commit. This path carries no
+    /// authenticated principal or router operation. Request handlers must use
+    /// the operation-bound creation path instead.
+    ///
+    /// Call [`FinalTaskCreationAdmission::checkpoint_before_write`] immediately
+    /// before the first irreversible write, including after suspension. Once
+    /// committed, settle the original receipt even if cancellation arrives;
+    /// dropping the future obeys [`FinalTaskStoreFuture`]'s recovery contract.
+    fn create_task_with_work_with_context<'a>(
+        &'a self,
+        admission: FinalTaskCreationAdmission<'a>,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+        work_descriptor: FinalTaskWorkDescriptor,
+    ) -> FinalTaskStoreFuture<'a, FinalTaskSnapshot> {
+        Box::pin(async move {
+            admission.checkpoint_before_write()?;
+            self.create_task_with_work(task, notification, work_descriptor)
+        })
+    }
+
     /// Atomically persists an authenticated principal with the task, work, and
     /// notification. The binding is private, immutable for this task's entire
     /// lifetime, and must survive every snapshot, transition, and recovery.
@@ -8804,6 +8828,8 @@ impl FinalTaskRuntime {
     /// This trusted embedding API creates unprotected work. Request dispatch
     /// uses its authenticated creation path instead; do not call this method
     /// to implement a credential-bearing request handler.
+    /// Use [`Self::create_task_with_work_with_cx`] for asynchronous storage
+    /// driven by the embedding's caller context.
     pub fn create_task_with_work(
         &self,
         work_descriptor: FinalTaskWorkDescriptor,

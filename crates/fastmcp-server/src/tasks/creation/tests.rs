@@ -93,6 +93,65 @@ impl FinalTaskStore for AsyncCreationStore {
         self.inner.execution_limits()
     }
 
+    fn create_task_with_work_with_context<'a>(
+        &'a self,
+        admission: FinalTaskCreationAdmission<'a>,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+        work_descriptor: FinalTaskWorkDescriptor,
+    ) -> FinalTaskStoreFuture<'a, FinalTaskSnapshot> {
+        Box::pin(async move {
+            let ctx = admission.context();
+            assert!(ctx.auth().is_none(), "embedding does not invent credentials");
+            assert!(Cx::current().is_some(), "provider inherits the caller's Cx");
+            self.create_calls.fetch_add(1, Ordering::SeqCst);
+            self.before_commit.wait().await;
+            admission.checkpoint_before_write()?;
+            let mut committed =
+                self.inner.create_task_with_work(task, notification, work_descriptor)?;
+            *self.created_task_id.lock().unwrap() = Some(committed.task().base().task_id.clone());
+            self.committed_writes.fetch_add(1, Ordering::SeqCst);
+            if self.cancel_after_commit.load(Ordering::SeqCst) {
+                ctx.cx().cancel_with(asupersync::types::CancelKind::User, None);
+            }
+            self.after_commit.wait().await;
+            if self.substitute_receipt.load(Ordering::SeqCst) {
+                committed = committed
+                    .with_authenticated_principal(Some(Sha256Digest::from_bytes([91; 32])));
+            }
+            Ok(committed)
+        })
+    }
+
+    fn get_task_snapshot_with_cx<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            self.async_payload_reads.fetch_add(1, Ordering::SeqCst);
+            self.notification_read.wait().await;
+            self.inner.get_task_snapshot(task_id)
+        })
+    }
+
+    fn get_task_access_metadata_with_cx<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskAccessMetadata>> {
+        Box::pin(async move { self.inner.get_task_access_metadata(task_id) })
+    }
+
+    fn create_task_with_work(
+        &self,
+        _task: FinalTask,
+        _notification: FinalTaskStatusNotification,
+        _work_descriptor: FinalTaskWorkDescriptor,
+    ) -> McpResult<FinalTaskSnapshot> {
+        panic!("embedding Task creation called the synchronous fallback")
+    }
+
     fn create_task_with_operation_with_context<'a>(
         &'a self,
         admission: FinalTaskCreationAdmission<'a>,
@@ -334,6 +393,16 @@ fn ready<T>(result: Poll<T>) -> T {
         Poll::Ready(result) => result,
         Poll::Pending => panic!("released creation operation unexpectedly remained pending"),
     }
+}
+
+fn with_embedding_caller(test: impl FnOnce(Cx)) {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0)
+        .build()
+        .unwrap();
+    let caller = runtime.request_cx_with_budget(Budget::INFINITE);
+    runtime.block_on(async { test(caller) });
+    assert!(runtime.shutdown_timeout(StdDuration::from_secs(2)));
 }
 
 #[test]
@@ -686,4 +755,197 @@ fn async_creation_invalid_receipt_cannot_publish_an_unverified_handle() {
     assert_eq!(fixture.store.inner.task_count(), 1);
     assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
     fixture.assert_admission_empty();
+}
+
+#[test]
+fn async_embedding_creation_retains_admission_and_exact_recoverable_work() {
+    with_embedding_caller(|cx| {
+        let mut fixture = Fixture::new();
+        fixture.store.before_commit.close();
+        let runtime = fixture.runtime.clone();
+        let mut create = Box::pin(runtime.create_task_with_work_with_cx(&cx, work(), None));
+        assert!(poll_once(create.as_mut()).is_pending());
+        assert_eq!(fixture.store.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.inner.task_count(), 0);
+        {
+            let ledger = fixture.runtime.admission.lock().unwrap();
+            assert_eq!(ledger.total.permits, 1);
+            assert!(ledger.total.payload_bytes > 0);
+        }
+        assert!(fixture.runtime.service_signal.try_lock().is_ok());
+        assert!(fixture.runtime.admission.try_lock().is_ok());
+        let mut second = Box::pin(runtime.create_task_with_work_with_cx(&cx, work(), None));
+        ready(poll_once(second.as_mut())).expect_err("pending creation retains its bounded slot");
+        assert_eq!(fixture.store.create_calls.load(Ordering::SeqCst), 1);
+        drop(second);
+
+        fixture.store.before_commit.release();
+        let created = ready(poll_once(create.as_mut())).unwrap();
+        drop(create);
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.async_payload_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.notifications.load(Ordering::SeqCst), 1);
+        fixture.assert_admission_empty();
+        let snapshot = fixture.store.snapshot();
+        assert!(snapshot.authenticated_principal().is_none());
+        assert!(snapshot.original_operation().is_none());
+        assert!(final_tasks_match_exactly(snapshot.task(), &created.task).unwrap());
+        let claim = fixture
+            .store
+            .inner
+            .take_initial_work_handoff_for_owner_if_current(&snapshot, "embedding-recovery")
+            .unwrap()
+            .expect("accepted embedding work remains recoverable");
+        assert_eq!(claim.work_descriptor, work());
+        let mut wakeup = Box::pin(fixture.receiver.recv(&cx));
+        assert_eq!(
+            ready(poll_once(wakeup.as_mut())).unwrap(),
+            created.task.base().task_id
+        );
+    });
+}
+
+#[test]
+fn async_embedding_creation_rechecks_cancellation_and_service_before_write() {
+    for stop in ["cancel-before-poll", "cancel-while-pending", "service-exit"] {
+        with_embedding_caller(|cx| {
+            let fixture = Fixture::new();
+            fixture.store.before_commit.close();
+            if stop == "cancel-before-poll" {
+                cx.cancel_with(asupersync::types::CancelKind::User, None);
+            }
+            let mut create = Box::pin(
+                fixture.runtime.create_task_with_work_with_cx(&cx, work(), None),
+            );
+            if stop != "cancel-before-poll" {
+                assert!(poll_once(create.as_mut()).is_pending());
+                assert_eq!(fixture.runtime.admission.lock().unwrap().total.permits, 1);
+                if stop == "cancel-while-pending" {
+                    cx.cancel_with(asupersync::types::CancelKind::User, None);
+                } else {
+                    fixture
+                        .runtime
+                        .service_signal
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .ready_generation = None;
+                }
+            }
+            fixture.store.before_commit.release();
+            ready(poll_once(create.as_mut())).expect_err("stopped admission cannot write");
+            assert_eq!(
+                fixture.store.create_calls.load(Ordering::SeqCst),
+                usize::from(stop != "cancel-before-poll")
+            );
+            assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.store.inner.task_count(), 0);
+            assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
+            fixture.assert_admission_empty();
+        });
+    }
+}
+
+#[test]
+fn async_embedding_creation_preserves_commit_after_cancellation_and_service_exit() {
+    with_embedding_caller(|cx| {
+        let fixture = Fixture::new();
+        fixture.store.after_commit.close();
+        let mut create = Box::pin(
+            fixture.runtime.create_task_with_work_with_cx(&cx, work(), None),
+        );
+        assert!(poll_once(create.as_mut()).is_pending());
+        assert_eq!(fixture.store.inner.task_count(), 1);
+        assert_eq!(fixture.runtime.admission.lock().unwrap().total.permits, 1);
+        cx.cancel_with(asupersync::types::CancelKind::User, None);
+        fixture
+            .runtime
+            .service_signal
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .ready_generation = None;
+        fixture.store.after_commit.release();
+        let created = ready(poll_once(create.as_mut())).unwrap();
+        assert!(final_tasks_match_exactly(&created.task, fixture.store.snapshot().task()).unwrap());
+        assert_eq!(fixture.store.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
+        assert!(fixture.store.inner.next_initial_work_snapshot().unwrap().is_some());
+        fixture.assert_admission_empty();
+    });
+}
+
+#[test]
+fn async_embedding_creation_drop_releases_admission_and_preserves_committed_work() {
+    for committed in [false, true] {
+        with_embedding_caller(|cx| {
+            let fixture = Fixture::new();
+            if committed {
+                fixture.store.after_commit.close();
+            } else {
+                fixture.store.before_commit.close();
+            }
+            let mut create = Box::pin(
+                fixture.runtime.create_task_with_work_with_cx(&cx, work(), None),
+            );
+            assert!(poll_once(create.as_mut()).is_pending());
+            assert_eq!(fixture.runtime.admission.lock().unwrap().total.permits, 1);
+            drop(create);
+            assert_eq!(fixture.store.inner.task_count(), usize::from(committed));
+            assert_eq!(
+                fixture.store.committed_writes.load(Ordering::SeqCst),
+                usize::from(committed)
+            );
+            assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                fixture.store.inner.next_initial_work_snapshot().unwrap().is_some(),
+                committed
+            );
+            fixture.assert_admission_empty();
+        });
+    }
+}
+
+#[test]
+fn async_embedding_creation_rejects_substituted_committed_identity() {
+    with_embedding_caller(|cx| {
+        let fixture = Fixture::new();
+        fixture.store.substitute_receipt.store(true, Ordering::SeqCst);
+        let mut create = Box::pin(
+            fixture.runtime.create_task_with_work_with_cx(&cx, work(), None),
+        );
+        ready(poll_once(create.as_mut())).expect_err("a different owner cannot validate the receipt");
+        assert_eq!(fixture.store.inner.task_count(), 1);
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
+        assert!(fixture.store.snapshot().authenticated_principal().is_none());
+        fixture.assert_admission_empty();
+    });
+}
+
+#[test]
+fn async_embedding_creation_wakes_recovery_before_pending_notification() {
+    with_embedding_caller(|cx| {
+        let mut fixture = Fixture::new();
+        fixture.store.notification_read.close();
+        let runtime = fixture.runtime.clone();
+        let mut create = Box::pin(runtime.create_task_with_work_with_cx(&cx, work(), None));
+        assert!(poll_once(create.as_mut()).is_pending());
+        let snapshot = fixture.store.snapshot();
+        let mut wakeup = Box::pin(fixture.receiver.recv(&cx));
+        assert_eq!(
+            ready(poll_once(wakeup.as_mut())).unwrap(),
+            snapshot.task().base().task_id
+        );
+        drop(wakeup);
+        assert_eq!(fixture.runtime.admission.lock().unwrap().total.permits, 1);
+        cx.cancel_with(asupersync::types::CancelKind::User, None);
+        let created = ready(poll_once(create.as_mut())).unwrap();
+        assert!(final_tasks_match_exactly(&created.task, snapshot.task()).unwrap());
+        assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
+        fixture.assert_admission_empty();
+    });
 }

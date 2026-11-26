@@ -566,7 +566,7 @@ impl FinalTaskRuntime {
         Ok(Some(committed))
     }
 
-    async fn emit_recovery_commit(&self, cx: &Cx, committed: &FinalTaskSnapshot) {
+    pub(super) async fn emit_recovery_commit(&self, cx: &Cx, committed: &FinalTaskSnapshot) {
         if final_task_service_caller(cx).is_err() {
             return;
         }
