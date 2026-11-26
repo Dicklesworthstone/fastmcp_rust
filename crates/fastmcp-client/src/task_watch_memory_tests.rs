@@ -1718,6 +1718,130 @@ fn attached_task_rejects_other_clients_before_requests_or_input_work() {
     });
 }
 
+async fn memory_input_custody_after_stop(cx: Cx, acknowledged: bool, cancel: bool) {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let owners = Arc::new(Mutex::new(Vec::new()));
+    let retained = Arc::clone(&owners);
+    let handlers = crate::ReverseRequestHandlers::new().with_modern_roots_list(
+        move |_, owner, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            retained.lock().unwrap().push(owner);
+            Box::pin(async { Ok(crate::FinalEmbeddedRootsListResult { roots: vec![] }) })
+        },
+    );
+    let (mut client, handle, mut peer) =
+        attached_with_handlers(&cx, input_task(1, false), handlers).await;
+    let mut driver = handle.into_driver(drive_policy());
+    let before = serde_json::to_vec(driver.task()).unwrap();
+    let cancellation = McpRequestCancellation::new();
+    let mut driving = Box::pin(driver.drive_with_memory(&cx, &mut client, &cancellation));
+    let request = {
+        let mut incoming = pin!(peer.recv_async(&cx));
+        poll_fn(|task_cx| {
+            assert!(driving.as_mut().poll(task_cx).is_pending());
+            incoming.as_mut().poll(task_cx)
+        })
+        .await
+        .unwrap()
+    };
+    let JsonRpcMessage::Request(update) = request else {
+        panic!("expected input update");
+    };
+    assert_eq!(update.method, "tasks/update");
+    assert_eq!(update.id, Some(RequestId::Number(3)));
+    assert_eq!(
+        update.params.as_ref().unwrap()["inputResponses"],
+        json!({"roots": {"roots": []}}),
+    );
+    let owner = owners.lock().unwrap()[0].clone();
+    assert!(owner.is_open());
+    if acknowledged {
+        peer.send_async(&cx, &response(3, json!({"resultType": "complete"})))
+            .await
+            .unwrap();
+    }
+    // Poll once with the frame already queued: its acknowledgement must settle
+    // callback custody before this operation can suspend again.
+    poll_fn(|task_cx| {
+        assert!(driving.as_mut().poll(task_cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(owner.is_open(), !acknowledged);
+    if cancel {
+        cancellation.cancel();
+        assert_eq!(
+            driving.as_mut().await.unwrap(),
+            FinalTaskWaitOutcome::ObservationCancelled,
+        );
+    }
+    drop(driving);
+    assert_eq!(driver.input_resolution_interrupted(), !acknowledged);
+    assert_eq!(driver.reconcile_before_input, acknowledged);
+    assert_eq!(serde_json::to_vec(driver.task()).unwrap(), before);
+    assert_eq!(owner.is_cancel_requested(), !acknowledged);
+    assert!(!owner.is_open());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let live = McpRequestCancellation::new();
+    if acknowledged {
+        let mut server = cx
+            .spawn(move |peer_cx| async move {
+                receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
+                peer.send_async(&peer_cx, &task_response(4, input_task(2, false)))
+                    .await
+                    .unwrap();
+                receive(&peer_cx, &mut peer, "tasks/get", Some(5)).await;
+                peer.send_async(&peer_cx, &task_response(5, task("completed", None, 3)))
+                    .await
+                    .unwrap();
+                peer
+            })
+            .unwrap();
+        assert_eq!(
+            driver
+                .drive_with_memory(&cx, &mut client, &live)
+                .await
+                .unwrap(),
+            FinalTaskWaitOutcome::Completed,
+        );
+        let peer = server.join(&cx).await.unwrap();
+        finish(&cx, &mut client, peer, vec![], 6).await;
+    } else {
+        assert_eq!(
+            driver
+                .drive_with_memory(&cx, &mut client, &live)
+                .await
+                .unwrap_err()
+                .code,
+            McpErrorCode::InvalidRequest,
+        );
+        finish(&cx, &mut client, peer, vec![3], 4).await;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!live.is_cancel_requested());
+    assert!(cx.checkpoint().is_ok());
+}
+
+#[test]
+fn memory_task_driver_keeps_acknowledged_input_when_observation_stops() {
+    for cancel in [false, true] {
+        run(|cx| memory_input_custody_after_stop(cx, true, cancel));
+    }
+}
+
+#[test]
+fn memory_task_driver_keeps_unacknowledged_input_latched_when_observation_stops() {
+    for cancel in [false, true] {
+        run(|cx| memory_input_custody_after_stop(cx, false, cancel));
+    }
+}
+
 #[test]
 fn created_task_clones_share_the_first_selected_client() {
     run(|cx| async move {

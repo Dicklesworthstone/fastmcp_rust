@@ -606,8 +606,9 @@ pub(crate) async fn resolve_snapshot_with_transport<T: TaskInputTransport>(
     let acknowledged = transport
         .update(cx, cancellation, snapshot, responses)
         .await?;
-    asupersync::runtime::yield_now().await;
-    checkpoint(cx, cancellation)?;
+    // A validated acknowledgement settles this input batch. Record delivery in
+    // this poll: cancellation or drop may stop observation afterward, but must
+    // not turn an acknowledged Host response back into uncertain input.
     for owner in &owners {
         owner.0.record_response_sent();
     }

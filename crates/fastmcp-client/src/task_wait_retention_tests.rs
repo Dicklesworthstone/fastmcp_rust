@@ -854,3 +854,169 @@ mod caller_authority {
         assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 }
+
+mod acknowledged_input_custody {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct UpdateBoundary {
+        handlers: crate::ReverseRequestHandlers,
+        acknowledged: bool,
+        reads: usize,
+        updates: usize,
+    }
+
+    impl TaskInputTransport for UpdateBoundary {
+        type Error = McpError;
+
+        async fn read(
+            &mut self,
+            _cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            task_id: FinalTaskId,
+        ) -> McpResult<FinalTask> {
+            assert!(!cancellation.is_cancel_requested());
+            assert_eq!(task_id.as_str(), "retained-task");
+            self.reads += 1;
+            assert!(self.reads <= 2, "no extra reconciliation read");
+            Ok(task(
+                if self.reads == 1 {
+                    "input_required"
+                } else {
+                    "completed"
+                },
+                None,
+                1,
+            ))
+        }
+
+        fn input_context(
+            &self,
+        ) -> McpResult<(crate::ReverseRequestHandlers, serde_json::Value)> {
+            Ok((self.handlers.clone(), json!({"roots": {}})))
+        }
+
+        async fn update(
+            &mut self,
+            _cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            snapshot: &FinalTask,
+            responses: FinalTaskInputResponses,
+        ) -> McpResult<FinalUpdateTaskResult> {
+            assert_eq!(snapshot.base().task_id.as_str(), "retained-task");
+            assert_eq!(
+                serde_json::to_value(responses).unwrap(),
+                json!({"roots": {"roots": []}}),
+            );
+            self.updates += 1;
+            assert_eq!(self.updates, 1, "an input update must never be replayed");
+            // Select cancellation in exactly the poll returning the transport
+            // disposition. Only a validated ACK is allowed to settle custody.
+            cancellation.cancel();
+            if self.acknowledged {
+                Ok(serde_json::from_value(json!({"resultType": "complete"})).unwrap())
+            } else {
+                Err(McpError::internal_error("update acknowledgement unavailable"))
+            }
+        }
+    }
+
+    fn check(acknowledged: bool) {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            let owners = Arc::new(Mutex::new(Vec::new()));
+            let retained = Arc::clone(&owners);
+            let handlers = crate::ReverseRequestHandlers::new().with_modern_roots_list(
+                move |_, owner, _| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    retained.lock().unwrap().push(owner);
+                    Box::pin(async {
+                        Ok(crate::FinalEmbeddedRootsListResult { roots: vec![] })
+                    })
+                },
+            );
+            let mut transport = UpdateBoundary {
+                handlers,
+                acknowledged,
+                reads: 0,
+                updates: 0,
+            };
+            let policy = FinalTaskDrivePolicy::new(
+                FinalTaskWaitPolicy::new(
+                    Duration::from_secs(2),
+                    4,
+                    Duration::from_millis(1),
+                )
+                .unwrap(),
+                2,
+                4,
+                4096,
+                4096,
+            )
+            .unwrap();
+            let mut driver =
+                FinalTaskHandle::new(task("input_required", None, 1)).into_driver(policy);
+            let before = serde_json::to_vec(driver.task()).unwrap();
+            let cancellation = McpRequestCancellation::new();
+            assert_eq!(
+                drive_task(&mut driver, &cx, &mut transport, &cancellation)
+                    .await
+                    .unwrap(),
+                FinalTaskWaitOutcome::ObservationCancelled,
+            );
+            assert_eq!(driver.input_resolution_interrupted(), !acknowledged);
+            assert_eq!(driver.reconcile_before_input, acknowledged);
+            assert_eq!(
+                serde_json::to_vec(driver.task()).unwrap(),
+                before,
+                "an ACK cannot replace the retained Task snapshot",
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(transport.updates, 1);
+            assert_eq!(transport.reads, 0);
+            let owner = owners.lock().unwrap()[0].clone();
+            assert_eq!(owner.is_cancel_requested(), !acknowledged);
+            assert!(!owner.is_open());
+
+            let live = McpRequestCancellation::new();
+            let resumed = drive_task(&mut driver, &cx, &mut transport, &live).await;
+            if acknowledged {
+                assert_eq!(resumed.unwrap(), FinalTaskWaitOutcome::Completed);
+                assert_eq!(
+                    transport.reads, 2,
+                    "reconcile before examining the repeated answered input",
+                );
+            } else {
+                assert_eq!(
+                    resumed.unwrap_err().code,
+                    fastmcp_core::McpErrorCode::InvalidRequest,
+                );
+                assert_eq!(
+                    transport.reads, 0,
+                    "uncertain input still requires manual reconciliation",
+                );
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(transport.updates, 1);
+            assert!(cx.checkpoint().is_ok());
+            assert!(!live.is_cancel_requested());
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn task_driver_commits_acknowledged_inputs_before_same_poll_cancellation() {
+        check(true);
+    }
+
+    #[test]
+    fn task_driver_does_not_clear_interruption_without_an_update_acknowledgement() {
+        check(false);
+    }
+}

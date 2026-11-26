@@ -2356,35 +2356,36 @@ async fn resolve_driver_inputs<T: TaskInputTransport>(
         unreachable!("the current snapshot requires input");
     };
     *input_requests = unanswered;
-    let interrupted = &mut driver.input_resolution_interrupted;
-    let resolution = resolve_snapshot_with_transport(
-        cx,
-        cancellation,
-        client,
-        &snapshot,
-        policy
-            .maximum_input_keys
-            .min(fastmcp_protocol::tasks_extension::MAX_TASK_INPUT_MAP_ENTRIES),
-        policy.maximum_payload_bytes,
-        || *interrupted = true,
-    );
+    let resolution = async {
+        let interrupted = &mut driver.input_resolution_interrupted;
+        resolve_snapshot_with_transport(
+            cx,
+            cancellation,
+            client,
+            &snapshot,
+            policy
+                .maximum_input_keys
+                .min(fastmcp_protocol::tasks_extension::MAX_TASK_INPUT_MAP_ENTRIES),
+            policy.maximum_payload_bytes,
+            || *interrupted = true,
+        )
+        .await?;
+        // Commit known delivery before the observation guard's final fence.
+        // An ACK is not a Task snapshot: the next invocation must reconcile
+        // through tasks/get before it may authorize any further Host input.
+        driver
+            .inputs
+            .record_answers(&keys, &fingerprints, policy.maximum_state_bytes)
+            .map_err(drive_ledger_error)?;
+        *interrupted = false;
+        driver.reconcile_before_input = true;
+        *updates += 1;
+        Ok::<(), T::Error>(())
+    };
     match budget.guard(cx, cancellation, resolution).await {
-        Ok(result) => {
-            result?;
-        }
-        Err(outcome) => return Ok(Some(outcome)),
+        Ok(result) => result.map(|()| None),
+        Err(outcome) => Ok(Some(outcome)),
     }
-    // This synchronous handoff is the only place that clears the latch.
-    // Dropping either future before it runs retains uncertainty, including
-    // a response lost after update dispatch. An ACK is never a new snapshot.
-    driver
-        .inputs
-        .record_answers(&keys, &fingerprints, policy.maximum_state_bytes)
-        .map_err(drive_ledger_error)?;
-    driver.input_resolution_interrupted = false;
-    driver.reconcile_before_input = true;
-    *updates += 1;
-    Ok(None)
 }
 
 /// Only transports whose event future retains partial ingress on its listener
