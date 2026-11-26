@@ -881,8 +881,8 @@ impl<T> From<CompleteResult<T>> for FinalMethodOutcome<T> {
 /// Identifies who selected a complete final resource-read cache policy.
 ///
 /// The legacy-to-final bridge asks the router to install its configured
-/// policy. A direct final handler or exact proxy result owns its wire cache
-/// hints, even if those values happen to equal a router default.
+/// policy. An explicit handler or proxy hint can shorten that policy's TTL.
+/// Reads dispatched with the caller's context have private scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalResourceReadCacheHintProvenance {
     /// The result came from the legacy bridge and needs the router policy.

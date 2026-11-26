@@ -728,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn apps_read_metadata_preserves_configured_router_cache_policy() {
+    fn apps_read_metadata_preserves_router_ttl_and_private_handler_scope() {
         let ((), report) = asupersync::lab::run_async_under_lab(0xa9_03, |cx| async move {
             let resource = McpAppsUiResource::try_new(
                 AbsoluteUri::parse("ui://weather/dashboard").unwrap(),
@@ -764,7 +764,7 @@ mod tests {
                 .await
                 .expect("Apps resource reads through configured router");
             assert_eq!(read["ttlMs"], 23);
-            assert_eq!(read["cacheScope"], "public");
+            assert_eq!(read["cacheScope"], "private");
             assert_eq!(
                 read["contents"][0]["_meta"],
                 json!({"ui": {"prefersBorder": true}})

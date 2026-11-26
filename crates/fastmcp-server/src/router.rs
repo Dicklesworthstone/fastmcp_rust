@@ -2702,8 +2702,10 @@ impl Router {
 
     /// Sets the application cache policy for final catalog and resource-read
     /// responses. The default is a five-minute private catalog TTL and a
-    /// one-hour private resource-read TTL. Catalog responses additionally
-    /// respect any upstream proxy's remaining lifetime and private scope.
+    /// one-hour private resource-read TTL. Explicit resource-read lifetimes
+    /// can narrow this ceiling. Resource handlers receive the caller's request
+    /// context, so their reads are private even under a public catalog policy.
+    /// Catalog responses also respect upstream lifetime and scope ceilings.
     pub fn set_final_cache_hint_policy(
         &mut self,
         list_ttl_ms: CacheTtl,
@@ -6684,15 +6686,19 @@ impl Router {
         match outcome {
             Outcome::Ok(mut result) => {
                 admit_final_resource_read_outcome(resolved.uri_use_policy, &result)?;
-                // Provenance, not equality with a wire value, determines
-                // whether router policy owns these hints. An explicit final
-                // handler may intentionally choose the same values as the
-                // legacy bridge and must still retain them unchanged.
-                if let FinalMethodOutcome::Complete(complete) = &mut result
-                    && cache_hint_provenance == FinalResourceReadCacheHintProvenance::RouterPolicy
-                {
-                    complete.payload.ttl_ms = self.final_cache_hints.resource_read_ttl_ms.clone();
-                    complete.payload.cache_scope = self.final_cache_hints.scope;
+                if let FinalMethodOutcome::Complete(complete) = &mut result {
+                    let ceiling = &self.final_cache_hints.resource_read_ttl_ms;
+                    complete.payload.ttl_ms = match cache_hint_provenance {
+                        FinalResourceReadCacheHintProvenance::RouterPolicy => ceiling,
+                        FinalResourceReadCacheHintProvenance::Explicit => {
+                            complete.payload.ttl_ms.capped_by(ceiling)
+                        }
+                    }
+                    .clone();
+                    // This dispatch gave the handler a caller-bearing context.
+                    // Neither its wire hint nor an upstream's public scope
+                    // proves the content is independent of that caller.
+                    complete.payload.cache_scope = CacheScope::Private;
                 }
                 Ok(result)
             }
@@ -12955,10 +12961,10 @@ mod router_tests {
             Ok(CompleteResult::new(
                 FinalReadResourceResult {
                     contents: Vec::new(),
-                    // This is intentionally the former sentinel value. Only
-                    // the explicit provenance may preserve it.
+                    // This matches the legacy bridge TTL but a direct handler
+                    // may also supply it explicitly.
                     ttl_ms: CacheTtl::milliseconds(DEFAULT_FINAL_RESOURCE_TTL_MS),
-                    cache_scope: CacheScope::Private,
+                    cache_scope: CacheScope::Public,
                 },
                 empty_final_result_meta()?,
             ))
@@ -28184,7 +28190,7 @@ mod router_tests {
 
         assert_eq!(response["resultType"], "complete");
         assert_eq!(response["ttlMs"], 321);
-        assert_eq!(response["cacheScope"], "public");
+        assert_eq!(response["cacheScope"], "private");
         assert_eq!(
             response["contents"][0]["text"],
             "direct final resource result"
@@ -28206,7 +28212,7 @@ mod router_tests {
             panic!("resources/read selects the exact final result");
         };
         assert_eq!(result.payload.ttl_ms.as_str(), "321");
-        assert_eq!(result.payload.cache_scope, CacheScope::Public);
+        assert_eq!(result.payload.cache_scope, CacheScope::Private);
         assert!(matches!(
             result.payload.contents.as_slice(),
             [EmbeddedResourceContents::Text { text, mime_type, .. }]
@@ -28232,30 +28238,29 @@ mod router_tests {
             981_i64,
         );
 
-        for (provenance, expected_ttl, expected_scope) in [
-            (
-                FinalResourceReadCacheHintProvenance::Explicit,
-                DEFAULT_FINAL_RESOURCE_TTL_MS,
-                "private",
-            ),
-            (
-                FinalResourceReadCacheHintProvenance::RouterPolicy,
-                23,
-                "public",
-            ),
-        ] {
-            let mut router = Router::new();
-            router.set_final_cache_hint_policy(
-                CacheTtl::milliseconds(17),
-                CacheTtl::milliseconds(23),
-                CacheScope::Public,
-            );
-            router.add_resource(SentinelHintResource { provenance });
+        use FinalResourceReadCacheHintProvenance::{Explicit, RouterPolicy};
+        let longer = DEFAULT_FINAL_RESOURCE_TTL_MS + 1;
+        for scope in [CacheScope::Private, CacheScope::Public] {
+            for (provenance, ceiling, expected_ttl) in [
+                (Explicit, 0, 0),
+                (Explicit, 23, 23),
+                (Explicit, longer, DEFAULT_FINAL_RESOURCE_TTL_MS),
+                (RouterPolicy, 23, 23),
+                (RouterPolicy, longer, longer),
+            ] {
+                let mut router = Router::new();
+                router.set_final_cache_hint_policy(
+                    CacheTtl::milliseconds(17),
+                    CacheTtl::milliseconds(ceiling),
+                    scope,
+                );
+                router.add_resource(SentinelHintResource { provenance });
 
-            let response = block_on(router.dispatch_stateless(&request_ctx, &request))
-                .expect("final resource result dispatches");
-            assert_eq!(response["ttlMs"], expected_ttl);
-            assert_eq!(response["cacheScope"], expected_scope);
+                let response = block_on(router.dispatch_stateless(&request_ctx, &request))
+                    .expect("final resource result dispatches");
+                assert_eq!(response["ttlMs"], expected_ttl);
+                assert_eq!(response["cacheScope"], "private");
+            }
         }
     }
 

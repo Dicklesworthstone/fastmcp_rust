@@ -1073,7 +1073,52 @@ impl CacheTtl {
     /// This is intentionally checked: the final schema has no maximum, while
     /// local duration APIs accept at most `u64` milliseconds.
     pub fn try_as_millis(&self) -> Result<u64, CacheTtlConversionError> {
-        cache_ttl_runtime_millis(self.0.as_str())
+        let (width, digits) = self.magnitude();
+        if width > 20 {
+            return Err(CacheTtlConversionError::RuntimeOutOfRange);
+        }
+        digits
+            .bytes()
+            .chain(std::iter::repeat(b'0'))
+            .take(width)
+            .try_fold(0_u64, |value, digit| {
+                value.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
+            })
+            .ok_or(CacheTtlConversionError::RuntimeOutOfRange)
+    }
+
+    /// Selects the shorter lifetime without narrowing either wire integer to
+    /// a machine duration. Equal values retain the original hint's spelling.
+    #[must_use]
+    pub fn capped_by<'a>(&'a self, ceiling: &'a Self) -> &'a Self {
+        if self.magnitude() > ceiling.magnitude() {
+            ceiling
+        } else {
+            self
+        }
+    }
+
+    // Compare by integer width, then by significant digits with implicit
+    // trailing zeros. Once trailing zeros are removed, ordinary lexicographic
+    // prefix ordering gives the same result as zero-padding.
+    fn magnitude(&self) -> (usize, String) {
+        let lexeme = self.as_str().trim_start_matches('-');
+        let (mantissa, exponent) = lexeme.split_once(['e', 'E']).unwrap_or((lexeme, "0"));
+        let exponent: i32 = exponent.parse().expect("admitted bounded JSON exponent");
+        let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        let digits = format!("{whole}{fraction}");
+        let digits = digits.trim_start_matches('0');
+        if digits.is_empty() {
+            return (0, String::new());
+        }
+        // A JsonInteger is bounded to 4096 bytes and |exponent| <= 10000.
+        let width = i32::try_from(digits.len()).expect("bounded mantissa")
+            + exponent
+            - i32::try_from(fraction.len()).expect("bounded fraction");
+        (
+            usize::try_from(width).expect("nonzero integer has positive width"),
+            digits.trim_end_matches('0').to_owned(),
+        )
     }
 }
 
@@ -1115,64 +1160,6 @@ fn cache_ttl_is_negative(lexeme: &str) -> bool {
         .split(['e', 'E'])
         .next()
         .is_some_and(|mantissa| mantissa.bytes().any(|byte| matches!(byte, b'1'..=b'9')))
-}
-
-fn cache_ttl_runtime_millis(lexeme: &str) -> Result<u64, CacheTtlConversionError> {
-    let unsigned = lexeme.strip_prefix('-').unwrap_or(lexeme);
-    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
-        Some((mantissa, exponent)) => (mantissa, exponent),
-        None => (unsigned, "0"),
-    };
-    let exponent = exponent
-        .parse::<i128>()
-        .map_err(|_| CacheTtlConversionError::RuntimeOutOfRange)?;
-    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    let digits = format!("{whole}{fraction}");
-    // Leading mantissa zeroes carry no magnitude. Strip them before the
-    // checked decimal shift so a small exponent-form integer cannot appear
-    // out of range solely because its original fraction had many zeroes.
-    let digits = digits.trim_start_matches('0');
-    if digits.is_empty() {
-        return Ok(0);
-    }
-
-    let fraction_len =
-        i128::try_from(fraction.len()).map_err(|_| CacheTtlConversionError::RuntimeOutOfRange)?;
-    let decimal_shift = exponent
-        .checked_sub(fraction_len)
-        .ok_or(CacheTtlConversionError::RuntimeOutOfRange)?;
-    let integer_digits = if decimal_shift >= 0 {
-        let zeroes = usize::try_from(decimal_shift)
-            .map_err(|_| CacheTtlConversionError::RuntimeOutOfRange)?;
-        let length = digits
-            .len()
-            .checked_add(zeroes)
-            .ok_or(CacheTtlConversionError::RuntimeOutOfRange)?;
-        if length > 20 {
-            return Err(CacheTtlConversionError::RuntimeOutOfRange);
-        }
-        format!("{digits}{}", "0".repeat(zeroes))
-    } else {
-        let trimmed = usize::try_from(decimal_shift.unsigned_abs())
-            .map_err(|_| CacheTtlConversionError::RuntimeOutOfRange)?;
-        let Some(length) = digits.len().checked_sub(trimmed) else {
-            return Err(CacheTtlConversionError::RuntimeOutOfRange);
-        };
-        if !digits[length..].bytes().all(|byte| byte == b'0') {
-            return Err(CacheTtlConversionError::RuntimeOutOfRange);
-        }
-        digits[..length].to_owned()
-    };
-    let normalized = integer_digits.trim_start_matches('0');
-    if normalized.is_empty() {
-        return Ok(0);
-    }
-    if normalized.len() > 20 {
-        return Err(CacheTtlConversionError::RuntimeOutOfRange);
-    }
-    normalized
-        .parse()
-        .map_err(|_| CacheTtlConversionError::RuntimeOutOfRange)
 }
 
 /// Why a peer's required cache TTL carried no usable value.
@@ -2737,6 +2724,24 @@ mod tests {
             serde_json::from_str::<CacheTtl>("18446744073709551616.5").is_err(),
             "changing only the unbounded integer TTL to a fraction violates the final integer schema"
         );
+    }
+
+    #[test]
+    fn cache_ttl_ceiling_compares_arbitrary_width_and_preserves_winning_lexeme() {
+        for (source, ceiling, expected) in [
+            ("-0.00e4", "0", "-0.00e4"),
+            ("0", "1e10000", "0"),
+            ("1.20e+3", "1200", "1.20e+3"),
+            ("1210", "1.201e+3", "1.201e+3"),
+            ("0.001e+5", "99", "99"),
+            ("18446744073709551617", "18446744073709551616", "18446744073709551616"),
+            ("1000000000000000000001", "1e21", "1e21"),
+            ("1.00001e+9999", "1e10000", "1.00001e+9999"),
+        ] {
+            let hint: CacheTtl = serde_json::from_str(source).unwrap();
+            let cap: CacheTtl = serde_json::from_str(ceiling).unwrap();
+            assert_eq!(hint.capped_by(&cap).as_str(), expected);
+        }
     }
 
     #[test]
