@@ -663,42 +663,34 @@ where
         .await;
     }
     let mut last_poll = std::time::Instant::now();
-    output.write_event(cx, "snapshot", &latest_task)?;
-    if is_terminal_task_status(latest_task.base().status) {
-        return output.write_event(
-            cx,
-            "watch-ended",
-            &serde_json::json!({"reason": "task-terminal", "updates": 0}),
-        );
-    }
     let task_id = handle.task_id().clone();
+    let Some(mut clock) = task_poll::start(cx, output, budget, &task_id, &latest_task)? else {
+        return Ok(());
+    };
     let mut filter = fastmcp_protocol::SubscriptionFilter::default();
     fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
         .map_err(|_| McpError::invalid_params("invalid task watch filter"))?;
-    budget.remaining()?;
-    client
-        .open_final_task_subscription_listener(cx, filter.clone())
-        .await
+    clock.until(cx, &latest_task, client.open_final_task_subscription_listener(cx, filter.clone()))
+        .await?
         .map_err(|error| operation_failure(error, "WebSocket Task watch could not start"))?;
     let mut updates = 0;
     let mut reconnects = 0;
     let mut reconnect_ack_pending = false;
     loop {
-        budget.remaining()?;
-        let event = client
-            .next_final_task_subscription_event(cx, cancellation)
-            .await
+        let event = clock.until(cx, &latest_task, client.next_final_task_subscription_event(cx, cancellation))
+            .await?
             .map_err(|error| operation_failure(error, "WebSocket Task watch failed"))?;
         let reconnect = match event {
             StdioTaskSubscriptionEvent::Acknowledged(accepted) => {
                 validate_task_watch_acknowledgement(&accepted, &task_id)?;
-                output.write_event(cx, "watch-acknowledged", &accepted)?;
+                clock.output(cx, &latest_task, output)?.write_event(cx, "watch-acknowledged", &accepted)?;
                 false
             }
             StdioTaskSubscriptionEvent::Notification(notification) => {
                 match observe_task_notification(
                     cx,
                     output,
+                    &mut clock,
                     &mut latest_task,
                     notification.params.task,
                     &mut updates,
@@ -720,15 +712,15 @@ where
         if let Some(delay) =
             task_poll_delay(last_poll, latest_task.base().poll_interval_ms.as_ref())?
         {
-            wait_for_task_poll_delay(cx, budget, delay).await?;
+            clock.until(cx, &latest_task, wait_for_task_poll_delay(cx, budget, delay)).await??;
         }
-        budget.remaining()?;
-        let task = handle
-            .poll_with_websocket(cx, client, cancellation)
-            .await
+        let task = clock.until(cx, &latest_task, handle.poll_with_websocket(cx, client, cancellation))
+            .await?
             .map_err(|error| operation_failure(error, "WebSocket Task reconciliation failed"))?
             .clone();
         last_poll = std::time::Instant::now();
+        clock.accept(cx, &latest_task, &task)?;
+        let output = clock.output(cx, &task, output)?;
         if reconnect_ack_pending && !reconnect {
             output.write_event(
                 cx,
@@ -737,7 +729,7 @@ where
             )?;
             reconnect_ack_pending = false;
         }
-        if reconcile_task_snapshot(cx, output, &latest_task, &task, &mut updates, max_events)? {
+        if reconcile_task_snapshot(cx, &output, &latest_task, &task, &mut updates, max_events)? {
             return Ok(());
         }
         latest_task = task;
@@ -748,10 +740,8 @@ where
                 ));
             }
             reconnects += 1;
-            budget.remaining()?;
-            client
-                .open_final_task_subscription_listener(cx, filter.clone())
-                .await
+            clock.until(cx, &latest_task, client.open_final_task_subscription_listener(cx, filter.clone()))
+                .await?
                 .map_err(|error| {
                     operation_failure(error, "WebSocket Task watch could not resume")
                 })?;
@@ -841,6 +831,53 @@ mod tests {
                 assert_eq!(request.method, method);
                 assert_eq!(request.id, Some(RequestId::Number((index + 1) as i64)));
             }
+        });
+    }
+
+    #[test]
+    fn websocket_task_watch_idle_listener_expires_before_command_timeout() {
+        build_cli_runtime().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let (client_io, peer_io) = VirtualTcpStream::pair(
+                "127.0.0.1:45251".parse().unwrap(),
+                "127.0.0.1:45252".parse().unwrap(),
+            );
+            let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+            let discovery = json!({"jsonrpc":"2.0","id":1,"result":{
+                "resultType":"complete","supportedVersions":["2026-07-28"],
+                "capabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},
+                "ttlMs":0,"cacheScope":"private"
+            }});
+            peer.send(&cx, &serde_json::from_value(discovery).unwrap()).await.unwrap();
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
+                .await.unwrap();
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut initial = task(&now, "live", false);
+            initial["createdAt"] = json!(now);
+            initial["ttlMs"] = json!(1500);
+            peer.send(&cx, &serde_json::from_value(task_response(2, &initial)).unwrap()).await.unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let mut handle = client.attach_final_task(
+                &cx, &cancellation, fastmcp_protocol::FinalTaskId::parse("cli-watch-task").unwrap(),
+            ).await.unwrap();
+            let budget = TaskCommandBudget {
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(8),
+            };
+            let output = TaskOutput { json: true, budget };
+            // Keep the socket open without acknowledging the listener.
+            let result = asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(5),
+                Box::pin(watch_task(&cx, &mut client, &output, budget, &mut handle, 1, false, &cancellation)),
+            ).await.expect("finite retention must interrupt idle WebSocket ingress");
+            assert!(result.unwrap_err().message.contains("retention expired"));
+            for expected in ["server/discover", "tasks/get", "subscriptions/listen"] {
+                let message = asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(1),
+                    Box::pin(peer.recv(&cx))).await.unwrap().unwrap();
+                let JsonRpcMessage::Request(request) = message else { panic!("expected request") };
+                assert_eq!(request.method, expected);
+            }
+            client.close(&cx).await.unwrap();
         });
     }
 

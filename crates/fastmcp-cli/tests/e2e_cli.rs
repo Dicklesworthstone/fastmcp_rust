@@ -5381,6 +5381,7 @@ mode, task_id, log_path, transport, ready_path = sys.argv[1:]
 poll_ms = 5000 if mode == "working" else 80
 called_at = None
 reads = 0
+retention_created = None
 raw_result = r'{"content":[{"type":"text","text":"done"}],"isError":false,"com.example\/number":1.20e+4,"com.example/big":9007199254740993,"_meta":{"com.example/result":"preserved"}}'
 
 def task(status, result_type):
@@ -5410,8 +5411,17 @@ def task(status, result_type):
         encoded = encoded[:-1] + ',"result":' + result + "}"
     return encoded
 
+def extended_terminal(subscription_id):
+    from datetime import datetime, timezone
+    fields = json.loads(task("completed", "complete"))
+    del fields["resultType"]
+    fields["createdAt"] = retention_created
+    fields["lastUpdatedAt"] = datetime.now(timezone.utc).isoformat()
+    fields["_meta"] = {"io.modelcontextprotocol/subscriptionId": subscription_id}
+    return json.dumps({"jsonrpc":"2.0", "method":"notifications/tasks", "params":fields})
+
 def respond(request):
-    global called_at, reads
+    global called_at, reads, retention_created
     method = request["method"]
     event = {"request": request, "pid": os.getpid()}
     if called_at is not None:
@@ -5444,6 +5454,8 @@ def respond(request):
         meta = {"io.modelcontextprotocol/subscriptionId": request["id"]}
         ack = {"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
                "params": {"_meta": meta, "notifications": {"taskIds": [task_id]}}}
+        if mode.startswith("listen_retention_"):
+            return [json.dumps(ack)]
         duplicate = json.loads(task("working", "complete"))
         del duplicate["resultType"]
         duplicate["_meta"] = meta
@@ -5465,6 +5477,21 @@ def respond(request):
         assert request["params"]["taskId"] == task_id
         reads += 1
         result = task("completed" if reads == 3 else "working", "complete")
+        if mode.startswith("listen_retention_"):
+            if mode == "listen_retention_initial":
+                result = task("completed", "complete").replace('"ttlMs":null', '"ttlMs":1')
+                result = result.replace("2026-11-16", "2020-01-01")
+            elif mode == "listen_retention_shortened":
+                result = result.replace("2026-11-16", "2020-01-01")
+                if reads == 2:
+                    result = result.replace('"ttlMs":null', '"ttlMs":1')
+            else:
+                from datetime import datetime, timezone
+                if retention_created is None:
+                    retention_created = datetime.now(timezone.utc).isoformat()
+                if reads == 1 or mode != "listen_retention_extend":
+                    result = result.replace('"ttlMs":null', '"ttlMs":1500')
+                result = result.replace("2026-11-16T00:00:00Z", retention_created)
         if mode == "listen_replaced_read" and reads == 2:
             result = result.replace('"createdAt":"2026-11-16', '"createdAt":"2026-11-15')
             result = result.replace('public', 'unconfirmed queued state')
@@ -5503,6 +5530,12 @@ if transport == "stdio":
         if "id" in request:
             response = respond(request)
             print("\n".join(response) if isinstance(response, list) else response, flush=True)
+            if mode == "listen_retention_extend":
+                if request["method"] == "subscriptions/listen":
+                    subscription_id = request["id"]
+                if request["method"] == "tasks/get" and reads == 2:
+                    time.sleep(1.75)
+                    print(extended_terminal(subscription_id), flush=True)
         else:
             with open(log_path, "a", encoding="utf-8") as output:
                 output.write(json.dumps({"notification": request, "pid": os.getpid()}) + "\n")
@@ -5521,6 +5554,23 @@ else:
             payload = response.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream" if stream else "application/json")
+            if stream and mode.startswith("listen_retention_"):
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                self.wfile.write(("%x\r\n" % len(payload)).encode() + payload + b"\r\n")
+                self.wfile.flush()
+                if mode == "listen_retention_extend":
+                    # The read after acknowledgement removes the finite TTL.
+                    # Send completion strictly after the original TTL elapsed.
+                    until = time.monotonic() + 4
+                    while reads < 2 and time.monotonic() < until:
+                        time.sleep(0.01)
+                    time.sleep(1.75)
+                    terminal = ("data: " + extended_terminal(request["id"]) + "\n\n").encode()
+                    self.wfile.write(("%x\r\n" % len(terminal)).encode() + terminal + b"\r\n")
+                    self.wfile.flush()
+                time.sleep(10)
+                return
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Connection", "close")
             self.end_headers()
@@ -5528,7 +5578,8 @@ else:
             self.close_connection = True
         def log_message(self, *args):
             pass
-    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    server_type = http.server.ThreadingHTTPServer if mode.startswith("listen_retention_") else http.server.HTTPServer
+    server = server_type(("127.0.0.1", 0), Handler)
     with open(ready_path, "w", encoding="utf-8") as ready:
         ready.write("http://127.0.0.1:" + str(server.server_port) + "/mcp")
     server.serve_forever()
@@ -5552,7 +5603,13 @@ else:
         if mode.starts_with("poll_") {
             command.args(["tasks", "watch", task_id, "--poll", "--timeout", "5"]);
         } else if mode.starts_with("listen_") {
-            command.args(["tasks", "watch", task_id, "--max-events", "1", "--timeout", "5"]);
+            let bound = if mode == "listen_retention_extend" { "2" } else { "1" };
+            let timeout = match mode {
+                "listen_stale" => "900",
+                "listen_equal" => "301",
+                _ => "5",
+            };
+            command.args(["tasks", "watch", task_id, "--max-events", bound, "--timeout", timeout]);
         } else {
             command.args([
                 "call",
@@ -5666,6 +5723,52 @@ else:
                 "no obsolete task request hint"
             );
             assert!(params.get("ttlMs").is_none(), "no undeclared creation TTL");
+        }
+    }
+
+    #[test]
+    fn tasks_watch_listener_accepts_authoritative_extension_past_initial_expiry() {
+        for http in [false, true] {
+            let (output, _) = call("listen_retention_extend", http, true, &[]);
+            assert!(output.status.success(), "http={http}: {output:?}");
+            let docs = documents(&output);
+            assert_eq!(docs.len(), 5);
+            assert_eq!(docs[0]["data"]["ttlMs"], 1500);
+            assert_eq!(docs[1]["event"], "watch-acknowledged");
+            assert_eq!(docs[2]["event"], "task-updated");
+            assert!(docs[2]["data"]["ttlMs"].is_null());
+            assert_eq!(docs[3]["data"]["status"], "completed");
+            assert_eq!(docs[4]["data"], json!({"reason":"task-terminal","updates":2}));
+        }
+    }
+
+    #[test]
+    fn tasks_watch_listener_enforces_retention_before_output_and_while_idle() {
+        for http in [false, true] {
+            for mode in [
+                "listen_retention_initial",
+                "listen_retention_shortened",
+                "listen_retention_idle",
+            ] {
+                let (output, events) = call(mode, http, true, &[]);
+                assert!(!output.status.success(), "{mode} http={http}");
+                assert!(
+                    stderr_str(&output).contains("retention expired"),
+                    "{mode} http={http}: {output:?}"
+                );
+                let docs = documents(&output);
+                let gets = events.iter().filter(|event| event["request"]["method"] == "tasks/get").count();
+                if mode == "listen_retention_initial" {
+                    assert!(docs.is_empty());
+                    assert_eq!(gets, 1);
+                    assert!(!events.iter().any(|e| e["request"]["method"] == "subscriptions/listen"));
+                } else {
+                    assert_eq!(docs.len(), 2);
+                    assert_eq!(docs[0]["event"], "snapshot");
+                    assert_eq!(docs[1]["event"], "watch-acknowledged");
+                    assert_eq!(gets, 2);
+                }
+            }
         }
     }
 

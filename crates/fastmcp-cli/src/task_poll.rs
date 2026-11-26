@@ -1,4 +1,4 @@
-//! Read-only observation when the operator selects polling instead of a listener.
+//! Retention-aware Task observation and read-only polling.
 
 use std::time::{Duration, Instant};
 
@@ -29,13 +29,13 @@ fn interval(task: &Task) -> McpResult<Duration> {
     })
 }
 
-struct PollClock {
+pub(super) struct WatchClock {
     command: TaskCommandBudget,
     last_tick: Instant,
     last_wall: i128,
 }
 
-impl PollClock {
+impl WatchClock {
     fn new(command: TaskCommandBudget) -> Self {
         Self {
             command,
@@ -46,7 +46,7 @@ impl PollClock {
 
     // Keep the original command deadline. A backward civil-clock adjustment
     // must never extend the Task's lifetime; a forward adjustment can shorten it.
-    fn remaining(&mut self, cx: &Cx, task: &Task) -> McpResult<Duration> {
+    pub(super) fn remaining(&mut self, cx: &Cx, task: &Task) -> McpResult<Duration> {
         cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
         let remaining = self.command.remaining()?;
         let tick = Instant::now();
@@ -67,7 +67,7 @@ impl PollClock {
             .map_or(remaining, |ns| remaining.min(Duration::from_nanos(ns))))
     }
 
-    fn accept(&mut self, cx: &Cx, previous: &Task, next: &Task) -> McpResult<()> {
+    pub(super) fn accept(&mut self, cx: &Cx, previous: &Task, next: &Task) -> McpResult<()> {
         self.remaining(cx, previous)?;
         if previous.base().task_id != next.base().task_id || created(previous)? != created(next)? {
             return Err(McpError::invalid_request("task watch returned a different task identity"));
@@ -75,22 +75,52 @@ impl PollClock {
         self.remaining(cx, next)?;
         Ok(())
     }
+
+    /// Interrupt silent I/O at the retention deadline. With no finite TTL,
+    /// preserve the caller's existing command timeout and driverless stdio path.
+    pub(super) async fn until<T>(
+        &mut self,
+        cx: &Cx,
+        task: &Task,
+        work: impl std::future::Future<Output = T>,
+    ) -> McpResult<T> {
+        let remaining = self.remaining(cx, task)?;
+        if task.base().ttl_ms.is_none() {
+            let result = work.await;
+            self.remaining(cx, task)?;
+            return Ok(result);
+        }
+        let result = asupersync::time::timeout(cx.now(), remaining, Box::pin(work)).await;
+        self.remaining(cx, task)?;
+        result.map_err(|_| McpError::invalid_request("Task retention expired during observation"))
+    }
+
+    pub(super) fn output(&mut self, cx: &Cx, task: &Task, output: &TaskOutput) -> McpResult<TaskOutput> {
+        let start = Instant::now();
+        let remaining = self.remaining(cx, task)?;
+        Ok(TaskOutput {
+            json: output.json,
+            budget: TaskCommandBudget {
+                deadline: self.command.deadline.min(start + remaining),
+            },
+        })
+    }
 }
 
 /// Keep one clock across the initial output and every later read. Entering
 /// with a terminal snapshot still checks its identity and finite retention.
-fn start(
+pub(super) fn start(
     cx: &Cx,
     output: &TaskOutput,
     budget: TaskCommandBudget,
     expected: &fastmcp_protocol::FinalTaskId,
     task: &Task,
-) -> McpResult<Option<PollClock>> {
-    let mut clock = PollClock::new(budget);
+) -> McpResult<Option<WatchClock>> {
+    let mut clock = WatchClock::new(budget);
     if &task.base().task_id != expected {
         return Err(McpError::invalid_request("task watch returned a different task identity"));
     }
-    clock.remaining(cx, task)?;
+    let output = clock.output(cx, task, output)?;
     output.write_event(cx, "snapshot", task)?;
     if super::is_terminal_task_status(task.base().status) {
         output.write_event(cx, "watch-ended", &serde_json::json!({"reason":"task-terminal","updates":0}))?;
@@ -125,7 +155,8 @@ pub(super) async fn watch(
         clock.remaining(cx, &latest)?;
         let next = result.map_err(|_| McpError::internal_error("task watch read exceeded its observation deadline"))??;
         clock.accept(cx, &latest, &next)?;
-        if reconcile_task_snapshot(cx, output, &latest, &next, &mut updates, max_events)? {
+        let event_output = clock.output(cx, &next, output)?;
+        if reconcile_task_snapshot(cx, &event_output, &latest, &next, &mut updates, max_events)? {
             return Ok(());
         }
         latest = next;
@@ -152,7 +183,8 @@ pub(super) fn watch_sync(
         super::wait_for_task_poll_delay_sync(cx, budget, delay)?;
         let next = read(clock.remaining(cx, &latest)?)?;
         clock.accept(cx, &latest, &next)?;
-        if reconcile_task_snapshot(cx, output, &latest, &next, &mut updates, max_events)? {
+        let event_output = clock.output(cx, &next, output)?;
+        if reconcile_task_snapshot(cx, &event_output, &latest, &next, &mut updates, max_events)? {
             return Ok(());
         }
         latest = next;
@@ -178,7 +210,7 @@ mod tests {
                 wire["createdAt"] = serde_json::json!("2090-01-01T02:00:00.123456789+02:00");
                 wire["ttlMs"] = replacement;
                 let next: Task = serde_json::from_value(wire).unwrap();
-                let mut clock = PollClock::new(TaskCommandBudget {
+                let mut clock = WatchClock::new(TaskCommandBudget {
                     deadline: Instant::now() + Duration::from_secs(10),
                 });
                 clock.last_wall = start + 500_000_000;
