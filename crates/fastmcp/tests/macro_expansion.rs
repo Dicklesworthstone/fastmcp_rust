@@ -6124,6 +6124,64 @@ mod internally_tagged_newtypes {
         Finished,
     }
 
+    type TextKey = ::std::string::String;
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct AliasedFlattenedKeys {
+        #[serde(flatten)]
+        values: HashMap<TextKey, bool>,
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    #[serde(tag = "kind")]
+    enum GenericMapKeys<String: Ord + 'static> {
+        Generic(BTreeMap<String, bool>),
+        Qualified(HashMap<::std::string::String, bool>),
+        Aliased(BTreeMap<TextKey, bool>),
+    }
+
+    mod numeric_keys {
+        pub type String = u32;
+    }
+
+    #[derive(serde::Deserialize, JsonSchema)]
+    struct ShadowedFlattenedKeys {
+        #[serde(flatten)]
+        _values: BTreeMap<numeric_keys::String, bool>,
+    }
+
+    #[test]
+    fn json_schema_map_keys_follow_rust_type_identity_for_flatten_and_internal_tags() {
+        let flattened = fastmcp_rust::schema::admit_final_schema(
+            AliasedFlattenedKeys::try_json_schema().unwrap(),
+        )
+        .unwrap();
+        assert_round_trip::<AliasedFlattenedKeys>(&flattened, json!({"abc":true}));
+
+        let tagged = fastmcp_rust::schema::admit_final_schema(
+            GenericMapKeys::<TextKey>::try_json_schema().unwrap(),
+        )
+        .unwrap();
+        for variant in ["Generic", "Qualified", "Aliased"] {
+            assert_round_trip::<GenericMapKeys<TextKey>>(
+                &tagged,
+                json!({"kind":variant,"abc":true}),
+            );
+        }
+
+        for error in [
+            GenericMapKeys::<u32>::try_json_schema().unwrap_err(),
+            ShadowedFlattenedKeys::try_json_schema().unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("require String keys"), "{error}");
+        }
+        assert!(
+            serde_json::from_value::<GenericMapKeys<u32>>(json!({"kind":"Generic","abc":true}))
+                .is_err()
+        );
+        assert!(serde_json::from_value::<ShadowedFlattenedKeys>(json!({"abc":true})).is_err());
+    }
+
     fn assert_round_trip<T>(schema: &fastmcp_rust::schema::AdmittedSchema, value: serde_json::Value)
     where
         T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,

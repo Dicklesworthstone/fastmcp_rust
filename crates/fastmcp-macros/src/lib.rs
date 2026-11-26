@@ -6742,7 +6742,8 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Enum schemas follow Serde's external, internal (`tag`), adjacent (`tag` and
 /// `content`), and `untagged` representations. Internal tagging supports named
 /// and unit variants, plus newtypes containing a derived named object or a
-/// String-keyed map. Closed object payloads retain their unknown-field policy.
+/// String-keyed map. Key aliases and generic instantiations resolve to their
+/// actual Rust type. Closed object payloads retain their unknown-field policy.
 /// Map and catch-all payloads validate every additional member using the map's
 /// value schema. The discriminator is reserved. Root resources, applicators,
 /// and unsupported payload shapes require an explicit schema or adjacent
@@ -7511,7 +7512,7 @@ fn schema_field_name(
 
 enum SchemaFlattenType<'a> {
     Object(&'a Type),
-    MapValue(&'a Type),
+    Map { key: &'a Type, value: &'a Type },
 }
 
 /// The catch-all profile is deliberately syntactic: a named alias is an object
@@ -7554,13 +7555,8 @@ fn schema_flatten_type(ty: &Type) -> syn::Result<SchemaFlattenType<'_>> {
                     syn::GenericArgument::Type(inner) => Some(inner),
                     _ => None,
                 });
-                if let (Some(Type::Path(key)), Some(value)) = (types.next(), types.next())
-                    && key.qself.is_none()
-                    && key.path.segments.last().is_some_and(|part| {
-                        part.ident == "String" && matches!(part.arguments, syn::PathArguments::None)
-                    })
-                {
-                    return Ok(SchemaFlattenType::MapValue(value));
+                if let (Some(key), Some(value)) = (types.next(), types.next()) {
+                    return Ok(SchemaFlattenType::Map { key, value });
                 }
             }
             Err(syn::Error::new_spanned(
@@ -7632,11 +7628,13 @@ fn generate_fields_schema(
                         SchemaFlattenType::Object(ty) => flattened_fields.push(quote! {
                             object.flatten::<#ty>(__fastmcp_schema_context);
                         }),
-                        SchemaFlattenType::MapValue(ty) => {
+                        SchemaFlattenType::Map { key, value } => {
                             catch_all_seen = true;
-                            let schema = type_to_json_schema(ty, generic_params);
+                            let schema = type_to_json_schema(value, generic_params);
                             flattened_fields.push(quote! {
-                                let value_schema = #schema;
+                                let value_schema = __fastmcp_schema_context.string_map_value_schema::<#key>(
+                                    |__fastmcp_schema_context| #schema,
+                                );
                                 object.catch_all(__fastmcp_schema_context, value_schema);
                             });
                         }
@@ -8064,10 +8062,12 @@ fn generate_enum_variant_schema(
                             __fastmcp_schema_context, #tag, #name,
                         )
                     }),
-                    Ok(SchemaFlattenType::MapValue(value_ty)) => {
-                        let value_schema = type_to_json_schema(value_ty, generic_params);
+                    Ok(SchemaFlattenType::Map { key, value }) => {
+                        let schema = type_to_json_schema(value, generic_params);
                         Ok(quote! {{
-                            let value_schema = #value_schema;
+                            let value_schema = __fastmcp_schema_context.string_map_value_schema::<#key>(
+                                |__fastmcp_schema_context| #schema,
+                            );
                             fastmcp_protocol::schema::FlattenedObjectSchema::internally_tagged_map(
                                 __fastmcp_schema_context, #tag, #name, value_schema,
                             )
@@ -8766,7 +8766,7 @@ mod serde_schema_tests {
                 "no property name to rename",
             ),
             (
-                syn::parse_quote! { struct Invalid { #[serde(flatten)] value: BTreeMap<u32, String> } },
+                syn::parse_quote! { struct Invalid { #[serde(flatten)] value: BTreeMap<String> } },
                 "require String keys",
             ),
             (
@@ -8908,7 +8908,7 @@ mod serde_schema_tests {
                 "require a derived named-object payload",
             ),
             (
-                syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Value(BTreeMap<u32, u8>) } },
+                syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Value(BTreeMap<String>) } },
                 "require a derived named-object payload",
             ),
             (

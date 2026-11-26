@@ -284,6 +284,26 @@ impl FlattenedObjectSchema {
 }
 
 impl SchemaGenerator {
+    /// Resolves flattened and tagged map keys after aliases and generics have
+    /// been substituted. The supported map profile requires the standard String type.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn string_map_value_schema<K: 'static>(
+        &mut self,
+        value_schema: impl FnOnce(&mut Self) -> Value,
+    ) -> Value {
+        if TypeId::of::<K>() != TypeId::of::<String>() {
+            self.reject_flatten(
+                "$",
+                "flattened and internally tagged maps require String keys; implement json_schema() explicitly for other key types",
+            );
+        }
+        if self.error.is_some() {
+            return Value::Bool(false);
+        }
+        value_schema(self)
+    }
+
     fn reject_flatten(&mut self, property: &str, reason: &'static str) {
         if self.error.is_none() {
             self.error = Some(SchemaGenerationError::InvalidSchema(
