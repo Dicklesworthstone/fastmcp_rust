@@ -232,13 +232,10 @@ impl WorkerAuthority {
         }
     }
 
-    /// A current policy decision is separate from the backend's atomic fence.
-    /// Policy callbacks are bounded and synchronous by their public contract.
-    fn authorize_worker(
-        &self,
-        ctx: &McpContext,
-        metadata: &FinalTaskAccessMetadata,
-    ) -> McpResult<()> {
+    /// Bounds an outstanding metadata read without evaluating policy on the
+    /// original claim's potentially stale record generation. Policy callbacks
+    /// and payload reads wait for the current continuity proof.
+    fn checkpoint_worker(&self, ctx: &McpContext) -> McpResult<()> {
         if self.application_closed.load(TaskServiceOrdering::Acquire) {
             return Err(McpError::request_cancelled());
         }
@@ -253,6 +250,29 @@ impl WorkerAuthority {
         {
             return Err(McpError::request_cancelled());
         }
+        if self.execution_revoked.load(TaskServiceOrdering::Acquire) {
+            return Err(authorization::task_execution_denied());
+        }
+        if self
+            .execution_authorization
+            .original_operation()
+            .is_some_and(|operation| !operation.is_registered())
+        {
+            self.execution_revoked
+                .store(true, TaskServiceOrdering::Release);
+            return Err(authorization::task_execution_denied());
+        }
+        Ok(())
+    }
+
+    /// A current policy decision is separate from the backend's atomic fence.
+    /// Policy callbacks are bounded and synchronous by their public contract.
+    fn authorize_worker(
+        &self,
+        ctx: &McpContext,
+        metadata: &FinalTaskAccessMetadata,
+    ) -> McpResult<()> {
+        self.checkpoint_worker(ctx)?;
         if metadata.task_id() != &self.task_id
             || metadata.generation() < self.generation
             || metadata.creation_generation() != self.execution_authorization.creation_generation()
@@ -262,15 +282,15 @@ impl WorkerAuthority {
         {
             return Err(stale_final_task_handoff_error());
         }
-        if self.execution_revoked.load(TaskServiceOrdering::Acquire) {
-            return Err(authorization::task_execution_denied());
-        }
         if self.runtime.authorize_task_execution(metadata).is_err() {
             self.execution_revoked
                 .store(true, TaskServiceOrdering::Release);
             return Err(authorization::task_execution_denied());
         }
-        ctx.ensure_live().map_err(|_| McpError::request_cancelled())
+        // Policy is application code: returning success cannot extend the
+        // attempt if it also closes the worker, cancels its caller, revokes its
+        // registration or advances the backend clock beyond the original bound.
+        self.checkpoint_worker(ctx)
     }
 
     fn wait_deadline(&self, ctx: &McpContext) -> asupersync::Time {
@@ -289,7 +309,7 @@ impl WorkerAuthority {
     }
 
     async fn load_worker_metadata(&self, ctx: &McpContext) -> McpResult<FinalTaskAccessMetadata> {
-        self.authorize_worker(ctx, &self.execution_authorization)?;
+        self.checkpoint_worker(ctx)?;
         let continuity = await_worker_read(
             ctx,
             self.wait_deadline(ctx),
@@ -300,7 +320,7 @@ impl WorkerAuthority {
                 &self.owner_id,
                 self.dispatch_fence,
             ),
-            || self.authorize_worker(ctx, &self.execution_authorization),
+            || self.checkpoint_worker(ctx),
         )
         .await?;
         if let Some(metadata) = continuity {
@@ -316,7 +336,7 @@ impl WorkerAuthority {
             self.runtime
                 .store
                 .get_task_access_metadata_with_context(ctx, &self.task_id),
-            || self.authorize_worker(ctx, &self.execution_authorization),
+            || self.checkpoint_worker(ctx),
         )
         .await?;
         let metadata = match metadata {
@@ -491,7 +511,7 @@ impl FinalTaskHandoffAuthority {
         })
     }
 
-    fn cancellation_requested_with_cx<'a>(
+    pub(super) fn cancellation_requested_with_cx<'a>(
         &'a self,
         cx: &'a Cx,
     ) -> impl Future<Output = McpResult<bool>> + Send + 'a {

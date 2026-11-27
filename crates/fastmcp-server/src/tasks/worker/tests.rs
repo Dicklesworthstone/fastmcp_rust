@@ -60,6 +60,7 @@ struct AsyncWorkerStore {
     before_write: Mutex<Option<Hook>>,
     after_write: Mutex<Option<Hook>>,
     substituted_receipt: Mutex<Option<FinalTaskSnapshot>>,
+    substituted_metadata: Mutex<Option<FinalTaskAccessMetadata>>,
     error_after_write: AtomicBool,
     omit_metadata: AtomicBool,
     forbid_sync: AtomicBool,
@@ -82,6 +83,7 @@ impl AsyncWorkerStore {
             before_write: Mutex::new(None),
             after_write: Mutex::new(None),
             substituted_receipt: Mutex::new(None),
+            substituted_metadata: Mutex::new(None),
             error_after_write: AtomicBool::new(false),
             omit_metadata: AtomicBool::new(false),
             forbid_sync: AtomicBool::new(false),
@@ -248,6 +250,9 @@ impl FinalTaskStore for AsyncWorkerStore {
     ) -> FinalTaskStoreFuture<'a, Option<FinalTaskAccessMetadata>> {
         Box::pin(async move {
             self.read(ctx, task_id).await;
+            if let Some(metadata) = self.substituted_metadata.lock().unwrap().take() {
+                return Ok(Some(metadata));
+            }
             if self.omit_metadata.load(TaskServiceOrdering::SeqCst) {
                 Ok(None)
             } else {
@@ -508,6 +513,33 @@ impl TaskExecutionAuthorizer for CurrentPolicy {
             Ok(())
         } else {
             Err(McpError::invalid_request("worker grant was revoked"))
+        }
+    }
+}
+
+struct GenerationPolicy {
+    minimum: u64,
+    allowed: AtomicBool,
+    observed: Mutex<Vec<u64>>,
+}
+
+impl GenerationPolicy {
+    fn new(minimum: u64) -> Self {
+        Self {
+            minimum,
+            allowed: AtomicBool::new(true),
+            observed: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl TaskExecutionAuthorizer for GenerationPolicy {
+    fn authorize(&self, metadata: &FinalTaskAccessMetadata) -> McpResult<()> {
+        self.observed.lock().unwrap().push(metadata.generation());
+        if self.allowed.load(TaskServiceOrdering::SeqCst) && metadata.generation() >= self.minimum {
+            Ok(())
+        } else {
+            Err(McpError::invalid_request("worker generation is not authorized"))
         }
     }
 }
@@ -1353,5 +1385,202 @@ fn async_worker_anonymous_cancellation_rejects_a_successor_after_pending_read() 
         assert_eq!(store.committed.load(TaskServiceOrdering::SeqCst), 0);
         assert_eq!(store.synchronous_calls.load(TaskServiceOrdering::SeqCst), 0);
         assert!(fixture.notifications.lock().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn async_worker_continuity_policy_uses_current_status_generation() {
+    with_runtime(async {
+        let cx = Cx::current().unwrap();
+        for resumed in [false, true] {
+            let mut fixture = Fixture::new(resumed);
+            let claimed = fixture.snapshot().generation();
+            let _async_only = fixture.store.asynchronous_only();
+            update(&mut fixture.handoff, &cx, "current invocation")
+                .await
+                .unwrap();
+            let current = fixture.snapshot().generation();
+            assert!(current > claimed);
+            let policy = Arc::new(GenerationPolicy::new(current));
+            fixture
+                .runtime
+                .install_execution_authorizer(policy.clone())
+                .unwrap();
+            fixture.store.pause_reads_for(&fixture.task_id);
+            let reads = fixture.store.reads.load(TaskServiceOrdering::SeqCst);
+            let mut pending = Box::pin(cancellation_requested(&fixture.handoff, &cx));
+
+            // The valid status update keeps the same elected invocation. Until
+            // its continuity proof arrives, the original generation must not
+            // become input to a policy that now requires the current record.
+            assert!(poll_once(pending.as_mut()).is_pending());
+            assert!(poll_once(pending.as_mut()).is_pending());
+            assert!(policy.observed.lock().unwrap().is_empty());
+            assert_eq!(
+                fixture.store.reads.load(TaskServiceOrdering::SeqCst),
+                reads + 1
+            );
+            assert!(!fixture
+                .guard
+                .as_ref()
+                .unwrap()
+                .execution_revoked
+                .load(TaskServiceOrdering::Acquire));
+
+            fixture.store.read_gate.release();
+            assert!(!ready(poll_once(pending.as_mut())).unwrap());
+            drop(pending);
+            assert!(matches!(
+                complete(&fixture.handoff, &cx).await.unwrap(),
+                FinalTask::Completed { .. }
+            ));
+            let observed = policy.observed.lock().unwrap();
+            assert!(!observed.is_empty());
+            // Publication sees the completion's newer generation as well.
+            assert!(observed.iter().all(|generation| *generation >= current));
+            assert_eq!(fixture.store.committed.load(TaskServiceOrdering::SeqCst), 2);
+            assert_eq!(fixture.notifications.lock().unwrap().len(), 2);
+            assert_eq!(
+                fixture.store.synchronous_calls.load(TaskServiceOrdering::SeqCst),
+                0
+            );
+        }
+    });
+}
+
+#[test]
+fn async_worker_continuity_rejects_changed_identity_and_revoked_policy() {
+    with_runtime(async {
+        let cx = Cx::current().unwrap();
+        for resumed in [false, true] {
+            for substitute in [false, true] {
+                let mut fixture = Fixture::new(resumed);
+                let _async_only = fixture.store.asynchronous_only();
+                update(&mut fixture.handoff, &cx, "current invocation")
+                    .await
+                    .unwrap();
+                let current = fixture.snapshot();
+                let policy = Arc::new(GenerationPolicy::new(current.generation()));
+                fixture
+                    .runtime
+                    .install_execution_authorizer(policy.clone())
+                    .unwrap();
+                let before = fixture.retained_facts();
+                let notifications = fixture.notifications.lock().unwrap().len();
+                let reads = fixture.store.reads.load(TaskServiceOrdering::SeqCst);
+                fixture.store.pause_reads_for(&fixture.task_id);
+                let mut pending = Box::pin(complete(&fixture.handoff, &cx));
+                assert!(poll_once(pending.as_mut()).is_pending());
+                assert!(policy.observed.lock().unwrap().is_empty());
+
+                if substitute {
+                    // Differ only in principal: a returned current generation
+                    // cannot lend another identity to the original claim.
+                    *fixture.store.substituted_metadata.lock().unwrap() =
+                        Some(FinalTaskAccessMetadata::new(
+                            fixture.task_id.clone(),
+                            current.generation(),
+                            current.creation_generation(),
+                            Some(Sha256Digest::from_bytes([99; 32])),
+                            current.original_operation().cloned(),
+                        ));
+                } else {
+                    policy.allowed.store(false, TaskServiceOrdering::SeqCst);
+                }
+                fixture.store.read_gate.release();
+                assert!(ready(poll_once(pending.as_mut())).is_err());
+                drop(pending);
+
+                assert_eq!(fixture.retained_facts(), before);
+                assert_eq!(fixture.notifications.lock().unwrap().len(), notifications);
+                assert_eq!(fixture.store.transitions.load(TaskServiceOrdering::SeqCst), 0);
+                assert_eq!(fixture.store.committed.load(TaskServiceOrdering::SeqCst), 1);
+                // Rejection precedes the payload read and provider factory.
+                assert_eq!(
+                    fixture.store.reads.load(TaskServiceOrdering::SeqCst),
+                    reads + 1
+                );
+                let observed = policy.observed.lock().unwrap();
+                if substitute {
+                    assert!(observed.is_empty());
+                } else {
+                    assert_eq!(*observed, vec![current.generation()]);
+                }
+                assert_eq!(
+                    fixture
+                        .guard
+                        .as_ref()
+                        .unwrap()
+                        .execution_revoked
+                        .load(TaskServiceOrdering::Acquire),
+                    !substitute
+                );
+                assert_eq!(
+                    fixture.store.synchronous_calls.load(TaskServiceOrdering::SeqCst),
+                    0
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn async_worker_pending_continuity_checks_local_lifetime_without_policy() {
+    with_runtime(async {
+        let cx = Cx::current().unwrap();
+        for resumed in [false, true] {
+            for loss in ["application", "execution", "registration"] {
+                let mut fixture = Fixture::new(resumed);
+                let policy = Arc::new(GenerationPolicy::new(fixture.snapshot().generation()));
+                fixture
+                    .runtime
+                    .install_execution_authorizer(policy.clone())
+                    .unwrap();
+                let before = fixture.retained_facts();
+                let reads = fixture.store.reads.load(TaskServiceOrdering::SeqCst);
+                fixture.store.pause_reads_for(&fixture.task_id);
+                let _async_only = fixture.store.asynchronous_only();
+                let mut pending = Box::pin(complete(&fixture.handoff, &cx));
+                assert!(poll_once(pending.as_mut()).is_pending());
+                assert!(policy.observed.lock().unwrap().is_empty());
+
+                match loss {
+                    "application" => fixture
+                        .guard
+                        .as_ref()
+                        .unwrap()
+                        .pending_write
+                        .application_closed
+                        .store(true, TaskServiceOrdering::Release),
+                    "execution" => fixture
+                        .guard
+                        .as_ref()
+                        .unwrap()
+                        .execution_revoked
+                        .store(true, TaskServiceOrdering::Release),
+                    "registration" => {
+                        drop(std::mem::replace(&mut fixture._registration, Arc::new(())));
+                    }
+                    _ => unreachable!(),
+                }
+                // The provider remains silent; local terminal bounds still
+                // refuse the operation without running a stale policy callback.
+                assert!(ready(poll_once(pending.as_mut())).is_err());
+                drop(pending);
+                assert!(policy.observed.lock().unwrap().is_empty());
+                assert_eq!(fixture.retained_facts(), before);
+                assert_eq!(
+                    fixture.store.reads.load(TaskServiceOrdering::SeqCst),
+                    reads + 1
+                );
+                assert_eq!(fixture.store.transitions.load(TaskServiceOrdering::SeqCst), 0);
+                assert_eq!(fixture.store.committed.load(TaskServiceOrdering::SeqCst), 0);
+                assert!(fixture.notifications.lock().unwrap().is_empty());
+                assert_eq!(
+                    fixture.store.synchronous_calls.load(TaskServiceOrdering::SeqCst),
+                    0
+                );
+            }
+        }
     });
 }
