@@ -1189,7 +1189,9 @@ enum TaskAction {
     /// Read the current task snapshot.
     Get { task_id: String },
     /// Read a snapshot, then watch live notifications until a bound or stream end.
-    /// Observation ends at the Task's finite retention deadline or --timeout.
+    /// A clean disconnect after HTTP subscription acknowledgement triggers a fresh
+    /// snapshot and bounded reconnect. Observation ends at the Task's finite
+    /// retention deadline or --timeout.
     /// Synchronous stdio sends, file/device output and cleanup may finish afterward.
     Watch {
         task_id: String,
@@ -8939,13 +8941,31 @@ async fn run_http_task(
             let mut reconnects = 0;
             let mut reconnect_ack_pending = false;
             let mut latest_task = handle.task().clone();
+            let mut acknowledged = false;
             loop {
-                let event = clock.until(cx, &latest_task, client.next_final_task_subscription_event(cx))
-                    .await?
-                    .map_err(error)?;
+                // An acknowledged stream can close cleanly between SSE records
+                // without sending its final JSON-RPC response. Reconcile through
+                // the existing bounded reconnect path before publishing any change.
+                use fastmcp_client::HttpClientError::Connection;
+                use fastmcp_client::http_executor::ClientHttpConnectionError::SubscriptionsListen;
+                use fastmcp_client::http_executor::ModernHttpSubscriptionListenError::EndOfStream;
+
+                let event = clock
+                    .until(cx, &latest_task, client.next_final_task_subscription_event(cx))
+                    .await?;
+                let event = match event {
+                    Ok(event) => event,
+                    Err(Connection(SubscriptionsListen(EndOfStream { framing: Some(end) })))
+                        if acknowledged && !end.discarded_partial_line && !end.discarded_pending_event =>
+                    {
+                        fastmcp_client::StdioTaskSubscriptionEvent::Terminal
+                    }
+                    Err(cause) => return Err(error(cause)),
+                };
                 let reconnect = match event {
                     fastmcp_client::StdioTaskSubscriptionEvent::Acknowledged(accepted) => {
                         validate_task_watch_acknowledgement(&accepted, &task_id)?;
+                        acknowledged = true;
                         clock.output(cx, &latest_task, output)?.write_event(cx, "watch-acknowledged", &accepted)?;
                         false
                     }
@@ -9000,6 +9020,7 @@ async fn run_http_task(
                         ));
                     }
                     reconnects += 1;
+                    acknowledged = false;
                     clock.until(cx, &latest_task, client.open_final_task_subscription_listener(cx, filter.clone(), limits))
                         .await?
                         .map_err(error)?;

@@ -5457,7 +5457,9 @@ def respond(request):
         meta = {"io.modelcontextprotocol/subscriptionId": request["id"]}
         ack = {"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
                "params": {"_meta": meta, "notifications": {"taskIds": [task_id]}}}
-        if mode.startswith("listen_retention_"):
+        if mode == "listen_eof_unacknowledged":
+            return []
+        if mode.startswith("listen_retention_") or mode.startswith("listen_eof_"):
             return [json.dumps(ack)]
         duplicate = json.loads(task("working", "complete"))
         del duplicate["resultType"]
@@ -5561,6 +5563,8 @@ else:
             stream = isinstance(response, list)
             if stream:
                 response = "".join("data: " + frame + "\n\n" for frame in response)
+            if stream and mode == "listen_eof_partial":
+                response += "data: incomplete"
             payload = response.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream" if stream else "application/json")
@@ -5797,6 +5801,30 @@ else:
                     assert_eq!(docs[1]["event"], "watch-acknowledged");
                     assert_eq!(gets, 2);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn tasks_watch_http_reconciles_only_acknowledged_record_boundary_eof() {
+        for (mode, expected_reads, completed) in [
+            ("listen_eof_clean", 3, true),
+            ("listen_eof_partial", 2, false),
+            ("listen_eof_unacknowledged", 1, false),
+        ] {
+            let (output, events) = call(mode, true, true, &[]);
+            assert_eq!(output.status.success(), completed, "{mode}: {output:?}");
+            let mut expected = vec!["server/discover", "tasks/get", "subscriptions/listen"];
+            expected.extend(std::iter::repeat_n("tasks/get", expected_reads - 1));
+            assert_exchange(&events, &expected);
+            let docs = documents(&output);
+            assert_eq!(docs[0]["event"], "snapshot");
+            if completed {
+                assert_eq!(docs.len(), 4);
+                assert_eq!(docs[2]["data"]["status"], "completed");
+                assert_eq!(docs[3]["data"], json!({"reason":"task-terminal","updates":1}));
+            } else {
+                assert_eq!(docs.len(), expected_reads);
             }
         }
     }
