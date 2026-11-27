@@ -8095,6 +8095,106 @@ pub mod modern {
                 .map_err(HttpClientError::Connection)
         }
 
+        /// Calls a Tasks-capable tool and answers input rounds with the installed handlers.
+        ///
+        /// Without installed handlers, an input-required result is returned intact.
+        /// The deadline bounds the entire interaction. A received Task is returned
+        /// to the caller without automatic polling, cancellation, or tool replay.
+        #[cfg(feature = "tasks")]
+        pub async fn call_tool_outcome_with_handlers(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            sse_limits: SseLimits,
+            maximum_response_bytes: usize,
+        ) -> Result<FinalToolCallOutcome, HttpClientError> {
+            self.inner
+                .call_tool_final_outcome_with_handlers(
+                    cx,
+                    cancellation,
+                    deadline,
+                    name,
+                    arguments,
+                    sse_limits,
+                    maximum_response_bytes,
+                )
+                .await
+        }
+
+        /// Calls a Tasks-capable tool with an operation-local input responder.
+        ///
+        /// Each continuation retains the original arguments, metadata, and
+        /// negotiated capabilities and uses a fresh request ID. Complete,
+        /// input-required, and Task outcomes retain their full result envelopes.
+        #[cfg(feature = "tasks")]
+        pub async fn call_tool_outcome_with_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            sse_limits: SseLimits,
+            maximum_response_bytes: usize,
+            respond: F,
+        ) -> Result<FinalToolCallOutcome, HttpClientError>
+        where
+            F: FnMut(&crate::InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        {
+            self.inner
+                .call_tool_final_outcome_with_mrtr_retry(
+                    cx,
+                    cancellation,
+                    deadline,
+                    name,
+                    arguments,
+                    sse_limits,
+                    maximum_response_bytes,
+                    respond,
+                )
+                .await
+        }
+
+        /// Awaits input on the caller's runtime before continuing a Tasks-capable call.
+        ///
+        /// One cancellation token and absolute deadline cover transport and input
+        /// handling. Once a Task receipt is admitted, simultaneous cancellation
+        /// does not hide it; adopt the returned Task without repeating the call.
+        #[cfg(feature = "tasks")]
+        pub async fn call_tool_outcome_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            sse_limits: SseLimits,
+            maximum_response_bytes: usize,
+            respond: F,
+        ) -> Result<FinalToolCallOutcome, HttpClientError>
+        where
+            F: for<'a> FnMut(
+                &'a Cx,
+                &'a crate::InputRequiredResult,
+            ) -> crate::MrtrResponderFuture<'a>,
+        {
+            self.inner
+                .call_tool_final_outcome_with_async_mrtr_retry(
+                    cx,
+                    cancellation,
+                    deadline,
+                    name,
+                    arguments,
+                    sse_limits,
+                    maximum_response_bytes,
+                    respond,
+                )
+                .await
+        }
+
         /// Calls one Tasks-capable tool while stamping the caller's progress token.
         ///
         /// Stateless modern HTTP create still returns JSON `Task`. This method

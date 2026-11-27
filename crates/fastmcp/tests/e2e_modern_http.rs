@@ -472,6 +472,71 @@ impl ToolHandler for PublicHttpTaskTool {
     }
 }
 
+/// A tool that requires approval before it creates a Task.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+struct PublicHttpInteractiveTaskTool;
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+const PUBLIC_HTTP_INTERACTIVE_TASK_TOOL_NAME: &str = "public-http-e2e-interactive-task";
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+impl ToolHandler for PublicHttpInteractiveTaskTool {
+    fn definition(&self) -> Tool {
+        let mut definition = PublicHttpTaskTool.definition();
+        definition.name = PUBLIC_HTTP_INTERACTIVE_TASK_TOOL_NAME.to_owned();
+        definition.description = Some("Requires approval before creating a Task".to_owned());
+        definition
+    }
+
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        PublicHttpTaskTool.call(ctx, arguments)
+    }
+
+    fn declares_final_tasks(&self) -> bool {
+        true
+    }
+
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
+    fn call_final_outcome(
+        &self,
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        PublicHttpUrlElicitationTool.call_final_outcome(ctx, arguments)
+    }
+
+    fn call_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: serde_json::Value,
+        resume_inputs: Option<&'a fastmcp_rust::MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        Box::pin(async move {
+            let result = (|| {
+                let Some(inputs) = resume_inputs else {
+                    return self.call_final_outcome(ctx, arguments);
+                };
+                let approval = inputs.elicitation("approval")?.ok_or_else(|| {
+                    McpError::internal_error("Task approval was not preserved")
+                })?;
+                if approval.is_accepted() {
+                    PublicHttpTaskTool.call_final_outcome(ctx, arguments)
+                } else {
+                    public_http_url_elicitation_complete(inputs)
+                }
+            })();
+            match result {
+                Ok(outcome) => Outcome::Ok(outcome),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+}
+
 /// Keeps one created official Task live until `tasks/cancel` is honored.
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 struct PublicHttpHoldingTaskSupervisor;
@@ -5018,6 +5083,14 @@ fn e2e_public_http_prefixed_as_proxy_forwards_prefixed_tool_and_unprefixed_resou
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 fn spawn_modern_task_http_server() -> HttpServerFixture {
+    spawn_modern_task_http_server_with_middleware(false, None)
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn spawn_modern_task_http_server_with_middleware(
+    interactive_tool: bool,
+    middleware: Option<Arc<dyn Middleware>>,
+) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -5036,15 +5109,21 @@ fn spawn_modern_task_http_server() -> HttpServerFixture {
                     .expect("task HTTP server timing policy is valid"),
                 Arc::new(|_| {}),
             );
-            let server = modern::ServerBuilder::new("facade-http-task", "1.0.0")
+            let mut builder = modern::ServerBuilder::new("facade-http-task", "1.0.0")
                 .resource(PublicHttpWatchResource)
                 .tool(PublicHttpTaskTool)
                 .tool(PublicHttpTouchTool)
                 .tool(PublicHttpHideTool)
                 .final_tasks(task_runtime.clone())
                 .map_err(|error| format!("task HTTP server final_tasks install failed: {error}"))?
-                .task_supervisor(Arc::new(PublicHttpHoldingTaskSupervisor))
-                .build();
+                .task_supervisor(Arc::new(PublicHttpHoldingTaskSupervisor));
+            if interactive_tool {
+                builder = builder.tool(PublicHttpInteractiveTaskTool);
+            }
+            let server = match middleware {
+                Some(middleware) => builder.middleware(middleware).build(),
+                None => builder.build(),
+            };
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
                 Err(error) => {
@@ -10810,7 +10889,12 @@ impl Middleware for PublicHttpAsyncMrtrAudit {
     ) -> McpResult<MiddlewareDecision> {
         if matches!(
             request.method.as_str(),
-            "tools/call" | "resources/read" | "prompts/get"
+            "tools/call"
+                | "resources/read"
+                | "prompts/get"
+                | "tasks/get"
+                | "tasks/update"
+                | "tasks/cancel"
         ) {
             let mut requests = self.requests.lock().expect("request audit is not poisoned");
             assert!(requests.len() < 32, "MRTR request audit stays bounded");
@@ -10825,7 +10909,7 @@ impl Middleware for PublicHttpAsyncMrtrAudit {
         request: &JsonRpcRequest,
         mut response: serde_json::Value,
     ) -> McpResult<serde_json::Value> {
-        if response["resultType"] == "complete"
+        if matches!(response["resultType"].as_str(), Some("complete" | "task"))
             && matches!(
                 request.method.as_str(),
                 "tools/call" | "resources/read" | "prompts/get"
@@ -11234,6 +11318,227 @@ fn e2e_public_http_async_mrtr_facade_cancels_and_drops_pending_responders() {
     .expect("cancelling or dropping a responder releases the client's mutable borrow");
     assert!(matches!(outcome, FinalCoreResult::ToolsCall { .. }));
     assert_eq!(requests.lock().unwrap().len(), 4);
+    server.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+async fn invoke_public_http_tasks_mrtr<F>(
+    client: &mut modern::HttpClient,
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    respond: F,
+) -> Result<FinalToolCallOutcome, modern::HttpClientError>
+where
+    F: for<'a> FnMut(
+        &'a Cx,
+        &'a fastmcp_rust::InputRequiredResult,
+    ) -> fastmcp_rust::MrtrResponderFuture<'a>,
+{
+    client
+        .call_tool_outcome_with_async_mrtr_retry(
+            cx,
+            cancellation,
+            Instant::now() + HTTP_OPERATION_BOUND,
+            PUBLIC_HTTP_INTERACTIVE_TASK_TOOL_NAME,
+            json!({"correlation": "public-http-tasks-mrtr"}),
+            SseLimits::new(65_536, 1 << 20, 64).expect("finite response limits"),
+            1 << 20,
+            respond,
+        )
+        .await
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_tasks_mrtr_facade_preserves_the_created_receipt() {
+    let cx = public_http_caller();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = spawn_modern_task_http_server_with_middleware(
+        true,
+        Some(Arc::new(PublicHttpAsyncMrtrAudit {
+            requests: Arc::clone(&requests),
+        })),
+    );
+    let mut client = public_http_async_mrtr_client(&cx, &server);
+    let cancellation = McpRequestCancellation::new();
+    let callbacks = AtomicUsize::new(0);
+    let outcome = runtime_block_on_bounded(
+        &cx,
+        invoke_public_http_tasks_mrtr(
+            &mut client,
+            &cx,
+            &cancellation,
+            |callback_cx, input| {
+                callbacks.fetch_add(1, Ordering::SeqCst);
+                public_http_async_mrtr_answer(
+                    callback_cx,
+                    input,
+                    PublicHttpAsyncMrtrVerb::Tool.answer(),
+                )
+            },
+        ),
+    )
+    .expect("approval can be awaited before the real HTTP server creates a Task");
+    let FinalToolCallOutcome::Task(created) = outcome else {
+        panic!("approved tools/call must retain its Task receipt: {outcome:?}");
+    };
+    let task_id = created.task.base().task_id.clone();
+    let encoded = serde_json::to_value(&created).expect("the Task envelope serializes");
+    assert_eq!(encoded["resultType"], "task");
+    assert_eq!(encoded["_meta"]["example.test/async-mrtr"], "tools/call");
+    assert_eq!(encoded["asyncResponderEnvelope"], json!({"retained": true}));
+    assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+
+    {
+        let requests = requests.lock().expect("request audit is not poisoned");
+        assert_eq!(requests.len(), 2, "Task creation does not automatically poll or cancel");
+        assert!(requests.iter().all(|request| request.method == "tools/call"));
+        assert!(requests[0].id.is_some());
+        assert_ne!(requests[0].id, requests[1].id);
+        let initial = requests[0].params.as_ref().expect("initial parameters");
+        let mut continued = requests[1].params.clone().expect("continuation parameters");
+        let object = continued.as_object_mut().expect("object parameters");
+        assert!(object.remove("requestState").is_some());
+        assert_eq!(
+            object.remove("inputResponses"),
+            Some(json!(PublicHttpAsyncMrtrVerb::Tool.answer()))
+        );
+        assert_eq!(&continued, initial, "the original request survives the input round");
+        assert_eq!(initial["arguments"]["correlation"], "public-http-tasks-mrtr");
+        assert_eq!(
+            initial["_meta"][fastmcp_protocol::FINAL_LOG_LEVEL_META_KEY],
+            "notice"
+        );
+        assert_eq!(
+            initial["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]
+                ["extensions"][fastmcp_protocol::TASKS_EXTENSION],
+            json!({})
+        );
+    }
+
+    let observed = runtime_block_on_bounded(
+        &cx,
+        client.get_task(
+            &cx,
+            RequestId::String("explicit-task-observation".to_owned()),
+            task_id.clone(),
+            1 << 20,
+        ),
+    )
+    .expect("the returned receipt names the Task actually created by the hosted service");
+    assert_eq!(observed.task.base().task_id, task_id);
+    assert!(cx.checkpoint().is_ok());
+    drop(client);
+    server.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_tasks_mrtr_facade_retains_input_and_stops_before_creation() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let cx = public_http_caller();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = spawn_modern_task_http_server_with_middleware(
+        true,
+        Some(Arc::new(PublicHttpAsyncMrtrAudit {
+            requests: Arc::clone(&requests),
+        })),
+    );
+    let mut client = public_http_async_mrtr_client(&cx, &server);
+    let cancellation = McpRequestCancellation::new();
+    let outcome = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome_with_handlers(
+            &cx,
+            &cancellation,
+            Instant::now() + HTTP_OPERATION_BOUND,
+            PUBLIC_HTTP_INTERACTIVE_TASK_TOOL_NAME,
+            json!({}),
+            SseLimits::new(65_536, 1 << 20, 64).expect("finite response limits"),
+            1 << 20,
+        ),
+    )
+    .expect("without handlers, the caller retains the live input-required result");
+    let FinalToolCallOutcome::InputRequired(input) = outcome else {
+        panic!("approval must precede Task creation: {outcome:?}");
+    };
+    assert_live_input_required(&input, "approval", "Tasks facade without handlers");
+
+    for cancel in [true, false] {
+        let cancellation = McpRequestCancellation::new();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        runtime_block_on_bounded(&cx, async {
+            let responder_entered = Arc::clone(&entered);
+            let responder_dropped = Arc::clone(&dropped);
+            let mut operation = std::pin::pin!(invoke_public_http_tasks_mrtr(
+                &mut client,
+                &cx,
+                &cancellation,
+                move |callback_cx, input| {
+                    public_http_async_mrtr_pending(
+                        callback_cx,
+                        input,
+                        Arc::clone(&responder_entered),
+                        Arc::clone(&responder_dropped),
+                    )
+                },
+            ));
+            std::future::poll_fn(|task| {
+                assert!(operation.as_mut().poll(task).is_pending());
+                if entered.load(Ordering::SeqCst) == 1 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            if cancel {
+                cancellation.cancel();
+                let outcome = operation.await;
+                assert!(
+                    matches!(
+                        outcome,
+                        Err(modern::HttpClientError::CoreResult(ref error))
+                            if error.code == McpErrorCode::RequestCancelled
+                    ),
+                    "cancelling approval returns the cancellation error: {outcome:?}"
+                );
+            }
+        });
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(cx.checkpoint().is_ok());
+    }
+    assert_eq!(requests.lock().unwrap().len(), 3, "stopped approvals publish no retry");
+
+    let cancellation = McpRequestCancellation::new();
+    let complete = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome_with_mrtr_retry(
+            &cx,
+            &cancellation,
+            Instant::now() + HTTP_OPERATION_BOUND,
+            PUBLIC_HTTP_INTERACTIVE_TASK_TOOL_NAME,
+            json!({}),
+            SseLimits::new(65_536, 1 << 20, 64).expect("finite response limits"),
+            1 << 20,
+            |input| {
+                assert_live_input_required(input, "approval", "reused Tasks facade");
+                Ok(BTreeMap::from([("approval".to_owned(), json!({"action": "decline"}))]))
+            },
+        ),
+    )
+    .expect("the same client can complete an independent call after input cancellation");
+    let FinalToolCallOutcome::Complete(complete) = complete else {
+        panic!("declining approval completes without creating a Task: {complete:?}");
+    };
+    assert_eq!(complete.payload.content, vec![ContentBlock::text("url-elicit:decline")]);
+    assert_eq!(requests.lock().unwrap().len(), 5);
+    assert!(requests.lock().unwrap().iter().all(|request| request.method == "tools/call"));
+    drop(client);
     server.shutdown();
 }
 

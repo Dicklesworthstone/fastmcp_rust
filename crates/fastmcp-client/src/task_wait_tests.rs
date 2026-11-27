@@ -2900,3 +2900,651 @@ fn public_http_task_creating_call_refuses_absent_negotiation_and_precancellation
         peer.join().unwrap();
     }
 }
+
+fn tasks_http_mrtr_limits() -> crate::sse::SseLimits {
+    crate::sse::SseLimits::with_data_lines(64 * 1024, 64 * 1024, 64, 64).unwrap()
+}
+
+fn tasks_http_mrtr_input() -> Value {
+    json!({
+        "resultType": "input_required",
+        "inputRequests": {"roots": {"method": "roots/list"}},
+        "requestState": "first:opaque/state",
+        "x-input": {"retained": true}
+    })
+}
+
+fn tasks_http_mrtr_terminal(task_result: bool) -> Value {
+    if task_result {
+        let mut result = task("working", Some(80));
+        result["resultType"] = json!("task");
+        result["_meta"] = json!({"receipt": "after-input"});
+        result["x-call"] = json!({"retained": [true, 7]});
+        result
+    } else {
+        json!({
+            "resultType": "complete",
+            "content": [{"type": "text", "text": "after-input"}],
+            "_meta": {"receipt": "after-input"},
+            "x-call": {"retained": [true, 7]}
+        })
+    }
+}
+
+fn tasks_http_mrtr_write(stream: &mut TcpStream, value: &Value, sse: bool) {
+    if !sse {
+        write(stream, value).unwrap();
+        return;
+    }
+    let body = format!("data: {value}\n\n");
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    stream.write_all(body.as_bytes()).unwrap();
+    stream.flush().unwrap();
+}
+
+fn tasks_http_mrtr_peer(
+    advertised: Value,
+    replies: Vec<(Value, bool)>,
+    expect_tasks: bool,
+) -> (String, JoinHandle<Vec<Value>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let peer = std::thread::spawn(move || {
+        let mut discover = accept(&listener);
+        let request = read(&mut discover);
+        assert_eq!(request["method"], "server/discover");
+        assert_eq!(request["id"], 1);
+        write(&mut discover, &advertised).unwrap();
+        drop(discover);
+
+        let mut requests = Vec::new();
+        for (index, (result, sse)) in replies.into_iter().enumerate() {
+            let mut call = accept(&listener);
+            let request = read(&mut call);
+            assert_eq!(request["method"], "tools/call");
+            assert_eq!(request["id"], index + 2);
+            assert_eq!(request["params"]["name"], "start-work");
+            assert_eq!(request["params"]["arguments"], json!({"value": 7}));
+            let extensions =
+                &request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                    ["extensions"];
+            if expect_tasks {
+                assert_eq!(extensions[fastmcp_protocol::TASKS_EXTENSION], json!({}));
+            } else {
+                assert!(extensions.get(fastmcp_protocol::TASKS_EXTENSION).is_none());
+            }
+            tasks_http_mrtr_write(
+                &mut call,
+                &json!({"jsonrpc": "2.0", "id": index + 2, "result": result}),
+                sse,
+            );
+            requests.push(request);
+        }
+
+        let mut sibling = accept(&listener);
+        let request = read(&mut sibling);
+        assert_eq!(
+            request["method"], "tools/list",
+            "no rejected continuation, replay, implicit Task polling, or remote cancellation"
+        );
+        assert_eq!(request["id"], requests.len() + 2);
+        write(
+            &mut sibling,
+            &json!({"jsonrpc": "2.0", "id": request["id"], "result": {
+                "resultType": "complete", "tools": [], "ttlMs": 0, "cacheScope": "private"
+            }}),
+        )
+        .unwrap();
+        requests
+    });
+    (target, peer)
+}
+
+fn tasks_http_mrtr_answers(
+    input: &fastmcp_protocol::InputRequiredResult,
+) -> McpResult<crate::MrtrInputResponses> {
+    match input.request_state() {
+        Some("first:opaque/state") => Ok(std::collections::BTreeMap::from([(
+            "roots".to_owned(),
+            json!({"roots": []}),
+        )])),
+        Some("second:state-only") => {
+            assert!(input.input_requests().is_none());
+            Ok(std::collections::BTreeMap::new())
+        }
+        _ => panic!("the current peer request state must reach the local responder"),
+    }
+}
+
+
+#[test]
+fn public_http_tasks_mrtr_json_and_sse_preserve_outcomes_and_original_metadata() {
+    for sse in [false, true] {
+        for mode in ["installed", "sync", "async"] {
+            for task_result in [false, true] {
+                let terminal = tasks_http_mrtr_terminal(task_result);
+                let (target, peer) = tasks_http_mrtr_peer(
+                    discovery(),
+                    vec![
+                        (tasks_http_mrtr_input(), sse),
+                        (
+                            json!({
+                                "resultType": "input_required",
+                                "requestState": "second:state-only"
+                            }),
+                            sse,
+                        ),
+                        (terminal.clone(), sse),
+                    ],
+                    true,
+                );
+                let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                RuntimeBuilder::current_thread()
+                    .with_reactor(create_reactor().unwrap())
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let cx = Cx::current().unwrap();
+                        let handlers = if mode == "installed" {
+                            let calls = calls.clone();
+                            crate::ReverseRequestHandlers::new().with_modern_roots_list(
+                                move |callback_cx, _cancellation, _parameters| {
+                                    let calls = calls.clone();
+                                    Box::pin(async move {
+                                        assert!(callback_cx.checkpoint().is_ok());
+                                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        asupersync::runtime::yield_now().await;
+                                        Ok(serde_json::from_value(json!({"roots": []})).unwrap())
+                                    })
+                                },
+                            )
+                        } else {
+                            crate::ReverseRequestHandlers::new()
+                        };
+                        let mut client = HttpClient::connect_with_mcp_apps(
+                            &cx,
+                            plan(&target),
+                            ClientInfo {
+                                name: "tasks-mrtr-client".to_owned(),
+                                version: "1".to_owned(),
+                            },
+                            ClientCapabilities {
+                                roots: Some(fastmcp_protocol::RootsCapability::default()),
+                                ..ClientCapabilities::default()
+                            },
+                            None,
+                            handlers,
+                        )
+                        .await
+                        .unwrap();
+                        let cancellation = McpRequestCancellation::new();
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        let outcome = match mode {
+                            "installed" => client
+                                .call_tool_final_outcome_with_handlers(
+                                    &cx,
+                                    &cancellation,
+                                    deadline,
+                                    "start-work",
+                                    json!({"value": 7}),
+                                    tasks_http_mrtr_limits(),
+                                    64 * 1024,
+                                )
+                                .await
+                                .unwrap(),
+                            "sync" => client
+                                .call_tool_final_outcome_with_mrtr_retry(
+                                    &cx,
+                                    &cancellation,
+                                    deadline,
+                                    "start-work",
+                                    json!({"value": 7}),
+                                    tasks_http_mrtr_limits(),
+                                    64 * 1024,
+                                    |input| {
+                                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        tasks_http_mrtr_answers(input)
+                                    },
+                                )
+                                .await
+                                .unwrap(),
+                            "async" => {
+                                let calls = calls.clone();
+                                client
+                                    .call_tool_final_outcome_with_async_mrtr_retry(
+                                        &cx,
+                                        &cancellation,
+                                        deadline,
+                                        "start-work",
+                                        json!({"value": 7}),
+                                        tasks_http_mrtr_limits(),
+                                        64 * 1024,
+                                        move |callback_cx, input| {
+                                            let calls = calls.clone();
+                                            Box::pin(async move {
+                                                assert!(callback_cx.checkpoint().is_ok());
+                                                calls.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::SeqCst,
+                                                );
+                                                asupersync::runtime::yield_now().await;
+                                                tasks_http_mrtr_answers(input)
+                                            })
+                                        },
+                                    )
+                                    .await
+                                    .unwrap()
+                            }
+                            _ => unreachable!(),
+                        };
+                        let retained = match outcome {
+                            crate::FinalToolCallOutcome::Complete(result) if !task_result => {
+                                let encoded = fastmcp_protocol::CoreResult::Final(
+                                    fastmcp_protocol::FinalCoreResult::ToolsCall {
+                                        result,
+                                        diagnostic: None,
+                                    },
+                                )
+                                .encode()
+                                .unwrap();
+                                serde_json::from_str(&encoded).unwrap()
+                            }
+                            crate::FinalToolCallOutcome::Task(result) if task_result => {
+                                assert_eq!(result.task.base().task_id.as_str(), "wait-task");
+                                serde_json::to_value(result).unwrap()
+                            }
+                            _ => panic!("Tasks-aware MRTR changed the terminal result algebra"),
+                        };
+                        assert_eq!(retained, terminal, "all admitted result members survive");
+                        assert_eq!(
+                            calls.load(std::sync::atomic::Ordering::SeqCst),
+                            if mode == "installed" { 1 } else { 2 }
+                        );
+                        client.list_tools(&cx, None).await.unwrap();
+                    });
+                let requests = peer.join().unwrap();
+                assert_eq!(requests.len(), 3);
+                assert!(requests[0]["params"].get("requestState").is_none());
+                assert!(requests[0]["params"].get("inputResponses").is_none());
+                assert_eq!(
+                    requests[1]["params"]["inputResponses"],
+                    json!({"roots": {"roots": []}})
+                );
+                assert_eq!(requests[1]["params"]["requestState"], "first:opaque/state");
+                assert_eq!(requests[2]["params"]["requestState"], "second:state-only");
+                assert!(
+                    requests[2]["params"].get("inputResponses").is_none(),
+                    "a state-only continuation must not replay an earlier batch's answers"
+                );
+                assert_eq!(requests[1]["params"]["_meta"], requests[0]["params"]["_meta"]);
+                assert_eq!(requests[2]["params"]["_meta"], requests[0]["params"]["_meta"]);
+            }
+        }
+    }
+}
+
+
+#[test]
+fn public_http_tasks_mrtr_refusals_do_not_run_callbacks_or_allocate_continuations() {
+    for case in ["unhandled", "unadvertised", "missing", "extra", "resolver_error", "cancel"] {
+        let input = tasks_http_mrtr_input();
+        let (target, peer) = tasks_http_mrtr_peer(
+            discovery(),
+            vec![(input.clone(), false)],
+            true,
+        );
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut client = HttpClient::connect(
+                    &cx,
+                    plan(&target),
+                    ClientInfo {
+                        name: "tasks-mrtr-refusal-client".to_owned(),
+                        version: "1".to_owned(),
+                    },
+                    ClientCapabilities {
+                        roots: (case != "unadvertised")
+                            .then(fastmcp_protocol::RootsCapability::default),
+                        ..ClientCapabilities::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let calls = std::cell::Cell::new(0);
+                let result = if case == "unhandled" {
+                    client
+                        .call_tool_final_outcome_with_handlers(
+                            &cx,
+                            &cancellation,
+                            Instant::now() + Duration::from_secs(5),
+                            "start-work",
+                            json!({"value": 7}),
+                            tasks_http_mrtr_limits(),
+                            64 * 1024,
+                        )
+                        .await
+                } else {
+                    client
+                        .call_tool_final_outcome_with_mrtr_retry(
+                            &cx,
+                            &cancellation,
+                            Instant::now() + Duration::from_secs(5),
+                            "start-work",
+                            json!({"value": 7}),
+                            tasks_http_mrtr_limits(),
+                            64 * 1024,
+                            |input| {
+                                calls.set(calls.get() + 1);
+                                match case {
+                                    "missing" => Ok(std::collections::BTreeMap::new()),
+                                    "extra" => {
+                                        let mut answers = tasks_http_mrtr_answers(input)?;
+                                        answers.insert("unrequested".to_owned(), json!({}));
+                                        Ok(answers)
+                                    }
+                                    "resolver_error" => {
+                                        Err(McpError::internal_error("resolver declined"))
+                                    }
+                                    "cancel" => {
+                                        cancellation.cancel();
+                                        tasks_http_mrtr_answers(input)
+                                    }
+                                    _ => panic!("unadvertised input must fail before callback"),
+                                }
+                            },
+                        )
+                        .await
+                };
+                if case == "unhandled" {
+                    let crate::FinalToolCallOutcome::InputRequired(retained) = result.unwrap()
+                    else {
+                        panic!("without handlers the typed input result remains caller-owned");
+                    };
+                    let encoded = fastmcp_protocol::CoreResult::Final(
+                        fastmcp_protocol::FinalCoreResult::ToolsCallInputRequired {
+                            result: retained,
+                            diagnostic: None,
+                        },
+                    )
+                    .encode()
+                    .unwrap();
+                    assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), input);
+                    assert_eq!(calls.get(), 0);
+                } else {
+                    let Err(HttpClientError::CoreResult(error)) = result else {
+                        panic!("the local refusal must not become another transport request");
+                    };
+                    assert_eq!(
+                        error.code,
+                        match case {
+                            "resolver_error" => fastmcp_core::McpErrorCode::InternalError,
+                            "cancel" => fastmcp_core::McpErrorCode::RequestCancelled,
+                            "unadvertised" => fastmcp_core::McpErrorCode::InvalidRequest,
+                            _ => fastmcp_core::McpErrorCode::InvalidParams,
+                        }
+                    );
+                    assert_eq!(calls.get(), if case == "unadvertised" { 0 } else { 1 });
+                }
+                assert!(cx.checkpoint().is_ok());
+                client.list_tools(&cx, None).await.unwrap();
+            });
+        assert_eq!(peer.join().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn public_http_tasks_mrtr_preflight_refuses_without_ids_or_tool_effects() {
+    for case in ["unnegotiated", "cancelled", "expired"] {
+        let mut advertised = discovery();
+        if case == "unnegotiated" {
+            advertised["result"]["capabilities"]
+                .as_object_mut()
+                .unwrap()
+                .remove("extensions");
+        }
+        let (target, peer) = tasks_http_mrtr_peer(advertised, Vec::new(), true);
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut client = HttpClient::connect(
+                    &cx,
+                    plan(&target),
+                    ClientInfo {
+                        name: "tasks-mrtr-preflight-client".to_owned(),
+                        version: "1".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                )
+                .await
+                .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                if case == "cancelled" {
+                    cancellation.cancel();
+                }
+                let deadline = if case == "expired" {
+                    Instant::now() - Duration::from_millis(1)
+                } else {
+                    Instant::now() + Duration::from_secs(5)
+                };
+                let result = client
+                    .call_tool_final_outcome_with_async_mrtr_retry(
+                        &cx,
+                        &cancellation,
+                        deadline,
+                        "start-work",
+                        json!({"value": 7}),
+                        tasks_http_mrtr_limits(),
+                        64 * 1024,
+                        |_callback_cx, _input| panic!("preflight cannot invoke a responder"),
+                    )
+                    .await;
+                let Err(HttpClientError::CoreResult(error)) = result else {
+                    panic!("Tasks preflight must fail before native transport admission");
+                };
+                assert_eq!(
+                    error.code,
+                    match case {
+                        "cancelled" => fastmcp_core::McpErrorCode::RequestCancelled,
+                        "expired" => fastmcp_core::McpErrorCode::InternalError,
+                        _ => fastmcp_core::McpErrorCode::InvalidParams,
+                    }
+                );
+                client.list_tools(&cx, None).await.unwrap();
+            });
+        assert!(peer.join().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn public_http_ordinary_mrtr_still_rejects_task_results_without_tasks_advertisement() {
+    for sse in [false, true] {
+        // The same peer permits Tasks in discovery. Only the call's advertised
+        // contract distinguishes this negative from the Tasks-aware success.
+        let (target, peer) = tasks_http_mrtr_peer(
+            discovery(),
+            vec![(tasks_http_mrtr_terminal(true), sse)],
+            false,
+        );
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut client = HttpClient::connect(
+                    &cx,
+                    plan(&target),
+                    ClientInfo {
+                        name: "ordinary-mrtr-task-refusal".to_owned(),
+                        version: "1".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                )
+                .await
+                .unwrap();
+                let result = client
+                    .call_tool_with_async_mrtr_retry(
+                        &cx,
+                        &McpRequestCancellation::new(),
+                        Instant::now() + Duration::from_secs(5),
+                        "start-work",
+                        json!({"value": 7}),
+                        tasks_http_mrtr_limits(),
+                        64 * 1024,
+                        |_callback_cx, _input| panic!("a Task receipt is not an input batch"),
+                    )
+                    .await;
+                assert!(result.is_err(), "ordinary MRTR must retain its Tasks refusal");
+                client.list_tools(&cx, None).await.unwrap();
+            });
+        assert_eq!(peer.join().unwrap().len(), 1);
+    }
+}
+
+
+#[test]
+fn public_http_tasks_mrtr_cancellation_and_drop_close_pending_body_without_replay() {
+    for drop_pending in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let waiting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peer_waiting = waiting.clone();
+        let peer = std::thread::spawn(move || {
+            let mut discover = accept(&listener);
+            let request = read(&mut discover);
+            assert_eq!(request["method"], "server/discover");
+            assert_eq!(request["id"], 1);
+            write(&mut discover, &discovery()).unwrap();
+            drop(discover);
+
+            let mut initial = accept(&listener);
+            let original = read(&mut initial);
+            assert_eq!(original["method"], "tools/call");
+            assert_eq!(original["id"], 2);
+            write(
+                &mut initial,
+                &json!({"jsonrpc": "2.0", "id": 2, "result": tasks_http_mrtr_input()}),
+            )
+            .unwrap();
+            drop(initial);
+
+            let mut continuation = accept(&listener);
+            let request = read(&mut continuation);
+            assert_eq!(request["method"], "tools/call");
+            assert_eq!(request["id"], 3);
+            assert_eq!(request["params"]["_meta"], original["params"]["_meta"]);
+            assert_eq!(request["params"]["requestState"], "first:opaque/state");
+            assert_eq!(request["params"]["inputResponses"], json!({"roots": {"roots": []}}));
+            // Leave the correlated response body incomplete. A local stop
+            // must close this owned read, never replay its uncertain effect.
+            continuation
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\nConnection: close\r\n\r\n{",
+                )
+                .unwrap();
+            continuation.flush().unwrap();
+            peer_waiting.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut byte = [0_u8; 1];
+            match continuation.read(&mut byte) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                other => panic!("pending HTTP body must close after its caller stops: {other:?}"),
+            }
+            drop(continuation);
+
+            let mut sibling = accept(&listener);
+            let request = read(&mut sibling);
+            assert_eq!(
+                request["method"], "tools/list",
+                "a stopped uncertain continuation must not replay or cancel a remote Task"
+            );
+            assert_eq!(request["id"], 4);
+            write(
+                &mut sibling,
+                &json!({"jsonrpc": "2.0", "id": 4, "result": {
+                    "resultType": "complete", "tools": [], "ttlMs": 0, "cacheScope": "private"
+                }}),
+            )
+            .unwrap();
+        });
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut client = HttpClient::connect(
+                    &cx,
+                    plan(&target),
+                    ClientInfo {
+                        name: "tasks-mrtr-owned-body-client".to_owned(),
+                        version: "1".to_owned(),
+                    },
+                    ClientCapabilities {
+                        roots: Some(fastmcp_protocol::RootsCapability::default()),
+                        ..ClientCapabilities::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let mut operation = Box::pin(client.call_tool_final_outcome_with_mrtr_retry(
+                    &cx,
+                    &cancellation,
+                    Instant::now() + Duration::from_secs(5),
+                    "start-work",
+                    json!({"value": 7}),
+                    tasks_http_mrtr_limits(),
+                    64 * 1024,
+                    tasks_http_mrtr_answers,
+                ));
+                asupersync::time::timeout(
+                    cx.now(),
+                    Duration::from_secs(3),
+                    std::future::poll_fn(|task_cx| {
+                        if let Poll::Ready(result) = operation.as_mut().poll(task_cx) {
+                            panic!("the incomplete body must remain pending: {result:?}");
+                        }
+                        if waiting.load(std::sync::atomic::Ordering::SeqCst) {
+                            Poll::Ready(())
+                        } else {
+                            task_cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+                if drop_pending {
+                    drop(operation);
+                    assert!(!cancellation.is_cancel_requested());
+                } else {
+                    cancellation.cancel();
+                    assert!(operation.await.is_err());
+                }
+                assert!(cx.checkpoint().is_ok());
+                client.list_tools(&cx, None).await.unwrap();
+            });
+        peer.join().unwrap();
+    }
+}
+

@@ -5472,6 +5472,224 @@ impl From<McpError> for ModernHttpMrtrError {
 }
 
 impl crate::HttpClient {
+
+    /// Calls a Tasks-capable tool and answers each admitted input-required
+    /// round with the installed modern handlers.
+    ///
+    /// The operation uses one deadline and cancellation domain for every POST
+    /// and callback. Without modern handlers, an input-required result is
+    /// returned intact. JSON and SSE retain the complete, input-required, and
+    /// durable Task outcome algebra; a Task receipt admitted in the same poll
+    /// as a late stop remains available to its caller.
+    ///
+    /// This operation never polls or cancels the resulting Task, and never
+    /// replays a failed or uncertain tool request.
+    #[cfg(feature = "tasks")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn call_tool_final_outcome_with_handlers(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+    ) -> Result<FinalToolCallOutcome, HttpClientError> {
+        let responder: OperationMrtrResponder = OperationMrtrResponder::Installed(
+            self.connection
+                .modern_reverse_request_handlers()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        self.follow_tasks_http_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            name,
+            arguments,
+            sse_limits,
+            maximum_response_bytes,
+            responder,
+        )
+        .await
+    }
+
+    /// Calls a Tasks-capable tool with a bounded operation-local responder.
+    ///
+    /// The entire input batch must be authorized by the capabilities on the
+    /// first POST before the responder runs, and answers must match every
+    /// requested key exactly. Continuations preserve the initial arguments,
+    /// metadata, Tasks advertisement, and the latest opaque request state.
+    /// A synchronous responder must return cooperatively; late answers never
+    /// authorize another POST.
+    #[cfg(feature = "tasks")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn call_tool_final_outcome_with_mrtr_retry<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+        respond: F,
+    ) -> Result<FinalToolCallOutcome, HttpClientError>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        self.follow_tasks_http_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            name,
+            arguments,
+            sse_limits,
+            maximum_response_bytes,
+            OperationMrtrResponder::<F, AsyncMrtrResponderFn>::Caller(respond),
+        )
+        .await
+    }
+
+    /// Calls a Tasks-capable tool with a caller-owned asynchronous responder.
+    ///
+    /// The responder may borrow the caller context and this round's admitted
+    /// input descriptors. Cancelling, timing out, or dropping this operation
+    /// drops its pending callback or HTTP body before a continuation can be
+    /// committed. No detached work, implicit Task polling, or request replay
+    /// is started. An already-admitted Task receipt survives a same-poll stop.
+    #[cfg(feature = "tasks")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn call_tool_final_outcome_with_async_mrtr_retry<A>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+        respond: A,
+    ) -> Result<FinalToolCallOutcome, HttpClientError>
+    where
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+    {
+        self.follow_tasks_http_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            name,
+            arguments,
+            sse_limits,
+            maximum_response_bytes,
+            OperationMrtrResponder::<SyncMrtrResponderFn, A>::Async(respond),
+        )
+        .await
+    }
+
+    #[cfg(feature = "tasks")]
+    #[allow(clippy::too_many_arguments)]
+    async fn follow_tasks_http_mrtr<F, A>(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+        mut responder: OperationMrtrResponder<F, A>,
+    ) -> Result<FinalToolCallOutcome, HttpClientError>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+    {
+        #[allow(clippy::infallible_destructuring_match)]
+        let modern = match &self.connection {
+            ClientHttpConnection::Modern(client) => client,
+            #[cfg(feature = "legacy-2024-11-05")]
+            ClientHttpConnection::LegacySse(_) => {
+                return Err(HttpClientError::Connection(
+                    ClientHttpConnectionError::FinalToolCallRequiresModern,
+                ));
+            }
+        };
+        let deadline = deadline.min(crate::mrtr_operation_deadline(
+            cx,
+            self.request_timeout_policy,
+        )?);
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        // Admission precedes even the first ID allocation. This
+        // driver explicitly negotiates Tasks; ordinary MRTR still refuses them.
+        admit_final_tasks_result_discriminator(
+            &modern.server_discovery(),
+            OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+        )?;
+        let mut driver = MrtrDriver::new(
+            cx,
+            deadline,
+            MrtrDriverLimits::new(
+                MAX_MRTR_CONTINUATION_ROUNDS,
+                MAX_MRTR_TOTAL_INPUT_RESPONSES,
+            )?,
+        )?;
+        let mut parameters = serde_json::json!({"name": name, "arguments": arguments});
+        let mut original_parameters = None;
+
+        loop {
+            driver.before_request()?;
+            crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+            let request_id = self.next_request_id()?;
+            let (outcome, prepared_parameters) = await_tasks_mrtr_until(
+                cx,
+                cancellation,
+                deadline,
+                modern.execute_tasks_mrtr_round(
+                    cx,
+                    cancellation,
+                    deadline,
+                    parameters,
+                    request_id,
+                    sse_limits,
+                    maximum_response_bytes,
+                ),
+            )
+            .await
+            .map_err(|error| HttpClientError::Connection(ClientHttpConnectionError::Mrtr(error)))?;
+            // The typed receive owner already admitted this durable result.
+            // Hiding its ID cannot undo the Task's creation.
+            if matches!(outcome, FinalToolCallOutcome::Task(_)) {
+                return Ok(outcome);
+            }
+            crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+            let input_required = match outcome {
+                FinalToolCallOutcome::Complete(_) => return Ok(outcome),
+                FinalToolCallOutcome::InputRequired(input_required) => input_required,
+                FinalToolCallOutcome::Task(_) => unreachable!("Task receipt returned above"),
+            };
+            if !responder.has_handler() {
+                return Ok(FinalToolCallOutcome::InputRequired(input_required));
+            }
+            let original_parameters = original_parameters.get_or_insert(prepared_parameters);
+            driver.begin_continuation()?;
+            let responses = responder
+                .respond(
+                    cx,
+                    Some(cancellation),
+                    deadline,
+                    &mut driver,
+                    &original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY],
+                    &input_required,
+                )
+                .await?;
+            parameters = mrtr_retry_parameters(
+                original_parameters.clone(),
+                &input_required,
+                responses,
+            )?;
+        }
+    }
     /// Calls a tool on a modern HTTP peer, awaiting a caller-owned responder
     /// for every admitted input-required round. Each continuation uses a fresh
     /// request ID and retains the original tool, arguments and capabilities.
@@ -10166,6 +10384,91 @@ impl ModernHttpClient {
         }
     }
 
+
+    /// Executes one Tasks-authorized tool round without following it. Only the
+    /// caller-owned driver selects whether another round is permitted.
+    #[cfg(feature = "tasks")]
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_tasks_mrtr_round(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+    ) -> Result<(FinalToolCallOutcome, serde_json::Value), ModernHttpMrtrError> {
+        let extensions = BTreeMap::from([(
+            fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID.to_owned(),
+            serde_json::json!({}),
+        )]);
+        let request = self
+            .build_post_discovery_request(
+                cx,
+                TOOLS_CALL,
+                parameters,
+                Some(request_id.clone()),
+                Some(&extensions),
+                false,
+            )
+            .map_err(ModernHttpMrtrError::Request)?;
+        let wire: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
+            ModernHttpMrtrError::Request(ModernHttpClientError::RequestEncodingFailed)
+        })?;
+        let prepared_parameters = wire.params.ok_or(ModernHttpMrtrError::Request(
+            ModernHttpClientError::RequestEncodingFailed,
+        ))?;
+        let core_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            TOOLS_CALL,
+            Some(&prepared_parameters),
+        )
+        .map_err(ModernHttpMrtrError::TypedResult)?;
+        // Request preparation may consume the remaining aggregate budget.
+        // Recheck immediately before the native sender can publish any bytes.
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        let response = self
+            .execute_post_discovery_request_with_cancellation(cx, cancellation, &request)
+            .await
+            .map_err(ModernHttpMrtrError::Request)?;
+        let result = match response.metadata().kind() {
+            ModernHttpResponseKind::Json => {
+                let body = response
+                    .read_to_end_with_cancellation(cx, cancellation, maximum_response_bytes)
+                    .await
+                    .map_err(|error| {
+                        ModernHttpMrtrError::Request(ModernHttpClientError::Executor(error))
+                    })?;
+                decode_mrtr_json_response(
+                    &core_request,
+                    &request_id,
+                    &body,
+                    maximum_response_bytes,
+                )?
+            }
+            ModernHttpResponseKind::Sse => {
+                response
+                    .into_final_tasks_tool_call_listener(request_id, core_request, sse_limits)
+                    .map_err(ModernHttpMrtrError::Listener)?
+                    .collect(cx)
+                    .await
+                    .map_err(ModernHttpMrtrError::Listener)?
+                    .terminal
+            }
+            actual => return Err(ModernHttpMrtrError::UnexpectedResponseKind { actual }),
+        };
+        let outcome = match result {
+            FinalCoreResult::ToolsCall { result, .. } => FinalToolCallOutcome::Complete(result),
+            FinalCoreResult::ToolsCallTask { result } => FinalToolCallOutcome::Task(result),
+            FinalCoreResult::ToolsCallInputRequired { result, .. } => {
+                FinalToolCallOutcome::InputRequired(result)
+            }
+            _ => return Err(ModernHttpMrtrError::UnexpectedCoreResult),
+        };
+        Ok((outcome, prepared_parameters))
+    }
+
     async fn execute_mrtr_round(
         &self,
         cx: &Cx,
@@ -13835,6 +14138,37 @@ fn validate_mrtr_request_id(request_id: &RequestId) -> Result<(), ModernHttpMrtr
         });
     }
     Ok(())
+}
+
+/// Bounds one Tasks-aware receive without losing a receipt it has already
+/// admitted. The common operation guard still owns cancellation registration,
+/// caller restrictions, timers, and drop. Only a successful typed Task result
+/// can outlive its post-poll stop check; bytes, malformed results, ordinary
+/// completions, and input-required results never become a durable receipt.
+#[cfg(feature = "tasks")]
+async fn await_tasks_mrtr_until(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    deadline: Instant,
+    operation: impl Future<
+        Output = Result<(FinalToolCallOutcome, serde_json::Value), ModernHttpMrtrError>,
+    >,
+) -> Result<(FinalToolCallOutcome, serde_json::Value), ModernHttpMrtrError> {
+    let mut admitted_task = None;
+    let result = crate::wait_for_mrtr_operation(cx, Some(cancellation), deadline, async {
+        let (outcome, parameters) = operation.await?;
+        if matches!(outcome, FinalToolCallOutcome::Task(_)) {
+            admitted_task = Some((outcome, parameters));
+            Ok::<_, ModernHttpMrtrError>(None)
+        } else {
+            Ok(Some((outcome, parameters)))
+        }
+    })
+    .await;
+    match admitted_task {
+        Some(receipt) => Ok(receipt),
+        None => result?.ok_or(ModernHttpMrtrError::UnexpectedCoreResult),
+    }
 }
 
 async fn await_mrtr_until<T>(
@@ -29558,6 +29892,142 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
         });
         canceller.join().expect("cancellation thread joins");
         server.join().expect("cancellation peer joins");
+    }
+
+
+    #[cfg(feature = "tasks")]
+    fn tasks_mrtr_guard_outcome(kind: &str) -> FinalToolCallOutcome {
+        match kind {
+            "task" => FinalToolCallOutcome::Task(
+                serde_json::from_value(serde_json::json!({
+                    "resultType": "task",
+                    "taskId": "durable:opaque/7",
+                    "status": "working",
+                    "createdAt": "2026-07-28T12:00:00Z",
+                    "lastUpdatedAt": "2026-07-28T12:00:01Z",
+                    "ttlMs": null,
+                    "_meta": {"receipt": "retained"},
+                    "x-result": {"kept": [1, true]}
+                }))
+                .unwrap(),
+            ),
+            "complete" => FinalToolCallOutcome::Complete(
+                fastmcp_protocol::CompleteResult::new(
+                    serde_json::from_value(serde_json::json!({
+                        "content": [{"type": "text", "text": "finished"}]
+                    }))
+                    .unwrap(),
+                    fastmcp_protocol::ResultMeta::empty(),
+                ),
+            ),
+            "input_required" => FinalToolCallOutcome::InputRequired(
+                fastmcp_protocol::InputRequiredResult::new(
+                    None,
+                    Some("one-use".to_owned()),
+                    fastmcp_protocol::ResultMeta::empty(),
+                )
+                .unwrap(),
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn tasks_mrtr_receive_preserves_only_admitted_task_on_same_poll_stop() {
+        // This directly tests the receive adapter's election boundary. The
+        // live JSON/SSE tests separately exercise transport and typed admission.
+        for deadline_stop in [false, true] {
+            for kind in ["task", "complete", "input_required"] {
+                runtime_block_on(async {
+                    let cx = Cx::current().unwrap();
+                    let cancellation = fastmcp_core::McpRequestCancellation::new();
+                    let deadline = Instant::now()
+                        + if deadline_stop {
+                            Duration::from_millis(50)
+                        } else {
+                            Duration::from_secs(5)
+                        };
+                    let parameters = serde_json::json!({
+                        "name": "start-work",
+                        "_meta": {"receipt-owner": "initial"}
+                    });
+                    let result = super::await_tasks_mrtr_until(
+                        &cx,
+                        &cancellation,
+                        deadline,
+                        async {
+                            let outcome = tasks_mrtr_guard_outcome(kind);
+                            if deadline_stop {
+                                thread::sleep(
+                                    deadline.saturating_duration_since(Instant::now())
+                                        + Duration::from_millis(1),
+                                );
+                            } else {
+                                cancellation.cancel();
+                            }
+                            Ok((outcome, parameters.clone()))
+                        },
+                    )
+                    .await;
+                    if kind == "task" {
+                        let (FinalToolCallOutcome::Task(receipt), retained_parameters) =
+                            result.unwrap()
+                        else {
+                            panic!("an admitted durable receipt must survive a late stop");
+                        };
+                        assert_eq!(receipt.task.base().task_id.as_str(), "durable:opaque/7");
+                        assert_eq!(receipt.additional["x-result"], serde_json::json!({"kept": [1, true]}));
+                        assert_eq!(retained_parameters, parameters);
+                    } else {
+                        let Err(ModernHttpMrtrError::Driver(error)) = result else {
+                            panic!("a late non-Task outcome must remain cancellation-first");
+                        };
+                        assert_eq!(
+                            error.code,
+                            if deadline_stop {
+                                fastmcp_core::McpErrorCode::InternalError
+                            } else {
+                                fastmcp_core::McpErrorCode::RequestCancelled
+                            }
+                        );
+                    }
+                    assert!(cx.checkpoint().is_ok());
+                });
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn tasks_mrtr_receive_refuses_precancellation_and_preserves_nonreceipt_errors() {
+        runtime_block_on(async {
+            let cx = Cx::current().unwrap();
+            let cancellation = fastmcp_core::McpRequestCancellation::new();
+            cancellation.cancel();
+            let polls = std::cell::Cell::new(0);
+            let result = super::await_tasks_mrtr_until(
+                &cx,
+                &cancellation,
+                Instant::now() + Duration::from_secs(5),
+                async {
+                    polls.set(polls.get() + 1);
+                    Ok((tasks_mrtr_guard_outcome("task"), serde_json::json!({})))
+                },
+            )
+            .await;
+            assert!(matches!(result, Err(ModernHttpMrtrError::Driver(_))));
+            assert_eq!(polls.get(), 0, "a cancelled caller cannot admit new bytes");
+
+            let result = super::await_tasks_mrtr_until(
+                &cx,
+                &fastmcp_core::McpRequestCancellation::new(),
+                Instant::now() + Duration::from_secs(5),
+                async { Err(ModernHttpMrtrError::MissingResult) },
+            )
+            .await;
+            assert!(matches!(result, Err(ModernHttpMrtrError::MissingResult)));
+        });
     }
 
     #[test]
