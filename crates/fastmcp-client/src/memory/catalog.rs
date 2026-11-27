@@ -1286,7 +1286,7 @@ mod tests {
     #[test]
     fn memory_catalog_rebuilds_once_for_scope_or_cursor_without_resetting_budget() {
         run(|cx| async move {
-            for cause in ["scope", "cursor"] {
+            for cause in ["scope", "traced-scope", "cursor"] {
                 for second_failure in [false, true] {
                     let (mut client, mut peer) = connected(&cx).await;
                     let mut server = cx
@@ -1297,15 +1297,18 @@ mod tests {
                                     cursor,
                                 );
                                 let message = match id {
-                                    2 => response(
-                                        id,
-                                        page(
+                                    2 => {
+                                        let mut first = page(
                                             "tools/list",
                                             Some("discarded"),
                                             Some("old"),
                                             "private",
-                                        ),
-                                    ),
+                                        );
+                                        if cause == "traced-scope" {
+                                            first["_meta"]["baggage"] = json!("region=us");
+                                        }
+                                        response(id, first)
+                                    }
                                     3 if cause == "cursor" => rejected_cursor(id),
                                     3 => response(
                                         id,

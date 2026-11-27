@@ -557,7 +557,12 @@ impl FinalResultCache {
             return FinalCacheInsert::InvalidatedDuringFetch;
         }
 
-        let Some((ttl, scope)) = final_cache_hints(&result) else {
+        // Effective peer telemetry belongs to one response. Keep its typed
+        // scope visible to catalog traversal, but never store or replay it.
+        let hints = final_cache_hints(&result).filter(|_| {
+            matches!(&result, CoreResult::Final(result) if result.trace_context().is_empty())
+        });
+        let Some((ttl, scope)) = hints else {
             if let Some(previous) = self.entries.remove(&key) {
                 self.retained_bytes = self.retained_bytes.saturating_sub(previous.encoded_bytes);
             }
@@ -835,17 +840,12 @@ fn cap_final_cache_ttl_ms(result: &mut CoreResult, remaining_ttl_ms: u64) {
     }
 }
 
+/// Returns typed hints for a complete result, including traced pages. These
+/// facts govern full-list consistency independently of cache admission.
 pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(CacheTtl, CacheScope)> {
     let CoreResult::Final(result) = result else {
         return None;
     };
-    // A peer may attach valid telemetry even when this request sent none.
-    // Replaying it would expose one response's context to a later caller.
-    // Inspect only recovered, effective trace; malformed optional telemetry
-    // already discarded by the result codec must not poison application data.
-    if !result.trace_context().is_empty() {
-        return None;
-    }
     match result {
         FinalCoreResult::Discover(result) => {
             let hints = result.cache_hints();
@@ -1039,6 +1039,10 @@ mod tests {
                 unreachable!()
             };
             assert!(!final_result.trace_context().is_empty());
+            assert_eq!(
+                final_cache_hints(&traced),
+                Some((CacheTtl::milliseconds(60_000), CacheScope::Private))
+            );
             assert_eq!(
                 cache.insert_if_current_at(cache_key.clone(), generation, traced, receipt),
                 FinalCacheInsert::NotCacheable,
