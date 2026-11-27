@@ -292,6 +292,22 @@ struct FinalCacheEntry {
     encoded_bytes: usize,
 }
 
+impl FinalCacheEntry {
+    /// A read can return several resources with distinct wire URIs.
+    /// Only typed contents can establish that they are unrelated to an update.
+    fn resource_contents_omit(&self, updated_uri: &str) -> bool {
+        use fastmcp_protocol::common_types::EmbeddedResourceContents;
+
+        let CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) = &self.result else {
+            return false;
+        };
+        result.payload.contents.iter().all(|content| match content {
+            EmbeddedResourceContents::Text { uri, .. }
+            | EmbeddedResourceContents::Blob { uri, .. } => uri.as_str() != updated_uri,
+        })
+    }
+}
+
 /// Fixed-cardinality generation classes. A resource update conservatively
 /// advances the shared resource-read class so distinct peer URIs cannot grow
 /// an unbounded generation map.
@@ -658,6 +674,7 @@ impl FinalResultCache {
                 (updated_uri, key.result_set())
                 && uri.as_str() != updated
                 && entry.result_set_revision == current
+                && entry.resource_contents_omit(updated)
             {
                 entry.result_set_revision = generation;
                 return true;

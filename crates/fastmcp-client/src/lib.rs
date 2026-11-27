@@ -38442,11 +38442,16 @@ exec sleep 2
             let cx = Cx::current().unwrap();
             let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
             for (id, uri) in [(2, "file:///a"), (3, "file:///b")] {
+                // Reading B returns its own contents plus an embedded copy of A.
+                let mut contents = vec![serde_json::json!({"uri":uri,"text":"original"})];
+                if uri == "file:///b" {
+                    contents.push(serde_json::json!({"uri":"file:///a","blob":"YQ=="}));
+                }
                 write_server_text_frame(
                     &mut peer_io,
                     &serde_json::json!({
                         "jsonrpc":"2.0", "id":id, "result":{
-                            "resultType":"complete", "contents":[{"uri":uri,"text":"original"}],
+                            "resultType":"complete", "contents":contents,
                             "ttlMs":60000, "cacheScope":"private"
                         }
                     })
@@ -38479,7 +38484,7 @@ exec sleep 2
             }
             assert_eq!(
                 client.next_id, 5,
-                "the resource generation conservatively invalidates both reads"
+                "updating embedded A must invalidate the aggregate read of B"
             );
             write_server_text_frame(&mut peer_io,
                 r#"{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","contents":[{"uri":"file:///a","text":"updated"}],"ttlMs":60000,"cacheScope":"private"}}"#,
