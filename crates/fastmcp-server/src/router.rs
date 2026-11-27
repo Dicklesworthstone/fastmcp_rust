@@ -5133,6 +5133,14 @@ impl Router {
                         "modern tools/call dispatch selected another core request",
                     ));
                 };
+                // A partial retry can return directly from the registry; a full
+                // retry consumes its state. Check HTTP mirrors before either
+                // transition so a rejected request leaves the round retriable.
+                if params.request_state.is_some()
+                    && let Some(headers) = request_ctx.http_parameter_headers()
+                {
+                    self.validate_replayed_tool_headers(request_ctx, &params, headers)?;
+                }
                 let binding = final_mrtr_binding(
                     request_ctx,
                     "tools/call",
@@ -12124,13 +12132,26 @@ mod router_tests {
             Tool {
                 name: "state-only-input-required-tool".to_owned(),
                 description: None,
-                input_schema: serde_json::json!({"type": "object"}),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"region": {"type": "string", "x-mcp-header": "Region"}}
+                }),
                 output_schema: None,
                 icon: None,
                 version: None,
                 tags: Vec::new(),
                 annotations: None,
             }
+        }
+
+        fn header_exposure_reviews(
+            &self,
+        ) -> Vec<fastmcp_protocol::http_headers::NonSensitiveHeaderExposure> {
+            use fastmcp_protocol::http_headers::{NonSensitiveHeaderExposure, ToolSchemaRevision};
+
+            let tool = self.definition();
+            let revision = ToolSchemaRevision::of(&tool.input_schema).unwrap();
+            vec![NonSensitiveHeaderExposure::new(tool.name, revision, ["region"])]
         }
 
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
@@ -26251,10 +26272,12 @@ mod router_tests {
         let inbound = InboundRequestContext::with_modern_connection(
             cx,
             144,
-            InboundRequestTransport::Memory,
+            InboundRequestTransport::Http,
             &connection,
         );
-        let request_ctx = inbound.request_context();
+        let request_ctx = inbound.request_context().with_http_parameter_headers(
+            Arc::from([("mcp-param-region".to_owned(), "west".to_owned())]),
+        );
         let metadata = serde_json::json!({
             "io.modelcontextprotocol/protocolVersion": "2026-07-28",
             "io.modelcontextprotocol/clientCapabilities": {},
@@ -26264,7 +26287,7 @@ mod router_tests {
             Some(serde_json::json!({
                 "_meta": metadata.clone(),
                 "name": "state-only-input-required-tool",
-                "arguments": {},
+                "arguments": {"region": "west"},
             })),
             144_i64,
         );
@@ -26285,7 +26308,7 @@ mod router_tests {
             Some(serde_json::json!({
                 "_meta": metadata,
                 "name": "state-only-input-required-tool",
-                "arguments": {},
+                "arguments": {"region": "west"},
                 "requestState": request_state,
             })),
             145_i64,
@@ -26329,6 +26352,19 @@ mod router_tests {
                 .expect("absent-member retry has parameters"),
         )
         .expect("absent-member retry parameters serialize");
+        let missing_header = request_ctx.clone().with_http_parameter_headers(Arc::from([]));
+        let mismatch = block_on(router.dispatch_stateless_with_raw_params(
+            &missing_header,
+            &retry,
+            Some(&retry_raw_params),
+        ))
+        .expect_err("a missing mirror must refuse without consuming the round");
+        assert_eq!(
+            i32::from(mismatch.code),
+            fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE
+        );
+        assert_eq!(resumed_calls.load(Ordering::SeqCst), 0);
+
         let completed = block_on(router.dispatch_stateless_with_raw_params(
             &request_ctx,
             &retry,
