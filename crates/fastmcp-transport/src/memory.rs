@@ -145,23 +145,77 @@ fn recv_memory_source(
         return Err(TransportError::Closed);
     }
 
-    // Check before every dequeue, including after a sleep. Budget exhaustion
-    // or cancellation must leave a newly arrived frame queued for a live Cx.
-    // Do not checkpoint after dequeue: that would discard committed input.
-    loop {
-        cx.checkpoint().map_err(|_| TransportError::Cancelled)?;
-        let recv_result = receiver.try_recv();
-        match recv_result {
-            Ok(frame) => return Ok(frame.source),
-            Err(mpsc::RecvError::Empty) => {
-                std::thread::sleep(poll_interval);
-            }
-            Err(mpsc::RecvError::Disconnected) => {
-                *closed = true;
-                return Err(TransportError::Closed);
-            }
-            Err(mpsc::RecvError::Cancelled) => return Err(TransportError::Cancelled),
+    // Ready frames need no waiter. Never checkpoint after dequeuing, since the
+    // peer may have observed the freed slot and the input is already committed.
+    cx.checkpoint().map_err(|_| TransportError::Cancelled)?;
+    let result = match receiver.try_recv() {
+        Err(mpsc::RecvError::Empty) => wait_for_memory_frame(receiver, cx, poll_interval),
+        ready => ready,
+    };
+    match result {
+        Ok(frame) => Ok(frame.source),
+        Err(mpsc::RecvError::Disconnected) => {
+            *closed = true;
+            Err(TransportError::Closed)
         }
+        Err(mpsc::RecvError::Cancelled) => Err(TransportError::Cancelled),
+        Err(mpsc::RecvError::Empty) => Err(TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "memory transport queue is empty",
+        ))),
+    }
+}
+
+// A private, one-slot wake signal coalesces notifications, including a wake
+// delivered between poll and wait. It cannot consume the thread's park token
+// or a signal belonging to an enclosing executor.
+struct MemoryReceiveWake(std::sync::mpsc::SyncSender<()>);
+
+impl std::task::Wake for MemoryReceiveWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        let _ = self.0.try_send(());
+    }
+}
+
+fn wait_for_memory_frame(
+    receiver: &mut mpsc::Receiver<MemoryQueuedMessage>,
+    cx: &Cx,
+    poll_interval: Duration,
+) -> Result<MemoryQueuedMessage, mpsc::RecvError> {
+    use std::task::{Context, Poll, Waker};
+
+    let (signal, wakeups) = std::sync::mpsc::sync_channel(1);
+    let waker = Waker::from(std::sync::Arc::new(MemoryReceiveWake(signal)));
+    let mut task = Context::from_waker(&waker);
+    let (_keep_open, mut cancellation) = asupersync::channel::oneshot::channel::<()>();
+    let mut cancelled = std::pin::pin!(cancellation.recv(cx));
+    let mut receiving = std::pin::pin!(receiver.recv(cx));
+    loop {
+        cx.checkpoint().map_err(|_| mpsc::RecvError::Cancelled)?;
+        if cancelled.as_mut().poll(&mut task).is_ready() {
+            return Err(mpsc::RecvError::Cancelled);
+        }
+        if let Poll::Ready(frame) = receiving.as_mut().poll(&mut task) {
+            return frame;
+        }
+        // Synchronous callers can have a deadline without a timer driver.
+        // Wake for that deadline as well as channel activity and cancellation.
+        let mut delay = poll_interval;
+        if let Some(deadline) = cx.budget().deadline {
+            let now = cx.now();
+            if deadline > now {
+                delay = delay.min(Duration::from_nanos(deadline.duration_since(now)));
+            } else {
+                // An expired, masked context can still perform cleanup. Check
+                // once, then wait normally instead of spinning on a zero delay.
+                cx.checkpoint().map_err(|_| mpsc::RecvError::Cancelled)?;
+            }
+        }
+        let _ = wakeups.recv_timeout(delay);
     }
 }
 
@@ -207,8 +261,9 @@ struct MemoryQueuedMessage {
 ///
 /// Synchronous operations checkpoint the caller's context before publication
 /// or dequeue, observing cancellation masks and deadline, poll, and cost
-/// budgets. Receives repeat that checkpoint between sleeps without consuming
-/// a message on refusal. The [`Self::recv_async`] and [`Self::send_async`]
+/// budgets. Waiting receives wake on messages, peer closure, or cancellation.
+/// They also recheck the caller's budget at the configured poll interval.
+/// The [`Self::recv_async`] and [`Self::send_async`]
 /// methods instead await channel readiness without blocking the executor.
 pub struct MemoryTransport {
     /// Channel for sending messages to the peer.
@@ -252,9 +307,9 @@ impl MemoryTransport {
 
     /// Sets the poll interval for cancellation checks during recv.
     ///
-    /// Lower values provide faster cancellation response but use more CPU.
-    /// Default is 50ms. Values below 1ms are clamped to 1ms so an idle
-    /// receiver cannot busy-spin.
+    /// Channel readiness and cancellation wake an idle receiver immediately.
+    /// This interval bounds checks for other budget changes. It defaults to
+    /// 50ms and is clamped to a minimum of 1ms.
     #[must_use]
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = normalize_poll_interval(interval);
@@ -1293,9 +1348,44 @@ mod tests {
     }
 
     #[test]
+    fn idle_split_receive_wakes_for_data_and_disconnect_before_the_poll_interval() {
+        let (mut client, server) = MemoryTransportBuilder::new()
+            .poll_interval(Duration::from_secs(6))
+            .build();
+        let (mut incoming, _outgoing) = server.into_split();
+        let (started, starting) = std::sync::mpsc::sync_channel(0);
+        let (finished, result) = std::sync::mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let cx = Cx::for_testing();
+            for _ in 0..2 {
+                started.send(()).unwrap();
+                let message = TransportRecvHalf::recv(&mut incoming, &cx);
+                finished.send(message).unwrap();
+            }
+        });
+        let cx = Cx::for_testing();
+        starting.recv().unwrap();
+        thread::sleep(Duration::from_millis(20));
+        let request = JsonRpcRequest::new("wake", None, 1_i64);
+        client.send_request(&cx, &request).unwrap();
+        let message = result.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(json(&message), json(&JsonRpcMessage::Request(request)));
+
+        starting.recv().unwrap();
+        thread::sleep(Duration::from_millis(20));
+        client.close(&cx).unwrap();
+        assert!(matches!(
+            result.recv_timeout(Duration::from_secs(2)),
+            Ok(Err(TransportError::Closed))
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn test_cancellation_during_poll() {
+        let started = std::time::Instant::now();
         let (_client, mut server) = MemoryTransportBuilder::new()
-            .poll_interval(Duration::from_millis(5))
+            .poll_interval(Duration::from_secs(6))
             .build();
 
         let cx = Cx::for_testing();
@@ -1307,9 +1397,9 @@ mod tests {
             cx_clone.set_cancel_requested(true);
         });
 
-        // recv should eventually return Cancelled
         let result = server.recv(&cx);
         assert!(matches!(result, Err(TransportError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(2));
 
         handle.join().unwrap();
     }
@@ -1424,7 +1514,7 @@ mod tests {
     #[test]
     fn memory_idle_receive_observes_deadline_and_remains_reusable() {
         let (client, mut server) = MemoryTransportBuilder::new()
-            .poll_interval(Duration::from_millis(1))
+            .poll_interval(Duration::from_secs(10))
             .build();
         let mut client = Some(client);
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
