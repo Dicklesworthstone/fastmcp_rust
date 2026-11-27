@@ -86,7 +86,8 @@ use crate::{
     ClientProtocolPlan, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
     MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses, RequestTimeoutPolicy, RequestTimeoutSource,
     ResourceSubscriptionRelations, ReverseRequestHandlers, SubscriptionListenRequest,
-    SubscriptionTimeoutPolicy, admit_complete_mrtr_input_batch, validate_protocol_plan_feature,
+    AsyncMrtrResponderFn, HttpClientError, MrtrResponderFuture, OperationMrtrResponder,
+    SubscriptionTimeoutPolicy, SyncMrtrResponderFn, validate_protocol_plan_feature,
 };
 #[cfg(feature = "legacy-2024-11-05")]
 use crate::{ReverseCallbackState, ReverseRequestCancellation};
@@ -5464,6 +5465,156 @@ pub enum ModernHttpMrtrError {
     TasksResultRequiresNegotiatedOperation,
 }
 
+impl From<McpError> for ModernHttpMrtrError {
+    fn from(error: McpError) -> Self {
+        Self::Driver(error)
+    }
+}
+
+impl crate::HttpClient {
+    /// Calls a tool on a modern HTTP peer, awaiting a caller-owned responder
+    /// for every admitted input-required round. Each continuation uses a fresh
+    /// request ID and retains the original tool, arguments and capabilities.
+    ///
+    /// The earlier of `deadline` and the configured absolute timeout bounds
+    /// all POSTs, response bodies and callbacks together. Cancelling the token
+    /// or dropping this future releases pending work without a background retry.
+    /// This operation never requests the Tasks result discriminator.
+    pub async fn call_tool_with_async_mrtr_retry<A>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+        respond: A,
+    ) -> Result<FinalCoreResult, HttpClientError>
+    where
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+    {
+        self.follow_async_http_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            TOOLS_CALL,
+            serde_json::json!({"name": name, "arguments": arguments}),
+            sse_limits,
+            maximum_response_bytes,
+            respond,
+        )
+        .await
+    }
+
+    /// Reads a resource under the same continuation, cancellation and deadline
+    /// rules as [`Self::call_tool_with_async_mrtr_retry`].
+    pub async fn read_resource_with_async_mrtr_retry<A>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        uri: &str,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+        respond: A,
+    ) -> Result<FinalCoreResult, HttpClientError>
+    where
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+    {
+        self.follow_async_http_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            RESOURCES_READ,
+            serde_json::json!({"uri": uri}),
+            sse_limits,
+            maximum_response_bytes,
+            respond,
+        )
+        .await
+    }
+
+    /// Gets a prompt under the same continuation, cancellation and deadline
+    /// rules as [`Self::call_tool_with_async_mrtr_retry`].
+    pub async fn get_prompt_with_async_mrtr_retry<A>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+        respond: A,
+    ) -> Result<FinalCoreResult, HttpClientError>
+    where
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+    {
+        let mut parameters = serde_json::json!({"name": name});
+        if !arguments.is_empty() {
+            parameters["arguments"] = serde_json::json!(arguments);
+        }
+        self.follow_async_http_mrtr(
+            cx,
+            cancellation,
+            deadline,
+            PROMPTS_GET,
+            parameters,
+            sse_limits,
+            maximum_response_bytes,
+            respond,
+        )
+        .await
+    }
+
+    async fn follow_async_http_mrtr<A>(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        method: &'static str,
+        parameters: serde_json::Value,
+        sse_limits: SseLimits,
+        maximum_response_bytes: usize,
+        respond: A,
+    ) -> Result<FinalCoreResult, HttpClientError>
+    where
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+    {
+        let modern = match &self.connection {
+            ClientHttpConnection::Modern(client) => client,
+            #[cfg(feature = "legacy-2024-11-05")]
+            ClientHttpConnection::LegacySse(_) => {
+                return Err(HttpClientError::Connection(
+                    ClientHttpConnectionError::MrtrRequiresModern,
+                ));
+            }
+        };
+        let deadline = deadline.min(crate::mrtr_operation_deadline(
+            cx,
+            self.request_timeout_policy,
+        )?);
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        let result = modern
+            .drive_mrtr_retry(
+                cx,
+                self.next_request_id()?,
+                deadline,
+                method,
+                parameters,
+                sse_limits,
+                maximum_response_bytes,
+                || self.next_mrtr_request_id(),
+                Some(cancellation),
+                OperationMrtrResponder::<SyncMrtrResponderFn, A>::Async(respond),
+            )
+            .await
+            .map_err(|error| HttpClientError::Connection(ClientHttpConnectionError::Mrtr(error)))?;
+        self.require_terminal_http_mrtr_result(method, result)
+    }
+}
+
 impl fmt::Display for ModernHttpMrtrError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -9831,7 +9982,8 @@ impl ModernHttpClient {
             sse_limits,
             maximum_response_bytes,
             next_request_id,
-            respond,
+            None,
+            OperationMrtrResponder::<F, AsyncMrtrResponderFn>::Caller(respond),
         )
         .await
     }
@@ -9862,7 +10014,8 @@ impl ModernHttpClient {
             sse_limits,
             maximum_response_bytes,
             next_request_id,
-            respond,
+            None,
+            OperationMrtrResponder::<F, AsyncMrtrResponderFn>::Caller(respond),
         )
         .await
     }
@@ -9910,12 +10063,13 @@ impl ModernHttpClient {
             sse_limits,
             maximum_response_bytes,
             next_request_id,
-            respond,
+            None,
+            OperationMrtrResponder::<F, AsyncMrtrResponderFn>::Caller(respond),
         )
         .await
     }
 
-    async fn drive_mrtr_retry<F, I>(
+    async fn drive_mrtr_retry<F, A, I>(
         &self,
         cx: &Cx,
         initial_request_id: RequestId,
@@ -9925,10 +10079,12 @@ impl ModernHttpClient {
         sse_limits: SseLimits,
         maximum_response_bytes: usize,
         mut next_request_id: I,
-        mut respond: F,
+        cancellation: Option<&McpRequestCancellation>,
+        mut responder: OperationMrtrResponder<F, A>,
     ) -> Result<CoreResult, ModernHttpMrtrError>
     where
         F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
         I: FnMut() -> McpResult<RequestId>,
     {
         validate_mrtr_request_id(&initial_request_id)?;
@@ -9946,19 +10102,20 @@ impl ModernHttpClient {
             driver
                 .before_request()
                 .map_err(ModernHttpMrtrError::Driver)?;
-            let (result, prepared_parameters) = await_mrtr_until(
+            let round = self.execute_mrtr_round(
                 cx,
-                driver.deadline(),
-                self.execute_mrtr_round(
-                    cx,
-                    method,
-                    parameters,
-                    request_id.clone(),
-                    sse_limits,
-                    maximum_response_bytes,
-                ),
-            )
-            .await?;
+                method,
+                parameters,
+                request_id.clone(),
+                sse_limits,
+                maximum_response_bytes,
+            );
+            let (result, prepared_parameters) = match cancellation {
+                Some(token) => {
+                    crate::wait_for_mrtr_operation(cx, Some(token), driver.deadline(), round).await?
+                }
+                None => await_mrtr_until(cx, driver.deadline(), round).await?,
+            };
             // Retain the exact parameters that the request builder put on the
             // first POST. In particular, resolver authority comes from those
             // transmitted capabilities, not from a callback or peer descriptor.
@@ -9978,20 +10135,20 @@ impl ModernHttpClient {
             driver
                 .begin_continuation()
                 .map_err(ModernHttpMrtrError::Driver)?;
-            admit_complete_mrtr_input_batch(
-                &mut driver,
-                &original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY],
-                input_required,
-            )
-            .map_err(ModernHttpMrtrError::Driver)?;
-            let input_responses = respond(input_required).map_err(ModernHttpMrtrError::Driver)?;
+            let input_responses = responder
+                .respond(
+                    cx,
+                    cancellation,
+                    deadline,
+                    &mut driver,
+                    &original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY],
+                    input_required,
+                )
+                .await?;
             let retry_parameters =
                 mrtr_retry_parameters(original_parameters.clone(), input_required, input_responses)
                     .map_err(ModernHttpMrtrError::Driver)?;
-            driver
-                .before_request()
-                .map_err(ModernHttpMrtrError::Driver)?;
-
+            crate::check_mrtr_operation(cx, cancellation, deadline)?;
             let next_id = next_request_id().map_err(ModernHttpMrtrError::Driver)?;
             validate_mrtr_request_id(&next_id)?;
             if used_request_ids
@@ -28394,6 +28551,112 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
             validate_response_head(200, &refused),
             Err(ModernHttpExecutorError::UnsupportedContentEncoding)
         ));
+    }
+
+    #[test]
+    fn async_http_mrtr_preserves_rounds_and_releases_a_cancelled_responder() {
+        use fastmcp_core::{McpErrorCode, McpRequestCancellation};
+        use fastmcp_protocol::InputRequiredResult;
+
+        fn answer<'a>(
+            cx: &'a Cx,
+            input: &'a InputRequiredResult,
+        ) -> crate::MrtrResponderFuture<'a> {
+            Box::pin(async move {
+                asupersync::runtime::yield_now().await;
+                cx.checkpoint().unwrap();
+                assert_eq!(input.request_state(), Some("next"));
+                Ok(BTreeMap::from([("roots".to_owned(), serde_json::json!({"roots": []}))]))
+            })
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let peer = thread::spawn(move || {
+            let mut probe = accept_notification_test_peer(&listener);
+            let _ = read_request(&mut probe);
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+            let mut expected_id = 2;
+            for (method, continued, result) in [
+                (TOOLS_CALL, false, serde_json::Value::Null),
+                (TOOLS_CALL, true, serde_json::json!({"content": []})),
+                (RESOURCES_READ, true, serde_json::json!({"contents": [], "ttlMs":0, "cacheScope":"private"})),
+                (PROMPTS_GET, true, serde_json::json!({"messages": []})),
+            ] {
+                let mut initial = accept_notification_test_peer(&listener);
+                let body: serde_json::Value = serde_json::from_slice(&read_request(&mut initial).body).unwrap();
+                assert_eq!(body["id"], expected_id);
+                assert_eq!(body["method"], method);
+                assert!(body["params"].get("requestState").is_none());
+                let challenge = serde_json::json!({
+                    "jsonrpc":"2.0","id":expected_id,
+                    "result":{"resultType":"input_required","requestState":"next",
+                        "inputRequests":{"roots":{"method":"roots/list"}}}
+                });
+                write_response(&mut initial, 200, "application/json", &serde_json::to_vec(&challenge).unwrap());
+                expected_id += 1;
+                if continued {
+                    let mut retry = accept_notification_test_peer(&listener);
+                    let retry_body: serde_json::Value = serde_json::from_slice(&read_request(&mut retry).body).unwrap();
+                    assert_eq!(retry_body["id"], expected_id);
+                    assert_eq!(retry_body["method"], method);
+                    let mut original = body["params"].clone();
+                    original["requestState"] = serde_json::json!("next");
+                    original["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
+                    assert_eq!(retry_body["params"], original);
+                    let mut terminal = result;
+                    terminal["resultType"] = serde_json::json!("complete");
+                    let reply = serde_json::json!({"jsonrpc":"2.0","id":expected_id,"result":terminal});
+                    write_response(&mut retry, 200, "application/json", &serde_json::to_vec(&reply).unwrap());
+                    expected_id += 1;
+                }
+            }
+        });
+        runtime_block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut client = crate::HttpClient::connect(
+                &cx,
+                plan(&target, "http://127.0.0.1:9/sse", "http://127.0.0.1:9/messages", ProtocolPolicy::ModernOnly),
+                ClientInfo { name: "async-mrtr".into(), version: "1".into() },
+                serde_json::from_value(serde_json::json!({"roots": {}})).unwrap(),
+            ).await.unwrap();
+            let limits = SseLimits::new(1024, 8192, 8).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let stopped = McpRequestCancellation::new();
+            let entered = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&entered);
+            {
+                let mut operation = std::pin::pin!(client.call_tool_with_async_mrtr_retry(
+                    &cx, &stopped, deadline, "tool", serde_json::json!({}), limits, 4096,
+                    move |_, _| {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(std::future::pending())
+                    },
+                ));
+                std::future::poll_fn(|task| {
+                    assert!(operation.as_mut().poll(task).is_pending());
+                    if entered.load(Ordering::SeqCst) == 1 { Poll::Ready(()) } else { Poll::Pending }
+                }).await;
+                stopped.cancel();
+                assert!(matches!(operation.await,
+                    Err(crate::HttpClientError::Connection(ClientHttpConnectionError::Mrtr(
+                        ModernHttpMrtrError::Driver(error)
+                    ))) if error.code == McpErrorCode::RequestCancelled
+                ));
+            }
+            let active = McpRequestCancellation::new();
+            assert!(matches!(client.call_tool_with_async_mrtr_retry(
+                &cx, &active, deadline, "tool", serde_json::json!({"count": 1}), limits, 4096, answer,
+            ).await.unwrap(), FinalCoreResult::ToolsCall { .. }));
+            assert!(matches!(client.read_resource_with_async_mrtr_retry(
+                &cx, &active, deadline, "file:///data", limits, 4096, answer,
+            ).await.unwrap(), FinalCoreResult::ResourcesRead { .. }));
+            assert!(matches!(client.get_prompt_with_async_mrtr_retry(
+                &cx, &active, deadline, "prompt", HashMap::from([("name".into(), "here".into())]), limits, 4096, answer,
+            ).await.unwrap(), FinalCoreResult::PromptsGet { .. }));
+        });
+        peer.join().unwrap();
     }
 
     #[test]
