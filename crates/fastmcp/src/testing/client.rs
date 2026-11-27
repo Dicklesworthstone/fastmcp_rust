@@ -1103,7 +1103,11 @@ impl TestClient {
                 .into_parts();
             match message {
                 JsonRpcMessage::Response(response) => {
-                    if response.id.as_ref() != Some(expected_id) {
+                    if !response
+                        .id
+                        .as_ref()
+                        .is_some_and(|id| id.correlates_with(expected_id))
+                    {
                         return Err(McpError::invalid_request(
                             "TestClient response ID does not match its outstanding request",
                         ));
@@ -1490,6 +1494,34 @@ mod tests {
                 assert!(matches!(peer.recv(&cx), Err(TransportError::Closed)));
             }
         }
+    }
+
+    #[test]
+    fn test_client_numeric_alias_correlates_discovery_and_application_response() {
+        let (transport, mut peer) = create_memory_transport_pair();
+        let cx = Cx::for_testing();
+        peer.send(
+            &cx,
+            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Integer("1e0".into()),
+                discovery_fixture(),
+            )),
+        )
+        .unwrap();
+        let mut client = TestClient::new_auto(cx.clone(), transport);
+        client.initialize_core().unwrap();
+        peer.send(
+            &cx,
+            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Integer("2.0".into()),
+                serde_json::json!({
+                    "resultType": "complete", "tools": [], "ttlMs": 0, "cacheScope": "private"
+                }),
+            )),
+        )
+        .unwrap();
+        assert!(client.list_tools().unwrap().is_empty());
+        assert_eq!(client.protocol_version(), Some(FINAL_PROTOCOL_VERSION));
     }
 
     #[test]

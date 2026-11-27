@@ -87,9 +87,9 @@ use fastmcp_protocol::protocol_version::{
     admit_final_http_request,
 };
 use fastmcp_protocol::{
-    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams, JsonRpcAdmissionError,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseAdmission, RequestId,
-    decode_strict_jsonrpc_response,
+    CorrelationKey, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams,
+    JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseAdmission,
+    RequestId, decode_strict_jsonrpc_response,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -4730,10 +4730,40 @@ pub enum StreamableHttpRequestResponseMessage {
 }
 
 struct QueuedResponse {
-    request_id: Option<RequestId>,
+    request_key: Option<Arc<CorrelationKey>>,
     message: StreamableHttpRequestResponseMessage,
     serialized_bytes: usize,
     terminal: bool,
+}
+
+impl QueuedResponse {
+    fn belongs_to(&self, owner: &Arc<CorrelationKey>) -> bool {
+        // The pointer distinguishes this body from a later owner of the same ID.
+        self.request_key
+            .as_ref()
+            .is_some_and(|key| Arc::ptr_eq(key, owner))
+    }
+}
+
+type StreamableRequestStates =
+    HashMap<Arc<CorrelationKey>, Arc<StreamableHttpRequestCancellationState>>;
+
+fn streamable_request_key(id: &RequestId) -> Result<CorrelationKey, TransportError> {
+    id.correlation_key().map_err(|error| {
+        TransportError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+    })
+}
+
+fn try_request_states(
+    states: &Mutex<StreamableRequestStates>,
+) -> Result<std::sync::MutexGuard<'_, StreamableRequestStates>, TransportError> {
+    match states.try_lock() {
+        Ok(states) => Ok(states),
+        Err(TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => Err(streamable_queue_full_error(
+            "streamable HTTP request-response registry is busy",
+        )),
+    }
 }
 
 struct StreamableResponseMailbox {
@@ -4884,7 +4914,7 @@ impl StreamableHttpRequestIngress {
 pub struct StreamableHttpResponseStream {
     codec: Codec,
     mailbox: Arc<Mutex<StreamableResponseMailbox>>,
-    request_states: Arc<Mutex<HashMap<RequestId, Arc<StreamableHttpRequestCancellationState>>>>,
+    request_states: Arc<Mutex<StreamableRequestStates>>,
     pending_count: Arc<AtomicUsize>,
     endpoint_count: Arc<AtomicUsize>,
     active_admissions: Arc<AtomicUsize>,
@@ -4955,21 +4985,26 @@ impl StreamableHttpResponseStream {
         &self,
         request_id: Option<&RequestId>,
     ) -> Result<Option<JsonRpcResponse>, TransportError> {
-        if let Some(request_id) = request_id {
-            if self.request_is_live(request_id)? {
+        let request_key = request_id.map(streamable_request_key).transpose()?;
+        // Keep registration and unowned dequeue atomic. An owner must not
+        // register and publish its terminal response between these operations.
+        let states = if let Some(key) = &request_key {
+            let states = try_request_states(&self.request_states)?;
+            if states.contains_key(key) {
                 return Err(TransportError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "request-owned Streamable HTTP messages must use their bound SSE response body",
                 )));
             }
-        }
+            Some(states)
+        } else {
+            None
+        };
         let queued = self.pop_matching(|queued| {
-            matches!(
-                &queued.message,
-                StreamableHttpRequestResponseMessage::Response(response)
-                    if response.id.as_ref() == request_id
-            )
+            queued.request_key.as_deref() == request_key.as_ref()
+                && matches!(&queued.message, StreamableHttpRequestResponseMessage::Response(_))
         })?;
+        drop(states);
         Ok(queued.map(|queued| match queued.message {
             StreamableHttpRequestResponseMessage::Response(response) => response,
             StreamableHttpRequestResponseMessage::Notification(_)
@@ -5037,17 +5072,17 @@ impl StreamableHttpResponseStream {
 
     fn pop_request_message(
         &self,
-        request_id: &RequestId,
+        key: &Arc<CorrelationKey>,
     ) -> Result<Option<QueuedResponse>, TransportError> {
-        self.pop_matching(|queued| queued.request_id.as_ref() == Some(request_id))
+        self.pop_matching(|queued| queued.belongs_to(key))
     }
 
     fn pop_request_response(
         &self,
-        request_id: &RequestId,
+        key: &Arc<CorrelationKey>,
     ) -> Result<Option<JsonRpcResponse>, TransportError> {
         if let Some(response) =
-            try_pop_streamable_request_response(&self.mailbox, &self.pending_count, request_id)?
+            try_pop_streamable_request_response(&self.mailbox, &self.pending_count, key)?
         {
             return Ok(Some(response));
         }
@@ -5057,7 +5092,7 @@ impl StreamableHttpResponseStream {
             match try_pop_streamable_request_response(
                 &self.mailbox,
                 &self.pending_count,
-                request_id,
+                key,
             )? {
                 Some(response) => Ok(Some(response)),
                 None => Err(TransportError::Closed),
@@ -5067,34 +5102,13 @@ impl StreamableHttpResponseStream {
         }
     }
 
-    fn request_is_live(&self, request_id: &RequestId) -> Result<bool, TransportError> {
-        let request_states = match self.request_states.try_lock() {
-            Ok(request_states) => request_states,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                return Err(streamable_queue_full_error(
-                    "streamable HTTP request-response registry is busy",
-                ));
-            }
-        };
-        Ok(request_states.contains_key(request_id))
-    }
-
     fn request_response_guard_is_active(
         &self,
         cancellation: &StreamableHttpRequestCancellation,
     ) -> Result<bool, TransportError> {
-        let request_states = match self.request_states.try_lock() {
-            Ok(request_states) => request_states,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                return Err(streamable_queue_full_error(
-                    "streamable HTTP request-response registry is busy",
-                ));
-            }
-        };
+        let request_states = try_request_states(&self.request_states)?;
         Ok(request_states
-            .get(cancellation.request_id())
+            .get(&cancellation.state.key)
             .is_some_and(|state| Arc::ptr_eq(state, &cancellation.state)))
     }
 
@@ -5149,7 +5163,7 @@ impl StreamableHttpResponseStream {
                 streamable_queue_full_error("streamable response byte budget is full")
             })?;
         mailbox.queue.push_back(QueuedResponse {
-            request_id: Some(cancellation.request_id().clone()),
+            request_key: Some(cancellation.state.key.clone()),
             message,
             serialized_bytes,
             terminal,
@@ -5163,14 +5177,9 @@ impl StreamableHttpResponseStream {
         &self,
         cx: &Cx,
         cancellation: &StreamableHttpRequestCancellation,
-        response: JsonRpcResponse,
+        mut response: JsonRpcResponse,
     ) -> Result<(), TransportError> {
-        if response.id.as_ref() != Some(cancellation.request_id()) {
-            return Err(TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "streamable HTTP response ID does not match its request response body",
-            )));
-        }
+        cancellation.bind_response_id(&mut response)?;
         cancellation.checkpoint(cx)?;
         if !self.request_response_guard_is_active(cancellation)? {
             return Err(TransportError::Io(std::io::Error::new(
@@ -5246,7 +5255,7 @@ impl StreamableHttpResponseStream {
         })
     }
 
-    fn discard_request_messages(&self, request_id: &RequestId) {
+    fn discard_request_messages(&self, key: &Arc<CorrelationKey>) {
         let mut mailbox = self
             .mailbox
             .lock()
@@ -5254,7 +5263,7 @@ impl StreamableHttpResponseStream {
         let mut discarded_count = 0;
         let mut discarded_bytes = 0;
         mailbox.queue.retain(|queued| {
-            if queued.request_id.as_ref() == Some(request_id) {
+            if queued.belongs_to(key) {
                 discarded_count += 1;
                 discarded_bytes += queued.serialized_bytes;
                 false
@@ -5356,23 +5365,17 @@ impl StreamableHttpResponseStream {
             return Err(TransportError::Closed);
         }
 
+        let key = Arc::new(streamable_request_key(&request_id)?);
         let state = Arc::new(StreamableHttpRequestCancellationState {
-            request_id: request_id.clone(),
+            key,
+            request_id,
             cancelled: AtomicBool::new(false),
             terminal_committed: AtomicBool::new(false),
             response_commit_gate: Mutex::new(()),
             request_cancellation: McpRequestCancellation::new(),
         });
-        let mut request_states = match self.request_states.try_lock() {
-            Ok(request_states) => request_states,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                return Err(streamable_queue_full_error(
-                    "streamable HTTP request-response registry is busy",
-                ));
-            }
-        };
-        if request_states.contains_key(&request_id) {
+        let mut request_states = try_request_states(&self.request_states)?;
+        if request_states.contains_key(&state.key) {
             return Err(TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "streamable HTTP request already has a live response body",
@@ -5390,7 +5393,7 @@ impl StreamableHttpResponseStream {
         if mailbox
             .queue
             .iter()
-            .any(|queued| queued.request_id.as_ref() == Some(&request_id))
+            .any(|queued| queued.request_key.as_ref() == Some(&state.key))
         {
             return Err(TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -5398,10 +5401,9 @@ impl StreamableHttpResponseStream {
             )));
         }
         drop(mailbox);
-        request_states.insert(request_id.clone(), Arc::clone(&state));
+        request_states.insert(state.key.clone(), Arc::clone(&state));
         Ok(StreamableHttpRequestResponseStream {
             responses: self.clone(),
-            request_id,
             request_states: Arc::clone(&self.request_states),
             cancellation: StreamableHttpRequestCancellation { state },
             finished: AtomicBool::new(false),
@@ -5423,6 +5425,7 @@ pub struct StreamableHttpRequestCancellation {
 #[derive(Debug)]
 struct StreamableHttpRequestCancellationState {
     request_id: RequestId,
+    key: Arc<CorrelationKey>,
     cancelled: AtomicBool,
     terminal_committed: AtomicBool,
     response_commit_gate: Mutex<()>,
@@ -5430,6 +5433,20 @@ struct StreamableHttpRequestCancellationState {
 }
 
 impl StreamableHttpRequestCancellation {
+    fn bind_response_id(&self, response: &mut JsonRpcResponse) -> Result<(), TransportError> {
+        let key = response.id.as_ref().map(streamable_request_key).transpose()?;
+        if key.as_ref() != Some(self.state.key.as_ref()) {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamable HTTP response ID does not match its request response body",
+            )));
+        }
+        // Echo the request's original spelling even if the producer used a
+        // mathematically equivalent integer to identify the owner.
+        response.id = Some(self.request_id().clone());
+        Ok(())
+    }
+
     fn cancel(&self) {
         let _commit_gate = self
             .state
@@ -5517,8 +5534,7 @@ impl StreamableHttpRequestCancellation {
 /// can clone only the accompanying [`StreamableHttpRequestCancellation`] guard.
 pub struct StreamableHttpRequestResponseStream {
     responses: StreamableHttpResponseStream,
-    request_id: RequestId,
-    request_states: Arc<Mutex<HashMap<RequestId, Arc<StreamableHttpRequestCancellationState>>>>,
+    request_states: Arc<Mutex<StreamableRequestStates>>,
     cancellation: StreamableHttpRequestCancellation,
     finished: AtomicBool,
 }
@@ -5549,16 +5565,16 @@ impl StreamableHttpRequestResponseStream {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if request_states
-                .get(&self.request_id)
+                .get(&self.cancellation.state.key)
                 .is_some_and(|state| Arc::ptr_eq(state, &self.cancellation.state))
             {
-                request_states.remove(&self.request_id);
+                request_states.remove(&self.cancellation.state.key);
             }
             // Retirement and queued-output removal share the registry lock.
             // Reusing the same ID must not let this old owner discard a new
             // owner's output between registry removal and mailbox cleanup.
             // Registration already takes these locks in this same order.
-            self.responses.discard_request_messages(&self.request_id);
+            self.responses.discard_request_messages(&self.cancellation.state.key);
             drop(request_states);
         }
     }
@@ -5585,7 +5601,7 @@ impl StreamableHttpRequestResponseStream {
     /// Returns the request ID bound to this response body.
     #[must_use]
     pub fn request_id(&self) -> &RequestId {
-        &self.request_id
+        self.cancellation.request_id()
     }
 
     /// Returns whether this response body has reached its terminal state.
@@ -5611,7 +5627,7 @@ impl StreamableHttpRequestResponseStream {
             return Err(TransportError::Cancelled);
         }
 
-        let message = self.responses.pop_request_message(&self.request_id)?;
+        let message = self.responses.pop_request_message(&self.cancellation.state.key)?;
         if message.as_ref().is_some_and(|queued| queued.terminal) {
             self.finish();
         }
@@ -5650,7 +5666,7 @@ impl StreamableHttpRequestResponseStream {
             return Err(TransportError::Cancelled);
         }
 
-        let response = self.responses.pop_request_response(&self.request_id)?;
+        let response = self.responses.pop_request_response(&self.cancellation.state.key)?;
         if response.is_some() {
             self.finish();
         }
@@ -5781,7 +5797,7 @@ impl StreamableHttpRequestResponseSender {
 /// Cancels every response owner and releases queued output after the caller
 /// has sealed response admission and settled admissions already in progress.
 fn terminate_streamable_responses(
-    request_states: &Mutex<HashMap<RequestId, Arc<StreamableHttpRequestCancellationState>>>,
+    request_states: &Mutex<StreamableRequestStates>,
     mailbox: &Mutex<StreamableResponseMailbox>,
     pending_count: &AtomicUsize,
 ) {
@@ -5856,7 +5872,7 @@ fn try_pop_streamable_response(
 fn try_pop_streamable_request_response(
     mailbox: &Mutex<StreamableResponseMailbox>,
     pending_count: &AtomicUsize,
-    request_id: &RequestId,
+    key: &Arc<CorrelationKey>,
 ) -> Result<Option<JsonRpcResponse>, TransportError> {
     let mut mailbox = match mailbox.try_lock() {
         Ok(mailbox) => mailbox,
@@ -5870,7 +5886,7 @@ fn try_pop_streamable_request_response(
     let Some(position) = mailbox
         .queue
         .iter()
-        .position(|queued| queued.request_id.as_ref() == Some(request_id))
+        .position(|queued| queued.belongs_to(key))
     else {
         return Ok(None);
     };
@@ -6046,8 +6062,7 @@ pub struct StreamableHttpTransport {
     /// Bounded, correlation-aware response mailbox.
     response_mailbox: Arc<Mutex<StreamableResponseMailbox>>,
     /// Live request-owned response bodies keyed by their JSON-RPC request ID.
-    request_response_states:
-        Arc<Mutex<HashMap<RequestId, Arc<StreamableHttpRequestCancellationState>>>>,
+    request_response_states: Arc<Mutex<StreamableRequestStates>>,
     response_pending_count: Arc<AtomicUsize>,
     response_endpoint_count: Arc<AtomicUsize>,
     response_active_admissions: Arc<AtomicUsize>,
@@ -6307,37 +6322,10 @@ impl StreamableHttpTransport {
         &self,
         cancellation: &StreamableHttpRequestCancellation,
     ) -> Result<bool, TransportError> {
-        let request_states = match self.request_response_states.try_lock() {
-            Ok(request_states) => request_states,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                return Err(streamable_queue_full_error(
-                    "streamable HTTP request-response registry is busy",
-                ));
-            }
-        };
+        let request_states = try_request_states(&self.request_response_states)?;
         Ok(request_states
-            .get(cancellation.request_id())
+            .get(&cancellation.state.key)
             .is_some_and(|state| Arc::ptr_eq(state, &cancellation.state)))
-    }
-
-    fn response_is_bound_to_live_request(
-        &self,
-        response: &JsonRpcResponse,
-    ) -> Result<bool, TransportError> {
-        let Some(request_id) = response.id.as_ref() else {
-            return Ok(false);
-        };
-        let request_states = match self.request_response_states.try_lock() {
-            Ok(request_states) => request_states,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                return Err(streamable_queue_full_error(
-                    "streamable HTTP request-response registry is busy",
-                ));
-            }
-        };
-        Ok(request_states.contains_key(request_id))
     }
 
     /// Commits a final response for one live request response body.
@@ -6350,14 +6338,9 @@ impl StreamableHttpTransport {
         &mut self,
         cx: &Cx,
         cancellation: &StreamableHttpRequestCancellation,
-        response: JsonRpcResponse,
+        mut response: JsonRpcResponse,
     ) -> Result<(), TransportError> {
-        if response.id.as_ref() != Some(cancellation.request_id()) {
-            return Err(TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "streamable HTTP response ID does not match its request response body",
-            )));
-        }
+        cancellation.bind_response_id(&mut response)?;
         cancellation.checkpoint(cx)?;
         if !self.request_response_guard_is_active(cancellation)? {
             return Err(TransportError::Io(std::io::Error::new(
@@ -6368,7 +6351,7 @@ impl StreamableHttpTransport {
         cancellation.with_message_commit(cx, true, || {
             self.enqueue_message(
                 cx,
-                Some(cancellation.request_id().clone()),
+                Some(cancellation.state.key.clone()),
                 StreamableHttpRequestResponseMessage::Response(response),
                 Some(cancellation),
             )
@@ -6403,7 +6386,7 @@ impl StreamableHttpTransport {
         cancellation.with_message_commit(cx, false, || {
             self.enqueue_message(
                 cx,
-                Some(cancellation.request_id().clone()),
+                Some(cancellation.state.key.clone()),
                 StreamableHttpRequestResponseMessage::Notification(notification),
                 Some(cancellation),
             )
@@ -6433,7 +6416,7 @@ impl StreamableHttpTransport {
         cancellation.with_message_commit(cx, false, || {
             self.enqueue_message(
                 cx,
-                Some(cancellation.request_id().clone()),
+                Some(cancellation.state.key.clone()),
                 StreamableHttpRequestResponseMessage::Request(request),
                 Some(cancellation),
             )
@@ -6443,7 +6426,7 @@ impl StreamableHttpTransport {
     fn enqueue_message(
         &mut self,
         cx: &Cx,
-        request_id: Option<RequestId>,
+        request_key: Option<Arc<CorrelationKey>>,
         message: StreamableHttpRequestResponseMessage,
         request_cancellation: Option<&StreamableHttpRequestCancellation>,
     ) -> Result<(), TransportError> {
@@ -6478,6 +6461,20 @@ impl StreamableHttpTransport {
         if let Some(cancellation) = request_cancellation {
             cancellation.checkpoint(cx)?;
         }
+        // Registration holds the same registry lock while inspecting the
+        // mailbox. Only one of a live owner or unowned output may claim a key.
+        let unowned_states = if let (None, Some(key)) = (request_cancellation, &request_key) {
+            let states = try_request_states(&self.request_response_states)?;
+            if states.contains_key(key) {
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "request-bound Streamable HTTP responses must use send_response_for_request",
+                )));
+            }
+            Some(states)
+        } else {
+            None
+        };
         let mut mailbox = match self.response_mailbox.try_lock() {
             Ok(mailbox) => mailbox,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -6508,13 +6505,14 @@ impl StreamableHttpTransport {
                 streamable_queue_full_error("streamable response byte budget is full")
             })?;
         mailbox.queue.push_back(QueuedResponse {
-            request_id,
+            request_key,
             terminal: matches!(&message, StreamableHttpRequestResponseMessage::Response(_)),
             message,
             serialized_bytes,
         });
         mailbox.retained_bytes = prospective;
         self.response_pending_count.fetch_add(1, Ordering::Release);
+        drop(unowned_states);
         Ok(())
     }
 
@@ -6587,15 +6585,9 @@ impl Transport for StreamableHttpTransport {
 
         match message {
             JsonRpcMessage::Response(response) => {
-                if self.response_is_bound_to_live_request(response)? {
-                    return Err(TransportError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "request-bound Streamable HTTP responses must use send_response_for_request",
-                    )));
-                }
                 self.enqueue_message(
                     cx,
-                    response.id.clone(),
+                    response.id.as_ref().map(streamable_request_key).transpose()?.map(Arc::new),
                     StreamableHttpRequestResponseMessage::Response(response.clone()),
                     None,
                 )?;
@@ -12738,6 +12730,69 @@ Content-Length: {}\r\n\
     }
 
     #[test]
+    fn streamable_http_numeric_alias_shares_one_owner_and_echoes_its_wire_id() {
+        let mut transport = StreamableHttpTransport::with_capacity(4).unwrap();
+        let responses = transport.response_stream().unwrap();
+        let cx = Cx::for_testing();
+        let wire_id = RequestId::Integer("1.0".into());
+        let alias = RequestId::Integer("1e0".into());
+        let string_id = RequestId::String("1".into());
+        let body = responses.for_request(wire_id.clone()).unwrap();
+        let sibling = responses.for_request(string_id.clone()).unwrap();
+        assert!(matches!(
+            responses.for_request(alias.clone()),
+            Err(TransportError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        let result = |id| JsonRpcResponse::success(id, serde_json::json!({"ok": true}));
+        assert!(matches!(
+            transport.send(&cx, &JsonRpcMessage::Response(result(alias.clone()))),
+            Err(TransportError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert!(matches!(
+            body.sender().send_response(&cx, result(string_id.clone())),
+            Err(TransportError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        let old_sender = body.sender();
+        old_sender.send_response(&cx, result(alias.clone())).unwrap();
+        assert!(matches!(
+            responses.pop_response(Some(&RequestId::Number(1))),
+            Err(TransportError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(body.pop_response().unwrap().unwrap().id, Some(wire_id));
+        assert!(sibling.pop_response().unwrap().is_none());
+        let replacement = responses.for_request(alias.clone()).unwrap();
+        assert!(old_sender.send_response(&cx, result(alias.clone())).is_err());
+        transport
+            .send_response_for_request(&cx, &replacement.cancellation(), result(RequestId::Number(1)))
+            .unwrap();
+        assert_eq!(replacement.pop_response().unwrap().unwrap().id, Some(alias));
+        sibling.sender().send_response(&cx, result(string_id.clone())).unwrap();
+        assert_eq!(sibling.pop_response().unwrap().unwrap().id, Some(string_id));
+        assert_eq!(responses.pending_responses(), 0);
+    }
+
+    #[test]
+    fn streamable_http_numeric_alias_finds_unowned_output_before_id_reuse() {
+        let mut transport = StreamableHttpTransport::new();
+        let responses = transport.response_stream().unwrap();
+        let cx = Cx::for_testing();
+        let original = RequestId::Integer("170e-1".into());
+        let alias = RequestId::Number(17);
+        transport.send(
+            &cx,
+            &JsonRpcMessage::Response(JsonRpcResponse::success(original.clone(), serde_json::json!({}))),
+        ).unwrap();
+        assert!(matches!(
+            responses.for_request(alias.clone()),
+            Err(TransportError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert!(responses.pop_response(Some(&RequestId::String("17".into()))).unwrap().is_none());
+        assert_eq!(responses.pop_response(Some(&alias)).unwrap().unwrap().id, Some(original));
+        let body = responses.for_request(alias).unwrap();
+        assert!(body.pop_response().unwrap().is_none());
+    }
+
+    #[test]
     fn streamable_http_subscription_cancellation_is_one_terminal_for_its_owner() {
         let mut transport = StreamableHttpTransport::new();
         let responses = transport.response_stream().unwrap();
@@ -12959,7 +13014,7 @@ Content-Length: {}\r\n\
             if cancellation.is_cancelled() {
                 match responses.request_states.try_lock() {
                     Err(TryLockError::WouldBlock) => break true,
-                    Ok(states) if !states.contains_key(&RequestId::Number(704)) => break false,
+                    Ok(states) if !states.contains_key(&cancellation.state.key) => break false,
                     Ok(_) => {}
                     Err(TryLockError::Poisoned(_)) => break false,
                 }
