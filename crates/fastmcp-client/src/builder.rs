@@ -2408,8 +2408,8 @@ mod tests {
             .expect("reverse callback test runtime must build")
     }
 
-    #[cfg(all(unix, feature = "apps", feature = "legacy-2024-11-05"))]
-    fn auto_legacy_lifecycle_script(discovery_error_code: i32) -> String {
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn auto_legacy_lifecycle_script(discovery_error_code: impl std::fmt::Display) -> String {
         format!(
             "IFS= read -r first || exit 1; \\
              case \"$first\" in \\
@@ -2780,6 +2780,94 @@ exec sleep 5
             ("builder", connect_yielding(builder, script)),
             ("constructor", direct),
         ]
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn public_stdio_auto_falls_back_for_non_modern_discovery_errors() {
+        // The discovery branch never reads initialize. A successful legacy
+        // lifecycle therefore proves a new subprocess, and the fixture rejects
+        // modern metadata on that process's initialize and ordinary requests.
+        for code in [
+            "-32601",
+            "-32602",
+            "-32600",
+            "-32603",
+            "-32000",
+            "1",
+            "2147483648",
+            "-9223372036854775809",
+        ] {
+            let script = auto_legacy_lifecycle_script(code);
+            for (path, result) in connect_on_both_initializers(ProtocolPolicy::Auto, &script) {
+                let mut client = result.unwrap_or_else(|error| {
+                    panic!("{path} must select a fresh legacy child for {code}: {error}")
+                });
+                assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+                assert_eq!(
+                    client.selected_protocol_era(),
+                    Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024),
+                    "{path} with {code}"
+                );
+                client
+                    .ping()
+                    .expect("fallback returns a usable legacy client");
+                client.close().expect("fallback client cleanup");
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn public_stdio_auto_never_falls_back_for_recognized_modern_errors() {
+        // Only the error code differs from the positive fixture. Integral
+        // decimal/exponent aliases must not turn a modern refusal into fallback.
+        for code in [
+            "-32020",
+            "-32021",
+            "-32022",
+            "-32020.0",
+            "-3.2021e4",
+            "-320220e-1",
+        ] {
+            let script = auto_legacy_lifecycle_script(code);
+            for (path, result) in connect_on_both_initializers(ProtocolPolicy::Auto, &script) {
+                let error = match result {
+                    Ok(mut client) => {
+                        let _ = client.close();
+                        panic!("{path} must not downgrade a recognized modern error {code}");
+                    }
+                    Err(error) => error,
+                };
+                assert!(
+                    error.message.contains("final discovery unavailable"),
+                    "{path} preserves the modern refusal for {code}: {error}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn public_stdio_modern_only_never_falls_back_for_non_modern_errors() {
+        for code in ["-32602", "1", "2147483648"] {
+            let script = auto_legacy_lifecycle_script(code);
+            for (path, result) in
+                connect_on_both_initializers(ProtocolPolicy::ModernOnly, &script)
+            {
+                let error = match result {
+                    Ok(mut client) => {
+                        let _ = client.close();
+                        panic!("{path} must preserve ModernOnly for {code}");
+                    }
+                    Err(error) => error,
+                };
+                assert!(
+                    error.message.contains("final discovery unavailable"),
+                    "{path} preserves the ModernOnly refusal for {code}: {error}"
+                );
+            }
+        }
     }
 
     /// Both shipped legacy initializers correlate `initialize` by its exact
@@ -5219,6 +5307,14 @@ exit 73
                 "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{},\"error\":{\"code\":-32601,\"message\":\"method not found\"}}'; exec sleep 2",
             ),
             ("transport-closed", "exit 0"),
+            (
+                "wrong-id-non-modern-error",
+                "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"invalid params\"}}'; exec sleep 2",
+            ),
+            (
+                "malformed-error-code",
+                "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":\"-32602\",\"message\":\"invalid params\"}}'; exec sleep 2",
+            ),
         ];
 
         for (name, discovery_branch) in cases {
@@ -5376,12 +5472,10 @@ exit 73
     #[cfg(unix)]
     #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
     #[test]
-    fn default_builder_auto_rejects_invalid_params_discovery_without_legacy_fallback() {
-        // This differs from the accepted default-Auto fallback fixture only in
-        // the discovery error code. If Auto starts a legacy child for -32602,
-        // the fixture's initialize branch succeeds and this test incorrectly
-        // receives a live legacy client. -32602 means the peer knows
-        // server/discover, so it proves the modern era (#80).
+    fn default_builder_auto_accepts_invalid_params_discovery_on_a_fresh_legacy_child() {
+        // Canonical plan 5.10 permits a legacy server to reject a pre-initialize
+        // discovery probe with -32602. The adjacent -32022 fixture remains the
+        // matched negative: a recognized modern error never authorizes fallback.
         let script = auto_legacy_lifecycle_script(-32602);
         let builder = ClientBuilder::new().mcp_apps(
             McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
@@ -5389,16 +5483,22 @@ exit 73
         );
         let state_before_connect = builder.selected_protocol_plan().clone();
 
-        let error = match block_on(builder.clone().connect_stdio_with_cx(
-            &Cx::for_request(),
+        let mut client = block_on(builder.clone().connect_stdio_with_cx(
+            &stdio_test_caller(),
             "sh",
             &["-c", script.as_str()],
-        )) {
-            Ok(_) => panic!("invalid discovery parameters must not authorize legacy fallback"),
-            Err(error) => error,
-        };
+        ))
+        .expect("non-modern discovery refusal starts a fresh exact legacy client");
 
-        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+        );
+        client
+            .ping()
+            .expect("the Auto-selected legacy client remains usable");
+        client.close().expect("invalid-params fallback client cleanup");
         assert_eq!(builder.selected_protocol_plan(), &state_before_connect);
     }
 

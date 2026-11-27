@@ -97,8 +97,10 @@ pub enum TestClientProtocolMode {
     Modern2026,
     /// Modern-first negotiation: probes `server/discover` (`2026-07-28`) and
     /// falls back to exact `2024-11-05` `initialize` only when the peer
-    /// replies with a correlated `MethodNotFound` (`-32601`) and a fresh
-    /// endpoint factory was installed with [`TestClient::with_legacy_transport_factory`].
+    /// replies with an admitted, correlated non-modern JSON-RPC error and a
+    /// fresh endpoint factory was installed with
+    /// [`TestClient::with_legacy_transport_factory`]. Recognized modern
+    /// protocol errors never authorize fallback.
     Auto,
 }
 
@@ -225,9 +227,10 @@ impl TestClient {
     ///
     /// The probed endpoint is closed before this factory runs. It receives the
     /// caller's context and must return an independently driven, fresh endpoint.
-    /// Malformed replies, wrong IDs, unsupported modern versions, cancellation,
-    /// and transport failures never invoke it. Without a factory, a legacy-only
-    /// peer's error is returned and the probe endpoint is retired.
+    /// Malformed replies, wrong IDs, recognized modern errors, unsupported
+    /// modern versions, cancellation, and transport failures never invoke it.
+    /// Without a factory, a legacy-only peer's error is returned and the probe
+    /// endpoint is retired.
     #[must_use]
     pub fn with_legacy_transport_factory<F>(mut self, factory: F) -> Self
     where
@@ -479,7 +482,7 @@ impl TestClient {
         if let Some(error) = received.response.error.take() {
             // Eligibility comes only from this exact, admitted, correlated
             // wire response, never from a flattened local or transport error.
-            if error.code.as_i32() == Some(-32601) {
+            if !error.is_recognized_modern_protocol_error() {
                 return Ok(ModernProbe::LegacyCandidate(error));
             }
             return Err(Self::peer_error(error));
@@ -1538,6 +1541,140 @@ mod tests {
         .unwrap();
         assert!(client.list_tools().unwrap().is_empty());
         assert_eq!(client.protocol_version(), Some(FINAL_PROTOCOL_VERSION));
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn test_client_auto_uses_the_same_non_modern_error_boundary_as_stdio() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        for (code, auto_eligible) in [
+            ("-32601", true),
+            ("-32602", true),
+            ("1", true),
+            ("2147483648", true),
+            ("-9223372036854775809", true),
+            ("-32020", false),
+            ("-32021", false),
+            ("-32022", false),
+            ("-32020.0", false),
+            ("-3.2021e4", false),
+            ("-320220e-1", false),
+        ] {
+            for mode in [
+                TestClientProtocolMode::Auto,
+                TestClientProtocolMode::Modern2026,
+            ] {
+                let (transport, mut probe_peer) = create_memory_transport_pair();
+                let (legacy_transport, mut legacy_peer) = create_memory_transport_pair();
+                let cx = Cx::for_testing();
+                probe_peer
+                    .send(
+                        &cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::error(
+                            Some(RequestId::Number(1)),
+                            JsonRpcError {
+                                code: code.parse().expect("the fixture is a JSON integer"),
+                                message: "first discovery refused".to_owned(),
+                                data: None,
+                            },
+                        )),
+                    )
+                    .unwrap();
+                legacy_peer
+                    .send(
+                        &cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            RequestId::Number(2),
+                            serde_json::json!({
+                                "protocolVersion": PROTOCOL_VERSION,
+                                "capabilities": {},
+                                "serverInfo": {"name": "fresh-legacy", "version": "1"},
+                            }),
+                        )),
+                    )
+                    .unwrap();
+                legacy_peer
+                    .send(
+                        &cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            RequestId::Number(3),
+                            serde_json::json!({"tools": [{
+                                "name": "legacy-after-fallback",
+                                "inputSchema": {"type": "object"},
+                            }]}),
+                        )),
+                    )
+                    .unwrap();
+                let fallback_calls = Arc::new(AtomicUsize::new(0));
+                let calls = Arc::clone(&fallback_calls);
+                let mut client = TestClient::new(transport, cx.clone())
+                    .with_protocol_mode(mode)
+                    .with_legacy_transport_factory(move |_| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(legacy_transport)
+                    });
+
+                let result = client.initialize_core();
+                if auto_eligible && mode == TestClientProtocolMode::Auto {
+                    assert!(matches!(
+                        result.unwrap(),
+                        CoreResult::Legacy(LegacyCoreResult::Initialize(_))
+                    ));
+                    assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        client.negotiated_mode(),
+                        Some(TestClientProtocolMode::Legacy2024)
+                    );
+                    assert_eq!(client.protocol_version(), Some(PROTOCOL_VERSION));
+                    assert!(client.server_discovery().is_none());
+                    let tools = client.list_tools().expect("fresh legacy client is usable");
+                    assert_eq!(tools.len(), 1);
+                    assert_eq!(tools[0].name, "legacy-after-fallback");
+
+                    for (method, id) in [
+                        ("initialize", Some(RequestId::Number(2))),
+                        ("notifications/initialized", None),
+                        ("tools/list", Some(RequestId::Number(3))),
+                    ] {
+                        let JsonRpcMessage::Request(request) = legacy_peer.recv(&cx).unwrap() else {
+                            panic!("the fresh legacy endpoint receives the exact lifecycle");
+                        };
+                        assert_eq!(request.method, method);
+                        assert_eq!(request.id, id);
+                        assert!(
+                            request
+                                .params
+                                .as_ref()
+                                .and_then(|params| params.get("_meta"))
+                                .is_none()
+                        );
+                    }
+                } else {
+                    let error = result.expect_err("modern errors or Modern2026 never downgrade");
+                    assert_eq!(
+                        error.message,
+                        "first discovery refused",
+                        "{mode:?}: {code}"
+                    );
+                    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+                    assert!(!client.is_initialized());
+                    assert!(client.negotiated_mode().is_none());
+                    assert!(client.transport().is_closed());
+                    assert!(client.initialize_core().is_err());
+                    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+                }
+
+                let JsonRpcMessage::Request(probe) = probe_peer.recv(&cx).unwrap() else {
+                    panic!("the disposable endpoint receives its discovery probe");
+                };
+                assert_eq!(probe.method, "server/discover");
+                assert_eq!(probe.id, Some(RequestId::Number(1)));
+                assert!(matches!(probe_peer.recv(&cx), Err(TransportError::Closed)));
+                client.close();
+            }
+        }
     }
 
     #[test]

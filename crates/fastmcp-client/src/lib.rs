@@ -9,9 +9,10 @@
 //!
 //! MCP 2026-07-28 support is under implementation and remains unverified. The
 //! public stdio constructor starts with a modern `server/discover` probe and
-//! opens a fresh exact-2024 child only for a correlated `MethodNotFound`
-//! refusal or Unix-observable clean first-probe timeout; this source inventory
-//! is not aggregate conformance or release evidence.
+//! opens a fresh exact-2024 child for a correlated nonmodern discovery error
+//! or Unix-observable clean first-probe timeout. Recognized modern errors
+//! retain the modern selection; this source inventory is not aggregate
+//! conformance or release evidence.
 //!
 //! # Example
 //!
@@ -5051,9 +5052,9 @@ fn validate_initialize_result(result: &InitializeResult) -> McpResult<()> {
 /// ingress was admitted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AutoStdioFallbackSignal {
-    /// The first, correlated discovery response was JSON-RPC MethodNotFound
+    /// The first, correlated discovery response was a non-modern JSON-RPC error
     /// (see [`authorizes_auto_legacy_fallback`]).
-    CorrelatedDiscoverMethodNotFound,
+    CorrelatedDiscoverNonModernError,
     /// The committed first discovery request reached a clean receive deadline.
     CleanFirstProbeTimeout { source: RequestTimeoutSource },
 }
@@ -5061,16 +5062,15 @@ pub(crate) enum AutoStdioFallbackSignal {
 /// Whether an error answering the first Auto `server/discover` authorizes the
 /// exact-2024 branch.
 ///
-/// LEG-NEG-01-A / CLT-02 (#80): only `-32601` Method not found authorizes the
-/// downgrade. An exact 2024-11-05 server does not know `server/discover` and
-/// answers it with MethodNotFound. Any other error means the method exists:
-/// `-32602` Invalid params, an application error, and the recognized modern
-/// errors (`-32020` header mismatch, `-32021` missing client capability,
-/// `-32022` unsupported protocol version) all prove a modern peer and keep the
-/// modern era. Downgrading on them would also let a misbehaving or hostile
-/// server force the legacy protocol.
+/// CLT-02 / canonical plan 0.3 and 5.10: an admitted, correlated first-probe
+/// error authorizes Auto's fresh legacy branch unless its code is recognized
+/// as modern. A legacy peer can reject pre-initialize discovery with Invalid
+/// params or an implementation-defined application code, not only Method not
+/// found. The recognized modern errors (`-32020`, `-32021`, `-32022`) keep the
+/// modern era. Raw JSON-RPC error codes remain unbounded integers here rather
+/// than being flattened through the narrower local error vocabulary.
 fn authorizes_auto_legacy_fallback(error: &JsonRpcError) -> bool {
-    error.code.as_i32() == Some(-32_601)
+    !error.is_recognized_modern_protocol_error()
 }
 
 /// Rechecks the caller-owned context at Auto's one allowed downgrade boundary.
@@ -22064,7 +22064,7 @@ impl Client {
         if let Some(error) = response.error.take() {
             if auto_probe && authorizes_auto_legacy_fallback(&error) {
                 return Ok(std::task::Poll::Ready(Some(
-                    AutoStdioFallbackSignal::CorrelatedDiscoverMethodNotFound,
+                    AutoStdioFallbackSignal::CorrelatedDiscoverNonModernError,
                 )));
             }
             return Err(json_rpc_error_to_mcp(error));
@@ -24869,7 +24869,7 @@ impl Client {
     /// Sends Auto's one disposable modern discovery request.
     ///
     /// Unlike the ordinary prepared-request path, this preserves two facts
-    /// until selection is complete: a correlated MethodNotFound reply and a
+    /// until selection is complete: a correlated non-modern error reply and a
     /// clean no-ingress receive deadline. Both are lost if converted eagerly
     /// into the generic request error vocabulary.
     fn send_modern_discovery_probe(
@@ -24907,7 +24907,7 @@ impl Client {
         if let Some(error) = response.error.take() {
             if authorizes_auto_legacy_fallback(&error) {
                 return Ok(Err(
-                    AutoStdioFallbackSignal::CorrelatedDiscoverMethodNotFound,
+                    AutoStdioFallbackSignal::CorrelatedDiscoverNonModernError,
                 ));
             }
             return Err(json_rpc_error_to_mcp(error));
@@ -49722,21 +49722,32 @@ exec sleep 2
     use asupersync::runtime::RuntimeBuilder;
 
     #[test]
-    fn auto_legacy_fallback_is_authorized_only_by_method_not_found() {
-        let refusal = |code: i32| JsonRpcError {
-            code: code.into(),
-            message: "discovery refusal".to_owned(),
-            data: None,
-        };
-        // An exact 2024-11-05 server does not know `server/discover`.
-        assert!(authorizes_auto_legacy_fallback(&refusal(-32_601)));
-        // Every other answer proves the method exists: keep the modern era.
-        for code in [
-            -32_602, -32_600, -32_603, -32_000, -32_020, -32_021, -32_022, 1,
+    fn auto_legacy_fallback_accepts_only_non_modern_discovery_errors() {
+        for (code, eligible) in [
+            ("-32601", true),
+            ("-32602", true),
+            ("-32600", true),
+            ("-32603", true),
+            ("-32000", true),
+            ("1", true),
+            ("2147483648", true),
+            ("-9223372036854775809", true),
+            ("-32020", false),
+            ("-32021", false),
+            ("-32022", false),
+            ("-32020.0", false),
+            ("-3.2021e4", false),
+            ("-320220e-1", false),
         ] {
-            assert!(
-                !authorizes_auto_legacy_fallback(&refusal(code)),
-                "{code} must never authorize a legacy downgrade"
+            let refusal = JsonRpcError {
+                code: code.parse().expect("the fixture is a JSON integer"),
+                message: "discovery refusal".to_owned(),
+                data: None,
+            };
+            assert_eq!(
+                authorizes_auto_legacy_fallback(&refusal),
+                eligible,
+                "first-probe error {code} follows the frozen stdio policy"
             );
         }
     }
@@ -49744,8 +49755,8 @@ exec sleep 2
     #[test]
     fn auto_stdio_fallback_signals_are_explicit_and_bounded() {
         assert_eq!(
-            AutoStdioFallbackSignal::CorrelatedDiscoverMethodNotFound,
-            AutoStdioFallbackSignal::CorrelatedDiscoverMethodNotFound
+            AutoStdioFallbackSignal::CorrelatedDiscoverNonModernError,
+            AutoStdioFallbackSignal::CorrelatedDiscoverNonModernError
         );
         assert_eq!(
             AutoStdioFallbackSignal::CleanFirstProbeTimeout {
@@ -66595,24 +66606,30 @@ IFS= read -r second || exit 91
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_02_public_stdio_auto_reopens_one_fresh_exact_legacy_child() {
-        // Only MethodNotFound to the first discovery is the legacy branch: an
-        // exact 2024 server does not know `server/discover` (#80).
-        let script = auto_discovery_refusal_client_script(-32_601);
-        let mut client = Client::stdio_with_cx(Cx::for_testing(), "sh", &["-c", script.as_str()])
-            .expect("only a discovery MethodNotFound authorizes the fresh legacy child");
+        // A correlated nonmodern error to the isolated first discovery permits
+        // one fresh exact-2024 child, including InvalidParams and application
+        // errors (comprehensive plan 0.3 / 5.10).
+        for refusal in [-32_601, -32_602, -32_000] {
+            let script = auto_discovery_refusal_client_script(refusal);
+            let mut client =
+                Client::stdio_with_cx(Cx::for_testing(), "sh", &["-c", script.as_str()])
+                    .unwrap_or_else(|error| {
+                        panic!("{refusal} must authorize a fresh legacy child: {error}")
+                    });
 
-        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
-        assert_eq!(
-            client.selected_protocol_era(),
-            Some(ProtocolEra::Legacy2024)
-        );
-        assert!(client.server_discovery().is_none());
-        client
-            .ping()
-            .expect("the fresh exact legacy child receives the historical request shape");
-        client
-            .close()
-            .expect("public legacy fallback client cleanup");
+            assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+            assert_eq!(
+                client.selected_protocol_era(),
+                Some(ProtocolEra::Legacy2024)
+            );
+            assert!(client.server_discovery().is_none());
+            client
+                .ping()
+                .expect("the fresh exact legacy child receives the historical request shape");
+            client
+                .close()
+                .expect("public legacy fallback client cleanup");
+        }
     }
 
     #[cfg(unix)]
@@ -66620,24 +66637,22 @@ IFS= read -r second || exit 91
     #[test]
     fn clt_02_public_stdio_auto_keeps_the_modern_era_on_a_recognized_modern_refusal() {
         // Only the discovery refusal code differs from the paired fallback
-        // positive: any error other than MethodNotFound means the peer knows
-        // `server/discover`, so no second process may be used as a legacy
-        // replay path (#80). This covers InvalidParams, an application error
-        // and the recognized modern errors.
-        for refusal in [-32_602, -32_000, -32_020, -32_021, -32_022] {
+        // positive: these three reserved errors fix the modern era, so a
+        // second process cannot be used as a legacy replay path.
+        for refusal in [-32_020, -32_021, -32_022] {
             let script = auto_discovery_refusal_client_script(refusal);
             let error =
                 match Client::stdio_with_cx(Cx::for_testing(), "sh", &["-c", script.as_str()]) {
-                    Ok(_) => panic!("a recognized modern {refusal} refusal cannot fall back"),
+                    Ok(mut client) => {
+                        client.close().expect("unexpected fallback cleanup");
+                        panic!("a recognized modern {refusal} refusal cannot fall back");
+                    }
                     Err(error) => error,
                 };
             assert!(
                 error.message.contains("discovery refusal"),
                 "{refusal}: {error}"
             );
-            if refusal == -32_602 {
-                assert_eq!(error.code, McpErrorCode::InvalidParams, "{error}");
-            }
         }
     }
 

@@ -1449,6 +1449,19 @@ pub struct JsonRpcError {
     pub data: Option<Value>,
 }
 
+impl JsonRpcError {
+    /// Recognizes the reserved MCP 2026-07-28 protocol error codes.
+    ///
+    /// Recognition uses the mathematical integer value, including decimal and
+    /// exponent aliases, without changing the retained wire spelling. Callers
+    /// must separately admit and correlate the response before applying their
+    /// immutable, transport-specific negotiation policy.
+    #[must_use]
+    pub fn is_recognized_modern_protocol_error(&self) -> bool {
+        matches!(self.code.as_i32(), Some(-32_020 | -32_021 | -32_022))
+    }
+}
+
 fn deserialize_error_data<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
 where
     D: Deserializer<'de>,
@@ -2750,6 +2763,33 @@ mod tests {
     // ========================================================================
     // JsonRpcError Tests
     // ========================================================================
+
+    #[test]
+    fn jsonrpc_error_recognizes_modern_protocol_errors_numerically() {
+        for (code, modern) in [
+            ("-32020", true),
+            ("-32021", true),
+            ("-32022", true),
+            ("-32020.0", true),
+            ("-3.2021e4", true),
+            ("-320220e-1", true),
+            ("-32601", false),
+            ("-32602", false),
+            ("-32019", false),
+            ("-32023", false),
+            ("1", false),
+            ("2147483648", false),
+            ("-9223372036854775809", false),
+        ] {
+            let error = JsonRpcError {
+                code: code.parse().expect("the fixture is a JSON integer"),
+                message: "discovery refusal".to_owned(),
+                data: None,
+            };
+            assert_eq!(error.is_recognized_modern_protocol_error(), modern, "{code}");
+            assert_eq!(error.code.as_str(), code, "classification preserves source");
+        }
+    }
 
     #[test]
     fn jsonrpc_error_from_mcp_error_preserves_code_message_and_data() {
