@@ -5582,6 +5582,7 @@ impl crate::HttpClient {
     where
         A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
     {
+        #[allow(clippy::infallible_destructuring_match)]
         let modern = match &self.connection {
             ClientHttpConnection::Modern(client) => client,
             #[cfg(feature = "legacy-2024-11-05")]
@@ -10181,7 +10182,7 @@ impl ModernHttpClient {
                 parameters,
                 Some(request_id.clone()),
                 None,
-                false,
+                true,
             )
             .map_err(ModernHttpMrtrError::Request)?;
         let wire_request: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
@@ -28576,7 +28577,11 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
         let peer = thread::spawn(move || {
             let mut probe = accept_notification_test_peer(&listener);
             let _ = read_request(&mut probe);
-            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+            #[cfg(feature = "tasks")]
+            let discovery = modern_tasks_discovery_body();
+            #[cfg(not(feature = "tasks"))]
+            let discovery = modern_discovery_body();
+            write_response(&mut probe, 200, "application/json", discovery.as_ref());
             let mut expected_id = 2;
             for (method, continued, result) in [
                 (TOOLS_CALL, false, serde_json::Value::Null),
@@ -28589,6 +28594,13 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
                 assert_eq!(body["id"], expected_id);
                 assert_eq!(body["method"], method);
                 assert!(body["params"].get("requestState").is_none());
+                let metadata = &body["params"]["_meta"];
+                assert_eq!(metadata[fastmcp_protocol::FINAL_LOG_LEVEL_META_KEY], "notice");
+                assert!(
+                    metadata[FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                        .get("io.modelcontextprotocol/tasks")
+                        .is_none()
+                );
                 let challenge = serde_json::json!({
                     "jsonrpc":"2.0","id":expected_id,
                     "result":{"resultType":"input_required","requestState":"next",
@@ -28615,12 +28627,39 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
         });
         runtime_block_on(async {
             let cx = Cx::current().unwrap();
-            let mut client = crate::HttpClient::connect(
+            let settings = super::HttpConnectionSettings::default();
+            #[cfg(feature = "tasks")]
+            let settings = {
+                use fastmcp_protocol::extensions::{
+                    ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionSettings,
+                    official_mcp_apps_negotiation_resolver, register_official_tasks_extension,
+                };
+                let mut registry = ExtensionDescriptorRegistry::new();
+                let tasks = register_official_tasks_extension(&mut registry).unwrap();
+                let extensions = BTreeMap::from([(
+                    tasks,
+                    ExtensionSettings::new(serde_json::json!({})).unwrap(),
+                )]);
+                let runtime = crate::session::ClientExtensionRuntime::new(
+                    registry,
+                    ClientExtensionDiscovery { extensions },
+                    official_mcp_apps_negotiation_resolver,
+                )
+                .unwrap();
+                super::HttpConnectionSettings { extensions: Some(Arc::new(runtime)), ..settings }
+            };
+            let mut client = crate::HttpClient::connect_with_settings(
                 &cx,
                 plan(&target, "http://127.0.0.1:9/sse", "http://127.0.0.1:9/messages", ProtocolPolicy::ModernOnly),
                 ClientInfo { name: "async-mrtr".into(), version: "1".into() },
-                serde_json::from_value(serde_json::json!({"roots": {}})).unwrap(),
+                ClientCapabilities {
+                    roots: Some(fastmcp_protocol::RootsCapability { list_changed: false }),
+                    ..ClientCapabilities::default()
+                },
+                settings,
+                ReverseRequestHandlers::new(),
             ).await.unwrap();
+            client.set_log_level_typed(super::LoggingLevel::Notice).unwrap();
             let limits = SseLimits::new(1024, 8192, 8).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             let stopped = McpRequestCancellation::new();
