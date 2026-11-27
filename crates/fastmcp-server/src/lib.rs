@@ -4187,6 +4187,147 @@ fn server_run_error(stage: &'static str, kind: &'static str, message: &'static s
     )
 }
 
+#[cfg(unix)]
+fn process_stdio_uses_native_pipes(
+    cx: &Cx,
+    input: &impl std::os::fd::AsFd,
+    output: &impl std::os::fd::AsFd,
+) -> McpResult<bool> {
+    use std::os::unix::fs::FileTypeExt;
+
+    // Classification must not read a frame, mutate shared descriptor flags,
+    // or probe descriptors through a wider caller than the surrounding host.
+    // Only a known non-pipe pair selects the compatibility pump. An inspection
+    // failure is not evidence that falling back to blocking I/O is safe.
+    fastmcp_core::runtime::with_caller_context(cx, || {
+        let caller = Cx::current().ok_or_else(|| {
+            server_run_error(
+                "startup",
+                "stdio_caller",
+                "Process stdio caller is unavailable",
+            )
+        })?;
+        caller
+            .checkpoint()
+            .map_err(|_| McpError::request_cancelled())?;
+        if !caller.capabilities().io {
+            return Err(server_run_error(
+                "startup",
+                "stdio_capability",
+                "Process stdio requires the caller's I/O capability",
+            ));
+        }
+        let input = std::fs::File::from(input.as_fd().try_clone_to_owned().map_err(|_| {
+            server_run_error(
+                "startup",
+                "stdio_input_probe",
+                "Could not inspect process stdin",
+            )
+        })?);
+        let input_is_pipe = input
+            .metadata()
+            .map_err(|_| {
+                server_run_error(
+                    "startup",
+                    "stdio_input_probe",
+                    "Could not inspect process stdin",
+                )
+            })?
+            .file_type()
+            .is_fifo();
+        let output = std::fs::File::from(output.as_fd().try_clone_to_owned().map_err(|_| {
+            server_run_error(
+                "startup",
+                "stdio_output_probe",
+                "Could not inspect process stdout",
+            )
+        })?);
+        let output_is_pipe = output
+            .metadata()
+            .map_err(|_| {
+                server_run_error(
+                    "startup",
+                    "stdio_output_probe",
+                    "Could not inspect process stdout",
+                )
+            })?
+            .file_type()
+            .is_fifo();
+        Ok(input_is_pipe && output_is_pipe)
+    })
+}
+
+#[cfg(all(test, unix))]
+mod native_process_stdio_admission_tests {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsFd, BorrowedFd};
+
+    use asupersync::cx::cap::CapMask;
+
+    use super::{CancelKind, Cx, McpErrorCode, process_stdio_uses_native_pipes};
+
+    struct UnavailableDescriptor;
+
+    impl AsFd for UnavailableDescriptor {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            panic!("descriptor inspection must follow caller admission");
+        }
+    }
+
+    #[test]
+    fn pipe_classification_does_not_consume_input_or_require_a_reactor() {
+        let cx = Cx::for_testing();
+        let (mut input, mut input_peer) = std::io::pipe().unwrap();
+        let (_output_peer, output) = std::io::pipe().unwrap();
+        input_peer
+            .write_all(b"opening frame remains owned\n")
+            .unwrap();
+        drop(input_peer);
+
+        assert!(process_stdio_uses_native_pipes(&cx, &input, &output).unwrap());
+        let mut preserved = Vec::new();
+        input.read_to_end(&mut preserved).unwrap();
+        assert_eq!(preserved, b"opening frame remains owned\n");
+    }
+
+    #[test]
+    fn either_non_pipe_endpoint_selects_the_compatibility_pump() {
+        let cx = Cx::for_testing();
+        let regular =
+            std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        let (input, input_peer) = std::io::pipe().unwrap();
+        let (output_peer, output) = std::io::pipe().unwrap();
+
+        assert!(!process_stdio_uses_native_pipes(&cx, &regular, &output).unwrap());
+        assert!(!process_stdio_uses_native_pipes(&cx, &input, &regular).unwrap());
+        drop((input_peer, output_peer));
+    }
+
+    #[test]
+    fn ambient_io_restriction_refuses_before_descriptor_inspection() {
+        let cx = Cx::for_testing();
+        let _host = Cx::set_current(Some(Cx::for_testing()));
+        let _restriction = Cx::push_restriction(CapMask::none());
+
+        let error =
+            process_stdio_uses_native_pipes(&cx, &UnavailableDescriptor, &UnavailableDescriptor)
+                .unwrap_err();
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(error.data.unwrap()["kind"], "stdio_capability");
+    }
+
+    #[test]
+    fn cancelled_caller_refuses_before_descriptor_inspection() {
+        let cx = Cx::for_testing();
+        cx.cancel_with(CancelKind::User, None);
+
+        let error =
+            process_stdio_uses_native_pipes(&cx, &UnavailableDescriptor, &UnavailableDescriptor)
+                .unwrap_err();
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+    }
+}
+
 fn returning_send_result_with_connection_failure(
     error: &TransportError,
     connection_failure: &Option<Arc<AtomicBool>>,
@@ -21771,25 +21912,54 @@ impl Server {
             .await
     }
 
-    /// Runs the server on stdio with a provided Cx.
+    /// Runs the server on process stdio and exits after serving has settled.
     ///
-    /// The application owns the runtime and must configure a blocking pool
-    /// for the receive pump. This method does not create or re-enter a runtime.
+    /// On Unix, when both stdin and stdout are pipes, this uses the same native
+    /// asynchronous dispatcher as [`Self::serve_stdio_io`]. The application
+    /// supplies a reactor, timer and their capabilities through `cx`. Async
+    /// handlers and lifecycle hooks need no blocking-pool workers; handlers
+    /// explicitly declared blocking still require the caller's blocking pool.
+    /// ModernOnly, Auto and LegacyOnly retain their configured era policy.
     ///
-    /// On Unix, the receive pump uses readiness polling so cancellation from a
-    /// failed dispatch worker remains observable while stdin is silent or a
-    /// pipe frame is incomplete. Unix responses use nonblocking writes with a
-    /// bounded commit deadline for ordinary pipes and sockets; regular files
-    /// and some devices may ignore `O_NONBLOCK`. Other targets use the
-    /// sequential server loop: that avoids a worker failing while the receive
-    /// side is blocked, but generic blocking stdin reads and stdout writes
-    /// remain observable only at frame boundaries or I/O completion.
+    /// Dedicate both process streams to this connection for its lifetime. Do
+    /// not mix other stdin readers, stdout writers, buffered output, or aliases
+    /// that change descriptor flags with MCP serving. Native pipe ownership
+    /// temporarily enables `O_NONBLOCK` and restores the original flags during
+    /// cleanup; it never closes or replaces process descriptors 0 and 1. Send
+    /// application diagnostics to stderr. Startup, Task-service readiness,
+    /// request draining and shutdown use the native lifecycle in that order.
+    /// A native admission or serving failure is terminal and never retries the
+    /// connection through the compatibility pump.
     ///
-    /// If an arbitrary handler does not quiesce within the bounded worker
-    /// shutdown deadline, the process exits unsuccessfully without running the
-    /// shutdown hook; running a hook concurrently with a live handler would
-    /// violate the hook's quiescence contract.
+    /// Non-pipe stdio and non-Unix targets retain the compatibility pump and
+    /// require a caller-owned blocking pool. That path cannot run async
+    /// lifecycle hooks. Unix input uses readiness polling and ordinary pipe or
+    /// socket output has a bounded commit deadline; regular files and devices
+    /// may still block. Other targets observe cancellation only at frame
+    /// boundaries or I/O completion. An uncooperative compatibility worker
+    /// prevents the shutdown hook and causes unsuccessful process exit.
+    ///
+    /// This method creates no runtime. Use [`Self::serve_stdio_io`] when the
+    /// application needs a returning lifecycle instead of process exit.
     pub async fn run_stdio_with_cx(self, cx: &Cx) -> ! {
+        #[cfg(unix)]
+        match process_stdio_uses_native_pipes(cx, &std::io::stdin(), &std::io::stdout()) {
+            Ok(true) => {
+                let exit_code = match self.run_native_process_stdio(cx).await {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        error!(target: targets::SERVER, "Native process stdio failed: {error}");
+                        1
+                    }
+                };
+                std::process::exit(exit_code);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                error!(target: targets::SERVER, "Could not select process stdio: {error}");
+                std::process::exit(1);
+            }
+        }
         if let Err(error) = self.admit_blocking_lifespan() {
             error!(target: targets::SERVER, "{error}");
             std::process::exit(1);
@@ -21818,6 +21988,67 @@ impl Server {
             }
         };
         std::process::exit(exit_code)
+    }
+
+    #[cfg(unix)]
+    async fn run_native_process_stdio(self, cx: &Cx) -> McpResult<()> {
+        fastmcp_core::runtime::CallerContextFuture::new(cx, async move {
+            let caller = Cx::current().ok_or_else(|| {
+                server_run_error(
+                    "startup",
+                    "stdio_caller",
+                    "Native stdio caller is unavailable",
+                )
+            })?;
+            caller
+                .checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
+            if !caller.capabilities().time || caller.timer_driver().is_none() {
+                return Err(server_run_error(
+                    "startup",
+                    "stdio_timer",
+                    "Native process stdio requires the caller's time capability and timer",
+                ));
+            }
+            let mut input =
+                fastmcp_transport::NativePipeReader::from_stdin(&caller).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotConnected {
+                        server_run_error(
+                            "startup",
+                            "stdio_reactor",
+                            "Native process stdio requires the caller's I/O reactor",
+                        )
+                    } else {
+                        server_run_error(
+                            "startup",
+                            "stdio_input_claim",
+                            "Could not acquire native process stdin",
+                        )
+                    }
+                })?;
+            let output = match fastmcp_transport::NativePipeWriter::from_stdout(&caller) {
+                Ok(output) => output,
+                Err(_) => {
+                    // No frame has been read and startup has not run. Report
+                    // failed rollback explicitly rather than dropping an
+                    // uncertain lease and retrying with blocking descriptors.
+                    input.close().map_err(|_| {
+                        server_run_error(
+                            "startup",
+                            "stdio_input_cleanup",
+                            "Could not acquire native stdout or restore process stdin",
+                        )
+                    })?;
+                    return Err(server_run_error(
+                        "startup",
+                        "stdio_output_claim",
+                        "Could not acquire native process stdout",
+                    ));
+                }
+            };
+            self.serve_stdio_io(&caller, input, output).await
+        })
+        .await
     }
 
     fn run_stdio_pump(self, cx: &Cx, dispatch_cx: &Cx) -> i32 {
