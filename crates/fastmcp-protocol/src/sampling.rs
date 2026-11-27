@@ -107,7 +107,7 @@ struct ToolSchemas {
 
 enum Phase {
     Ready,
-    Tools(Vec<(String, String)>),
+    Tools(BTreeMap<String, String>),
     Complete(Box<FinalCreateMessageResult>),
     Closed,
 }
@@ -184,7 +184,7 @@ impl SamplingToolLoop {
             return Err(SamplingToolLoopError::ToolChoiceViolation);
         }
         let mut used_ids = BTreeSet::new();
-        let mut pending = Vec::new();
+        let mut pending = BTreeMap::new();
         for message in &request.messages {
             if pending.is_empty() {
                 if blocks(&message.content)
@@ -200,7 +200,7 @@ impl SamplingToolLoop {
                 if used_ids.len().saturating_add(calls.len()) > limits.max_tool_calls {
                     return Err(SamplingToolLoopError::ToolCallLimit);
                 }
-                used_ids.extend(calls.iter().map(|(id, _)| id.clone()));
+                used_ids.extend(calls.keys().cloned());
                 pending = calls;
             } else {
                 if message.role != Role::User {
@@ -288,7 +288,7 @@ impl SamplingToolLoop {
         bounded_wire(&next, self.limits.byte_ceiling)?;
         let count = calls.len();
         self.request = Some(next);
-        self.used_ids.extend(calls.iter().map(|(id, _)| id.clone()));
+        self.used_ids.extend(calls.keys().cloned());
         self.rounds += 1;
         self.phase = Phase::Tools(calls);
         Ok(SamplingToolLoopStep::Tools { count })
@@ -390,15 +390,17 @@ fn admit_calls(
     content: &FinalSamplingMessageContent,
     schemas: &BTreeMap<String, ToolSchemas>,
     used: &BTreeSet<String>,
-) -> Result<Vec<(String, String)>, SamplingToolLoopError> {
-    let mut ids = BTreeSet::new();
-    let mut calls = Vec::new();
+) -> Result<BTreeMap<String, String>, SamplingToolLoopError> {
+    let mut calls = BTreeMap::new();
     for block in blocks(content) {
         match block {
             SamplingContentBlock::ToolUse {
                 id, name, input, ..
             } => {
-                if id.is_empty() || used.contains(id) || !ids.insert(id) {
+                if id.is_empty()
+                    || used.contains(id)
+                    || calls.insert(id.clone(), name.clone()).is_some()
+                {
                     return Err(SamplingToolLoopError::RepeatedToolId);
                 }
                 let schema = schemas
@@ -408,7 +410,6 @@ fn admit_calls(
                     .input
                     .validate(&Value::Object(input.clone()))
                     .map_err(|_| SamplingToolLoopError::InvalidToolInput)?;
-                calls.push((id.clone(), name.clone()));
             }
             SamplingContentBlock::ToolResult { .. } => {
                 return Err(SamplingToolLoopError::InvalidResponse);
@@ -421,7 +422,7 @@ fn admit_calls(
 
 fn admit_results(
     results: &[SamplingContentBlock],
-    pending: &[(String, String)],
+    pending: &BTreeMap<String, String>,
     schemas: &BTreeMap<String, ToolSchemas>,
 ) -> Result<(), SamplingToolLoopError> {
     if results.len() != pending.len() || results.is_empty() {
@@ -438,9 +439,8 @@ fn admit_results(
         else {
             return Err(SamplingToolLoopError::InvalidToolResults);
         };
-        let (_, name) = pending
-            .iter()
-            .find(|(id, _)| id == tool_use_id)
+        let name = pending
+            .get(tool_use_id)
             .ok_or(SamplingToolLoopError::InvalidToolResults)?;
         if !seen.insert(tool_use_id) {
             return Err(SamplingToolLoopError::InvalidToolResults);
@@ -584,6 +584,48 @@ mod tests {
             run.accept_response(response(call("a"))),
             Err(SamplingToolLoopError::RepeatedToolId)
         );
+    }
+
+    #[test]
+    fn out_of_order_results_use_each_calls_schema_and_keep_host_order() {
+        let mut req = request();
+        let tools = req.tools.as_mut().unwrap();
+        tools[0].output_schema = Some(json!({"type":"string"}));
+        let mut other = tools[0].clone();
+        other.name = "forecast".to_owned();
+        other.output_schema = Some(json!({"type":"integer"}));
+        tools.push(other);
+
+        let mut forecast = call("a");
+        forecast["name"] = json!("forecast");
+        let mut run = SamplingToolLoop::new(req, SamplingToolLoopLimits::default()).unwrap();
+        run.accept_response(response(json!([call("z"), forecast])))
+            .unwrap();
+        let ids: Vec<_> = run
+            .pending_tool_calls()
+            .map(|block| match block {
+                SamplingContentBlock::ToolUse { id, .. } => id.as_str(),
+                _ => panic!("expected a pending tool call"),
+            })
+            .collect();
+        assert_eq!(ids, ["z", "a"]);
+
+        let result = |id: &str, output: Value| {
+            serde_json::from_value(json!({
+                "type":"tool_result", "toolUseId":id, "content":[], "structuredContent":output
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            run.submit_tool_results(vec![result("a", json!("wrong")), result("z", json!(3))]),
+            Err(SamplingToolLoopError::InvalidToolOutput)
+        );
+        run.submit_tool_results(vec![result("a", json!(3)), result("z", json!("sunny"))])
+            .unwrap();
+        let next = serde_json::to_value(run.request().unwrap()).unwrap();
+        let results = &next["messages"][2]["content"];
+        assert_eq!(results[0]["toolUseId"], "a");
+        assert_eq!(results[1]["toolUseId"], "z");
     }
 
     #[test]
