@@ -31,6 +31,7 @@ const MAX_CATALOG_CURSOR_BYTES: usize = 4 * 1024;
 /// or prompts list operation. A refused traversal returns no partial catalog.
 /// Defaults match the production client's page, item, and byte ceilings; a
 /// test may lower them with [`TestClient::with_pagination_limits`].
+/// Modern pages must also retain one cache scope throughout the traversal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TestClientPaginationLimits {
     /// Maximum requests in one traversal (1 through 1,024).
@@ -660,6 +661,7 @@ impl TestClient {
         let mut entries = Vec::new();
         let mut cursor = None;
         let mut serialized_bytes = 0_usize;
+        let mut cache_scope = None;
 
         for _ in 0..self.pagination_limits.max_pages {
             let mut params = serde_json::json!({});
@@ -683,6 +685,20 @@ impl TestClient {
                 serde_json::from_str(&source).map_err(|_| {
                     McpError::invalid_request("Invalid admitted TestClient catalog result")
                 })?;
+            if self.is_modern() {
+                // Core admission has already checked the required directive.
+                // Its consistency is a traversal property, independent of
+                // TTL, replay eligibility, and whether a page has entries.
+                let page_scope = page.get("cacheScope").cloned().ok_or_else(|| {
+                    McpError::invalid_request("Admitted catalog result omitted its cache scope")
+                })?;
+                if cache_scope.as_ref().is_some_and(|scope| scope != &page_scope) {
+                    return Err(McpError::invalid_request(
+                        "TestClient catalog cache scope changed during pagination",
+                    ));
+                }
+                cache_scope.get_or_insert(page_scope);
+            }
             cursor = serde_json::from_value(
                 page.remove("nextCursor").unwrap_or(serde_json::Value::Null),
             )
@@ -2126,6 +2142,73 @@ mod tests {
                         }
                     }
                     client.close();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_client_catalogs_require_one_scope_across_all_pages() {
+        for mode in [
+            TestClientProtocolMode::Modern2026,
+            TestClientProtocolMode::Auto,
+        ] {
+            for field in ["tools", "resources", "resourceTemplates", "prompts"] {
+                for first_scope in ["private", "public"] {
+                    for changed in [false, true] {
+                        for empty_middle_page in [false, true] {
+                            let (mut client, mut peer) = catalog_fixture(mode);
+                            let second_scope = if changed {
+                                if first_scope == "private" { "public" } else { "private" }
+                            } else {
+                                first_scope
+                            };
+                            let mut first = catalog_result(mode, field, "alpha", Some("next"));
+                            first["cacheScope"] = serde_json::json!(first_scope);
+                            let mut second = catalog_result(
+                                mode,
+                                field,
+                                "beta",
+                                empty_middle_page.then_some("last"),
+                            );
+                            second["cacheScope"] = serde_json::json!(second_scope);
+                            // ttlMs=0 keeps every page non-replayable; scope
+                            // coherence still applies to the returned catalog.
+                            if empty_middle_page {
+                                second[field] = serde_json::json!([]);
+                            }
+                            queue_catalog_result(&mut peer, 2, first);
+                            queue_catalog_result(&mut peer, 3, second);
+                            if !changed && empty_middle_page {
+                                let mut last = catalog_result(mode, field, "beta", None);
+                                last["cacheScope"] = serde_json::json!(first_scope);
+                                queue_catalog_result(&mut peer, 4, last);
+                            }
+
+                            let result = catalog_names(&mut client, field);
+                            if changed {
+                                let error = result.expect_err("mixed-scope catalogs must not escape");
+                                assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                                assert_eq!(
+                                    error.message,
+                                    "TestClient catalog cache scope changed during pagination"
+                                );
+                                assert_eq!(client.next_id.load(Ordering::SeqCst), 4);
+                            } else {
+                                assert_eq!(result.unwrap(), ["alpha", "beta"]);
+                            }
+
+                            // A refused traversal neither poisons the endpoint
+                            // nor carries its first page's scope into the next
+                            // independently requested catalog.
+                            let next_id = client.next_id.load(Ordering::SeqCst) as i64;
+                            let mut fresh = catalog_result(mode, field, "fresh", None);
+                            fresh["cacheScope"] = serde_json::json!(second_scope);
+                            queue_catalog_result(&mut peer, next_id, fresh);
+                            assert_eq!(catalog_names(&mut client, field).unwrap(), ["fresh"]);
+                            client.close();
+                        }
+                    }
                 }
             }
         }
