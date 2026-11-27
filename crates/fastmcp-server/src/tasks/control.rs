@@ -151,10 +151,10 @@ impl FinalTaskRuntime {
                 reason,
                 write_admitted: &write_admitted,
             };
-            let outcome = await_retention_reclaim(
+            let outcome = await_admitted_write(
                 ctx,
                 self.store.reclaim_terminal_task_with_context(admission),
-                &write_admitted,
+                || write_admitted.load(TaskServiceOrdering::Acquire),
                 &authorize,
             )
             .await
@@ -809,16 +809,16 @@ async fn await_control_read<T>(
 /// Cancellation can abandon a prewrite wait, but cannot erase a committed
 /// result. A provider may admit its write, cancel the caller, and first return
 /// Pending in a single poll, so check the boundary again after polling it.
-async fn await_retention_reclaim(
+pub(super) async fn await_admitted_write<T>(
     ctx: &McpContext,
-    mut future: FinalTaskStoreFuture<'_, TaskRetentionReclamation>,
-    write_admitted: &AtomicBool,
+    mut future: FinalTaskStoreFuture<'_, T>,
+    write_admitted: impl Fn() -> bool + Send,
     admit: impl Fn() -> McpResult<()> + Send,
-) -> McpResult<TaskRetentionReclamation> {
+) -> McpResult<T> {
     let mut cancelled = Box::pin(ctx.request_cancelled());
     let mut deadline = Some(Box::pin(ctx.request_deadline_elapsed()));
     std::future::poll_fn(move |poll| {
-        if write_admitted.load(TaskServiceOrdering::Acquire) {
+        if write_admitted() {
             deadline = None;
         } else {
             if let Err(error) = admit() {
@@ -829,7 +829,7 @@ async fn await_retention_reclaim(
             }
         }
         let result = future.as_mut().poll(poll);
-        if !write_admitted.load(TaskServiceOrdering::Acquire) {
+        if !write_admitted() {
             if let Err(error) = admit() {
                 return Poll::Ready(Err(error));
             }

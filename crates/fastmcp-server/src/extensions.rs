@@ -62,7 +62,7 @@ impl TaskControlReceipt {
         self.state.store(2, std::sync::atomic::Ordering::Release);
     }
 
-    fn has_admitted_write(&self) -> bool {
+    pub(crate) fn has_admitted_write(&self) -> bool {
         self.state.load(std::sync::atomic::Ordering::Acquire) != 0
     }
 

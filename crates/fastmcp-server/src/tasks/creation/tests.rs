@@ -476,16 +476,36 @@ fn async_creation_prewrite_cancellation_never_creates_a_task() {
 }
 
 #[test]
-fn async_creation_provider_cancels_before_its_write_without_releasing_early() {
+fn async_creation_cancellation_wakes_parked_storage_before_write_admission() {
+    struct WakeCount(AtomicUsize);
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     let fixture = Fixture::new();
     fixture.store.before_commit.close();
-    let mut create = Box::pin(fixture.create());
-    assert!(poll_once(create.as_mut()).is_pending());
-    fixture.ctx.request_cancellation().cancel();
+    let receipt = TaskControlReceipt::default();
+    let mut create = Box::pin(fixture.runtime.create_task_for_operation_with_receipt(
+        &fixture.ctx,
+        fixture.operation(),
+        work(),
+        None,
+        receipt.clone(),
+    ));
+    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut poll = Context::from_waker(&waker);
+    assert!(create.as_mut().poll(&mut poll).is_pending());
     assert_eq!(fixture.runtime.admission.lock().unwrap().total.permits, 1);
-    fixture.store.before_commit.release();
-    let error = ready(poll_once(create.as_mut())).unwrap_err();
-    assert_ne!(error.code, McpError::request_cancelled().code);
+    let before = wakes.0.load(Ordering::SeqCst);
+    fixture.ctx.request_cancellation().cancel();
+    assert!(wakes.0.load(Ordering::SeqCst) > before);
+    let result = ready(create.as_mut().poll(&mut poll));
+    let error = receipt.resolve_liveness(result, None).unwrap_err();
+    assert_eq!(error.code, McpError::request_cancelled().code);
+    assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.store.inner.task_count(), 0);
     fixture.assert_admission_empty();
 }
@@ -522,6 +542,7 @@ fn async_creation_committed_receipt_survives_cancellation_and_service_exit() {
         .unwrap()
         .ready_generation = None;
     assert_eq!(fixture.runtime.admission.lock().unwrap().total.permits, 1);
+    assert!(poll_once(create.as_mut()).is_pending());
     fixture.store.after_commit.release();
     let created = ready(poll_once(create.as_mut())).unwrap();
     assert!(final_tasks_match_exactly(&created.task, fixture.store.snapshot().task()).unwrap());
@@ -833,7 +854,9 @@ fn async_embedding_creation_rechecks_cancellation_and_service_before_write() {
                         .ready_generation = None;
                 }
             }
-            fixture.store.before_commit.release();
+            if stop == "service-exit" {
+                fixture.store.before_commit.release();
+            }
             ready(poll_once(create.as_mut())).expect_err("stopped admission cannot write");
             assert_eq!(
                 fixture.store.create_calls.load(Ordering::SeqCst),

@@ -21,6 +21,7 @@ pub struct FinalTaskCreationAdmission<'a> {
     ctx: &'a McpContext,
     operation: Option<&'a FinalTaskOperation>,
     permit: &'a TaskServiceAdmissionPermit,
+    receipt: &'a TaskControlReceipt,
 }
 
 impl<'a> FinalTaskCreationAdmission<'a> {
@@ -32,6 +33,12 @@ impl<'a> FinalTaskCreationAdmission<'a> {
 
     /// Revalidates admission immediately before the backend's first write.
     pub fn checkpoint_before_write(&self) -> McpResult<()> {
+        self.check_current_admission()?;
+        self.receipt.admit_write();
+        Ok(())
+    }
+
+    fn check_current_admission(&self) -> McpResult<()> {
         if let Some(operation) = self.operation {
             self.runtime.authorize_original_operation(
                 self.ctx,
@@ -40,6 +47,31 @@ impl<'a> FinalTaskCreationAdmission<'a> {
             )?;
         }
         self.permit.admit_commit(self.runtime, Some(self.ctx))
+    }
+}
+
+/// While a store is waiting to start its transaction, cancellation and deadline
+/// expiry can release its reservation immediately. Once the provider checkpoints
+/// the write, only the original storage receipt can establish the outcome.
+async fn settle_creation(
+    ctx: &McpContext,
+    receipt: &TaskControlReceipt,
+    future: FinalTaskStoreFuture<'_, FinalTaskSnapshot>,
+) -> McpResult<FinalTaskSnapshot> {
+    let result = control::await_admitted_write(
+        ctx,
+        future,
+        || receipt.has_admitted_write(),
+        || ctx.ensure_live().map_err(|_| McpError::request_cancelled()),
+    )
+    .await;
+    if receipt.has_admitted_write() {
+        result.map_err(|error| control::control_write_error(ctx, "Task creation", error))
+    } else {
+        result?;
+        Err(McpError::internal_error(
+            "Task creation backend returned a receipt without admitting the write",
+        ))
     }
 }
 
@@ -70,25 +102,24 @@ impl FinalTaskRuntime {
             let task = self.new_task_for_creation(status_message)?;
             let (permit, notification) =
                 self.prepare_task_creation(&task, &work_descriptor, None, Some(&ctx))?;
+            let receipt = TaskControlReceipt::default();
             let admission = FinalTaskCreationAdmission {
                 runtime: self,
                 ctx: &ctx,
                 operation: None,
                 permit: &permit,
+                receipt: &receipt,
             };
             // Capability callbacks may cancel the caller or retire readiness.
             // Revalidate before constructing the backend's mutation future.
-            admission.checkpoint_before_write()?;
-            let committed = self
-                .store
-                .create_task_with_work_with_context(
-                    admission,
-                    task.clone(),
-                    notification,
-                    work_descriptor,
-                )
-                .await
-                .map_err(|error| control::control_write_error(&ctx, "Task creation", error))?;
+            admission.check_current_admission()?;
+            let pending = self.store.create_task_with_work_with_context(
+                admission,
+                task.clone(),
+                notification,
+                work_descriptor,
+            );
+            let committed = settle_creation(&ctx, &receipt, pending).await?;
             let committed = self.validate_committed_new_task(&task, None, None, committed)?;
             self.signal_task_service(task.base().task_id.clone());
             self.emit_recovery_commit(ctx.cx(), &committed).await;
@@ -143,21 +174,18 @@ impl FinalTaskRuntime {
                 ctx,
                 operation: Some(&operation),
                 permit: &permit,
+                receipt: &receipt,
             };
-            admission.checkpoint_before_write()?;
-            receipt.admit_write();
-            let committed = self
-                .store
-                .create_task_with_operation_with_context(
-                    admission,
-                    task.clone(),
-                    notification.clone(),
-                    work_descriptor,
-                    principal,
-                    operation.clone(),
-                )
-                .await
-                .map_err(|error| control::control_write_error(ctx, "Task creation", error))?;
+            admission.check_current_admission()?;
+            let pending = self.store.create_task_with_operation_with_context(
+                admission,
+                task.clone(),
+                notification.clone(),
+                work_descriptor,
+                principal,
+                operation.clone(),
+            );
+            let committed = settle_creation(ctx, &receipt, pending).await?;
             let committed =
                 self.validate_committed_new_task(&task, principal, Some(&operation), committed)?;
             receipt.committed();
