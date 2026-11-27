@@ -621,9 +621,17 @@ impl FinalResultCache {
         self.insert_if_current_at(key, captured_generation, result, Instant::now())
     }
 
-    /// Advances a result-set generation before removing its previous entries.
+    /// Advances the generation and removes all entries in the generation class.
+    /// Resource reads share one bounded generation class.
     pub fn invalidate_result_set(&mut self, result_set: &FinalCacheResultSet) {
-        let generation_set = FinalCacheGenerationSet::from(result_set);
+        self.invalidate_generation(FinalCacheGenerationSet::from(result_set), None);
+    }
+
+    fn invalidate_generation(
+        &mut self,
+        generation_set: FinalCacheGenerationSet,
+        updated_uri: Option<&str>,
+    ) {
         let current = self.generations.get(&generation_set).copied().unwrap_or(0);
         let Some(generation) = current.checked_add(1) else {
             // Reusing a saturated revision would admit a pre-invalidation fill.
@@ -634,15 +642,23 @@ impl FinalResultCache {
             return;
         };
         self.generations.insert(generation_set, generation);
-        match result_set {
-            // Resource-update generations are intentionally shared and
-            // fixed-cardinality, so retire every resource-read entry rather
-            // than retaining immediately-invalid stale bytes for other URIs.
-            FinalCacheResultSet::Resource(_) => self
-                .entries
-                .retain(|key, _| !matches!(key.result_set(), FinalCacheResultSet::Resource(_))),
-            _ => self.entries.retain(|key, _| key.result_set() != result_set),
-        }
+        self.entries.retain(|key, entry| {
+            if FinalCacheGenerationSet::from(key.result_set()) != generation_set {
+                return true;
+            }
+            // A URI update fences all in-flight reads via the shared revision.
+            // Carry forward only previously current, committed reads for other
+            // URIs, without extending their expiry or retaining per-URI state.
+            if let (Some(updated), FinalCacheResultSet::Resource(uri)) =
+                (updated_uri, key.result_set())
+                && uri.as_str() != updated
+                && entry.result_set_revision == current
+            {
+                entry.result_set_revision = generation;
+                return true;
+            }
+            false
+        });
         self.recount_retained_bytes();
         self.stats.invalidations = self.stats.invalidations.saturating_add(1);
     }
@@ -703,15 +719,16 @@ impl FinalResultCache {
                 // entries can no longer be trusted, including session-local
                 // disable_resource mutations that publish list_changed rather
                 // than resources/updated.
-                self.invalidate_result_set(&FinalCacheResultSet::Resource(String::new()));
+                self.invalidate_generation(FinalCacheGenerationSet::Resource, None);
             }
             ServerNotification::PromptsListChanged(_) => {
                 self.invalidate_result_set(&FinalCacheResultSet::Prompts);
             }
             ServerNotification::ResourceUpdated(params) => {
-                self.invalidate_result_set(&FinalCacheResultSet::Resource(
-                    params.uri.as_str().to_owned(),
-                ));
+                self.invalidate_generation(
+                    FinalCacheGenerationSet::Resource,
+                    Some(params.uri.as_str()),
+                );
             }
             ServerNotification::Cancelled(_)
             | ServerNotification::Progress(_)
@@ -1917,8 +1934,20 @@ mod tests {
         let expected = result.encode().expect("complete result re-encodes");
         let generation = cache.begin_fetch(resource_key.result_set());
         let receipt = Instant::now();
+        let (other_resource, other_result, _) = resource_revalidation_fixture();
+        let other_generation = cache.begin_fetch(other_resource.result_set());
         assert_eq!(
-            cache.insert_if_current_at(resource_key.clone(), generation, result, receipt),
+            cache.insert_if_current_at(
+                other_resource.clone(),
+                other_generation,
+                other_result.clone(),
+                receipt,
+            ),
+            FinalCacheInsert::Stored
+        );
+        let other_bytes = cache.retained_bytes;
+        assert_eq!(
+            cache.insert_if_current_at(resource_key.clone(), generation, result.clone(), receipt),
             FinalCacheInsert::Stored
         );
         let FinalCacheLookup::Fresh(replayed) = cache.lookup_at(&resource_key, receipt) else {
@@ -1934,9 +1963,30 @@ mod tests {
             Some(serde_json::json!({"uri": "file:///changed.txt"})),
         ));
         assert!(matches!(
-            cache.lookup(&resource_key),
+            cache.lookup_at(&resource_key, receipt),
             FinalCacheLookup::Miss(FinalCacheMiss::Absent)
         ));
+        assert_eq!(cache.retained_bytes, other_bytes);
+        assert!(matches!(
+            cache.lookup_at(&other_resource, receipt + Duration::from_millis(99)),
+            FinalCacheLookup::Fresh(_)
+        ));
+        // Both reads started before the update. Neither may replace content in
+        // the new shared revision, even though the unrelated committed hit survives.
+        for (key, old, response) in [
+            (resource_key, generation, result),
+            (other_resource.clone(), other_generation, other_result),
+        ] {
+            assert_eq!(
+                cache.insert_if_current_at(key, old, response, receipt),
+                FinalCacheInsert::InvalidatedDuringFetch
+            );
+        }
+        assert!(matches!(
+            cache.lookup_at(&other_resource, receipt + Duration::from_millis(100)),
+            FinalCacheLookup::Miss(FinalCacheMiss::Stale)
+        ));
+        assert_eq!(cache.retained_bytes, 0);
     }
 
     #[test]
