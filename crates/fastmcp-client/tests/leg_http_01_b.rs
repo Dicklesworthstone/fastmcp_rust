@@ -1444,6 +1444,38 @@ fn ready_legacy_sse_absolute_lifetime_preserves_typed_refusal() {
     log.assert_legacy_hygiene("ready-client absolute lifetime");
 }
 
+#[test]
+fn legacy_sse_native_reader_accepts_initial_bom_and_default_message_event() {
+    let peer = Peer::serve(|message| {
+        vec![
+            Step::ModernProbe,
+            Step::Stream {
+                extra_headers: &[],
+                events: vec![
+                    vec![0xef],
+                    vec![0xbb],
+                    vec![0xbf],
+                    endpoint_event(message),
+                    b"event: ignored\nevent:\ndata: {\"jsonrpc\":\"2.0\",\"id\":51,\"result\":{}}\n\n".to_vec(),
+                    // Stripping another BOM would invent a second endpoint.
+                    b"\xef\xbb\xbfevent: endpoint\ndata: {\"jsonrpc\":\"2.0\",\"id\":52,\"result\":{}}\n\n".to_vec(),
+                ],
+                end: true,
+            },
+        ]
+    });
+    runtime_block_on(async {
+        let cx = Cx::for_request();
+        let mut client = open_legacy(&cx, &peer).await.unwrap();
+        for id in [51, 52] {
+            assert_response_id(client.next_message(&cx).await.unwrap().unwrap(), id);
+        }
+        assert!(client.next_message(&cx).await.unwrap().is_none());
+    });
+    peer.finish()
+        .assert_legacy_hygiene("split leading BOM and default event");
+}
+
 async fn ready_notification(connection: &mut ClientHttpConnection) -> JsonRpcRequest {
     bounded_ready(poll_fn(|_| {
         connection

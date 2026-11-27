@@ -13411,6 +13411,7 @@ impl LegacySseResponseStream {
 #[derive(Default)]
 struct LegacySseParser {
     line: Vec<u8>,
+    first_line_consumed: bool,
     pending_cr: bool,
     event_type: Option<LegacySseEventType>,
     data: String,
@@ -13473,6 +13474,13 @@ impl LegacySseParser {
     ) -> Result<(), LegacySseHttpClientError> {
         let line = std::str::from_utf8(&self.line)
             .map_err(|_| LegacySseHttpClientError::SseInvalidUtf8)?;
+        // The event stream may begin with one UTF-8 signature. Each fresh
+        // generation has a fresh parser, including after reconnect.
+        let line = if std::mem::replace(&mut self.first_line_consumed, true) {
+            line
+        } else {
+            line.strip_prefix('\u{feff}').unwrap_or(line)
+        };
         if line.is_empty() {
             self.ignored_keepalives = 0;
             if self.has_data {
@@ -13507,7 +13515,7 @@ impl LegacySseParser {
         let value = value.strip_prefix(' ').unwrap_or(value);
         self.event_bytes = self
             .event_bytes
-            .saturating_add(line.len().saturating_add(1));
+            .saturating_add(self.line.len().saturating_add(1));
         if self.event_bytes > MAX_LEGACY_SSE_EVENT_BYTES {
             return Err(LegacySseHttpClientError::SseEventTooLarge);
         }
@@ -13515,7 +13523,7 @@ impl LegacySseParser {
             "event" => {
                 self.event_type = Some(match value {
                     "endpoint" => LegacySseEventType::Endpoint,
-                    "message" => LegacySseEventType::Message,
+                    "" | "message" => LegacySseEventType::Message,
                     _ => LegacySseEventType::Ignore,
                 });
             }
