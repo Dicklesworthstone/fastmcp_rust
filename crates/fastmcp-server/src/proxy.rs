@@ -3152,6 +3152,7 @@ fn catalog_cache_scope_token(scope: CacheScope) -> &'static str {
 struct ProxyCatalogAdmission {
     entries: usize,
     encoded_bytes: usize,
+    cache_scope: Option<CacheScope>,
 }
 
 impl ProxyCatalogAdmission {
@@ -3162,6 +3163,13 @@ impl ProxyCatalogAdmission {
         next_cursor: Option<&str>,
         cache_hint: Option<&ProxyCatalogCacheHint>,
     ) -> McpResult<()> {
+        if let Some(hint) = cache_hint
+            && self.cache_scope.is_some_and(|scope| scope != hint.cache_scope)
+        {
+            return Err(McpError::invalid_request(format!(
+                "Proxy {method} catalog has inconsistent cacheScope across pages"
+            )));
+        }
         self.admit_encoded(method, entries.len(), |counter| {
             serde_json::to_writer(&mut *counter, entries)?;
             if let Some(cursor) = next_cursor {
@@ -3174,7 +3182,11 @@ impl ProxyCatalogAdmission {
                 )?;
             }
             Ok(())
-        })
+        })?;
+        // Scope belongs to the same atomic admission as entries and bytes.
+        // A refused page must not constrain a later valid candidate.
+        self.cache_scope = self.cache_scope.or(cache_hint.map(|hint| hint.cache_scope));
+        Ok(())
     }
 
     fn admit_materialized<T: Serialize>(
@@ -3185,6 +3197,13 @@ impl ProxyCatalogAdmission {
         if cache_hints.len() > MAX_MODERN_PROXY_CATALOG_PAGES {
             return Err(McpError::invalid_request(format!(
                 "Proxy {method} catalog exceeded its {MAX_MODERN_PROXY_CATALOG_PAGES}-page limit"
+            )));
+        }
+        if let Some(first) = cache_hints.first()
+            && cache_hints.iter().any(|hint| hint.cache_scope != first.cache_scope)
+        {
+            return Err(McpError::invalid_request(format!(
+                "Proxy {method} catalog has inconsistent cacheScope across pages"
             )));
         }
         Self::default().admit_encoded(method, entries.len(), |counter| {
@@ -17774,6 +17793,7 @@ IFS= read -r end
         WrongProgressToken,
         AliasedNumericProgressToken,
         RegressingProgress,
+        CatalogScopes(&'static str, CacheScope, CacheScope),
     }
 
     struct OwnedAsyncBackend {
@@ -17893,8 +17913,28 @@ IFS= read -r end
                 if matches!(self.fault, OwnedAsyncFault::WrongMethod) {
                     return Ok(final_tool_result_with_open_members());
                 }
+                let mut source = owned_async_result(method, self.input_required);
+                if let OwnedAsyncFault::CatalogScopes(target, first_scope, second_scope) = self.fault
+                    && method == target
+                {
+                    let mut page: serde_json::Value = serde_json::from_str(&source).unwrap();
+                    let scope = if let Some(cursor) = params.get("cursor") {
+                        assert_eq!(cursor, &serde_json::json!(""));
+                        page["ttlMs"] = serde_json::json!(0);
+                        second_scope
+                    } else {
+                        page["nextCursor"] = serde_json::json!("");
+                        page["ttlMs"] = serde_json::json!(100);
+                        first_scope
+                    };
+                    page["cacheScope"] = serde_json::json!(match scope {
+                        CacheScope::Public => "public",
+                        CacheScope::Private => "private",
+                    });
+                    source = serde_json::to_string(&page).unwrap();
+                }
                 request
-                    .decode_result(&owned_async_result(method, self.input_required))
+                    .decode_result(&source)
                     .map_err(|error| fastmcp_core::McpError::invalid_request(error.to_string()))
             })
         }
@@ -18877,6 +18917,84 @@ IFS= read -r end
         );
         drop(state);
         assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    fn proxy_custom_async_catalog_scope_probe(changed_scope: bool) {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for (method_index, method) in [
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for first_scope in [CacheScope::Public, CacheScope::Private] {
+                let second_scope = if changed_scope {
+                    match first_scope {
+                        CacheScope::Public => CacheScope::Private,
+                        CacheScope::Private => CacheScope::Public,
+                    }
+                } else {
+                    first_scope
+                };
+                let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+                let state = Arc::new(Mutex::new(OwnedAsyncState::default()));
+                let proxy = owned_async_proxy(
+                    &state,
+                    false,
+                    OwnedAsyncFault::CatalogScopes(method, first_scope, second_scope),
+                );
+                let result = runtime.block_on(proxy.catalog_typed_with_cx(&cx));
+                if changed_scope {
+                    let error =
+                        result.expect_err("asynchronous traversal rejects a changed page scope");
+                    assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                    assert!(error.message.contains("cacheScope"));
+                } else {
+                    let catalog = result.expect("same-scope asynchronous pages remain valid");
+                    assert!(catalog.final_tools().unwrap().is_empty());
+                    assert!(catalog.final_resources().unwrap().is_empty());
+                    assert!(catalog.final_resource_templates().unwrap().is_empty());
+                    assert!(catalog.final_prompts().unwrap().is_empty());
+                }
+                let expected_requests = if changed_scope { method_index + 2 } else { 5 };
+                let observed = state.lock().unwrap();
+                assert_eq!(
+                    (
+                        observed.prepared,
+                        observed.executed,
+                        observed.dropped,
+                        observed.synchronous_calls
+                    ),
+                    (expected_requests, expected_requests, expected_requests, 0),
+                    "a rejected page retires its owned request and prevents later catalog queries"
+                );
+                let pages = observed
+                    .observed
+                    .iter()
+                    .filter(|entry| entry.1 == method)
+                    .collect::<Vec<_>>();
+                assert_eq!(pages.len(), 2);
+                assert!(pages[0].2.get("cursor").is_none());
+                assert_eq!(pages[1].2.get("cursor"), Some(&serde_json::json!("")));
+                assert!(!cx.is_cancel_requested());
+            }
+        }
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn proxy_custom_async_catalog_scope_positive() {
+        proxy_custom_async_catalog_scope_probe(false);
+    }
+
+    #[test]
+    fn proxy_custom_async_catalog_scope_planted_negative() {
+        proxy_custom_async_catalog_scope_probe(true);
     }
 
     fn proxy_custom_async_request_configured_identity_probe(substitute_downstream: bool) {
@@ -31090,7 +31208,7 @@ IFS= read -r end
                 Some("tools-page-2") => Ok((
                     vec![final_catalog_tool()],
                     None,
-                    ProxyCatalogCacheHint::new(CacheTtl::milliseconds(0), CacheScope::Private),
+                    ProxyCatalogCacheHint::new(CacheTtl::milliseconds(0), CacheScope::Public),
                 )),
                 Some(cursor) => Err(fastmcp_core::McpError::invalid_request(format!(
                     "unexpected test cursor {cursor}"
@@ -31104,7 +31222,155 @@ IFS= read -r end
         assert_eq!(catalog.cache_hints[0].ttl_ms.as_str(), huge_ttl.as_str());
         assert_eq!(catalog.cache_hints[0].cache_scope, CacheScope::Public);
         assert_eq!(catalog.cache_hints[1].ttl_ms.as_str(), "0");
-        assert_eq!(catalog.cache_hints[1].cache_scope, CacheScope::Private);
+        assert_eq!(catalog.cache_hints[1].cache_scope, CacheScope::Public);
+    }
+
+    fn proxy_catalog_scope_probe(changed_scope: bool) {
+        for method in [
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+        ] {
+            for first_scope in [CacheScope::Public, CacheScope::Private] {
+                let second_scope = if changed_scope {
+                    match first_scope {
+                        CacheScope::Public => CacheScope::Private,
+                        CacheScope::Private => CacheScope::Public,
+                    }
+                } else {
+                    first_scope
+                };
+                for empty_terminal in [false, true] {
+                    let mut requests = 0;
+                    let result = super::collect_modern_proxy_catalog_pages(method, |cursor| {
+                        requests += 1;
+                        match cursor {
+                            None => Ok((
+                                vec![1_u8],
+                                Some(String::new()),
+                                ProxyCatalogCacheHint::new(
+                                    CacheTtl::milliseconds(100),
+                                    first_scope,
+                                ),
+                            )),
+                            Some("") => Ok((
+                                if empty_terminal { Vec::new() } else { vec![2_u8] },
+                                None,
+                                ProxyCatalogCacheHint::new(
+                                    CacheTtl::milliseconds(0),
+                                    second_scope,
+                                ),
+                            )),
+                            _ => panic!("the opaque empty cursor must be forwarded unchanged"),
+                        }
+                    });
+                    assert_eq!(requests, 2);
+                    if changed_scope {
+                        let error =
+                            result.expect_err("a scope change invalidates the full catalog");
+                        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                        assert!(error.message.contains("cacheScope"));
+                    } else {
+                        let catalog = result.expect("one scope permits different per-page TTLs");
+                        assert_eq!(
+                            catalog.entries,
+                            if empty_terminal { vec![1] } else { vec![1, 2] }
+                        );
+                        assert_eq!(catalog.cache_hints.len(), 2);
+                        assert_eq!(catalog.cache_hints[0].ttl_ms.as_str(), "100");
+                        assert_eq!(catalog.cache_hints[1].ttl_ms.as_str(), "0");
+                        assert!(
+                            catalog.cache_hints.iter().all(|hint| hint.cache_scope == first_scope)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_catalog_scope_positive() {
+        proxy_catalog_scope_probe(false);
+    }
+
+    #[test]
+    fn proxy_catalog_scope_planted_negative() {
+        proxy_catalog_scope_probe(true);
+    }
+
+    #[test]
+    fn proxy_catalog_scope_and_capacity_commit_atomically() {
+        let public = ProxyCatalogCacheHint::new(CacheTtl::milliseconds(100), CacheScope::Public);
+        let private = ProxyCatalogCacheHint::new(CacheTtl::milliseconds(100), CacheScope::Private);
+        let mut admission = super::ProxyCatalogAdmission::default();
+        let oversized = "x".repeat(super::MAX_PROXY_CATALOG_BYTES);
+        let error = admission
+            .admit_page("tools/list", &[oversized], None, Some(&private))
+            .expect_err("an oversized first page cannot establish scope");
+        assert!(error.message.contains("byte limit"));
+        assert_eq!(
+            (admission.entries, admission.encoded_bytes, admission.cache_scope),
+            (0, 0, None)
+        );
+
+        admission
+            .admit_page("tools/list", &[1_u8], Some(""), Some(&public))
+            .unwrap();
+        let before = (admission.entries, admission.encoded_bytes, admission.cache_scope);
+        let error = admission
+            .admit_page::<u8>("tools/list", &[], None, Some(&private))
+            .expect_err("an empty terminal page cannot change scope");
+        assert!(error.message.contains("cacheScope"));
+        assert_eq!(
+            (admission.entries, admission.encoded_bytes, admission.cache_scope),
+            before
+        );
+        admission
+            .admit_page("tools/list", &[2_u8], None, Some(&public))
+            .unwrap();
+        assert_eq!(admission.entries, 2);
+        assert_eq!(admission.cache_scope, Some(CacheScope::Public));
+    }
+
+    #[test]
+    fn public_proxy_catalog_checks_scope_before_route_admission() {
+        for first_scope in [CacheScope::Public, CacheScope::Private] {
+            for changed_scope in [false, true] {
+                let second_scope = if changed_scope {
+                    match first_scope {
+                        CacheScope::Public => CacheScope::Private,
+                        CacheScope::Private => CacheScope::Public,
+                    }
+                } else {
+                    first_scope
+                };
+                let proxy = ProxyClient::from_backend(EmptyTypedCatalogBackend {
+                    resource_catalog: ProxyResourceCatalog::Final(ProxyFinalCatalog {
+                        entries: vec![final_catalog_resource()],
+                        cache_hints: vec![
+                            ProxyCatalogCacheHint::new(CacheTtl::milliseconds(100), first_scope),
+                            ProxyCatalogCacheHint::new(CacheTtl::milliseconds(0), second_scope),
+                        ],
+                    }),
+                });
+                let result = proxy.catalog_typed();
+                if changed_scope {
+                    let error =
+                        result.expect_err("custom backends cannot bypass page scope admission");
+                    assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                    assert!(error.message.contains("cacheScope"));
+                    assert_eq!(proxy.observed_protocol_era().unwrap(), None);
+                } else {
+                    let catalog = result.expect("coherent custom catalog is admitted");
+                    assert_eq!(catalog.final_resources().unwrap().len(), 1);
+                    assert_eq!(
+                        proxy.observed_protocol_era().unwrap(),
+                        Some(ProtocolEra::Modern2026)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
