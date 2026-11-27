@@ -5381,6 +5381,7 @@ mode, task_id, log_path, transport, ready_path = sys.argv[1:]
 poll_ms = 5000 if mode == "working" else 80
 called_at = None
 reads = 0
+listens = 0
 retention_created = None
 raw_result = r'{"content":[{"type":"text","text":"done"}],"isError":false,"com.example\/number":1.20e+4,"com.example/big":9007199254740993,"_meta":{"com.example/result":"preserved"}}'
 
@@ -5421,7 +5422,7 @@ def extended_terminal(subscription_id):
     return json.dumps({"jsonrpc":"2.0", "method":"notifications/tasks", "params":fields})
 
 def respond(request):
-    global called_at, reads, retention_created
+    global called_at, reads, listens, retention_created
     method = request["method"]
     event = {"request": request, "pid": os.getpid()}
     if called_at is not None:
@@ -5457,7 +5458,8 @@ def respond(request):
         meta = {"io.modelcontextprotocol/subscriptionId": request["id"]}
         ack = {"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
                "params": {"_meta": meta, "notifications": {"taskIds": [task_id]}}}
-        if mode == "listen_eof_unacknowledged":
+        listens += 1
+        if mode == "listen_eof_unacknowledged" or (mode == "listen_eof_second_unacknowledged" and listens == 2):
             return []
         if mode.startswith("listen_retention_") or mode.startswith("listen_eof_"):
             return [json.dumps(ack)]
@@ -5481,7 +5483,8 @@ def respond(request):
     elif method == "tasks/get" and mode.startswith("listen_"):
         assert request["params"]["taskId"] == task_id
         reads += 1
-        result = task("completed" if reads == 3 else "working", "complete")
+        terminal_read = 4 if mode in ("listen_eof_reopen", "listen_eof_second_unacknowledged") else 3
+        result = task("completed" if reads == terminal_read else "working", "complete")
         if mode.startswith("listen_retention_"):
             if mode == "listen_retention_initial":
                 result = task("completed", "complete").replace('"ttlMs":null', '"ttlMs":1')
@@ -5825,6 +5828,37 @@ else:
                 assert_eq!(docs[3]["data"], json!({"reason":"task-terminal","updates":1}));
             } else {
                 assert_eq!(docs.len(), expected_reads);
+            }
+        }
+    }
+
+    #[test]
+    fn tasks_watch_http_requires_a_new_ack_on_each_reopened_stream() {
+        for (mode, success) in [
+            ("listen_eof_reopen", true),
+            ("listen_eof_second_unacknowledged", false),
+        ] {
+            let (output, events) = call(mode, true, true, &[]);
+            assert_eq!(output.status.success(), success, "{mode}: {output:?}");
+            let mut expected = vec![
+                "server/discover", "tasks/get", "subscriptions/listen", "tasks/get",
+                "tasks/get", "subscriptions/listen",
+            ];
+            if success {
+                expected.push("tasks/get");
+            }
+            assert_exchange(&events, &expected);
+            let docs = documents(&output);
+            let names: Vec<_> = docs.iter().map(|doc| doc["event"].as_str().unwrap()).collect();
+            if success {
+                assert_eq!(names, [
+                    "snapshot", "watch-acknowledged", "watch-acknowledged", "watch-reconnected",
+                    "task-updated", "watch-ended",
+                ]);
+                assert_eq!(docs[3]["data"]["attempt"], 1);
+                assert_eq!(docs[4]["data"]["status"], "completed");
+            } else {
+                assert_eq!(names, ["snapshot", "watch-acknowledged"]);
             }
         }
     }
