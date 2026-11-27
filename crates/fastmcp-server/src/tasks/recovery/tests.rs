@@ -22,6 +22,7 @@ enum Step {
     Finish,
     RestoreInitial,
     RestoreInput,
+    CancellationIntent,
 }
 
 struct Gate {
@@ -93,8 +94,8 @@ impl Gate {
 struct AsyncRecoveryStore {
     inner: InMemoryFinalTaskStore,
     clock: Arc<Mutex<Instant>>,
-    gates: [Gate; 14],
-    calls: [AtomicUsize; 14],
+    gates: [Gate; 15],
+    calls: [AtomicUsize; 15],
     settlement_receipt: Gate,
     sync_settlements: AtomicUsize,
     initial_pause_from: AtomicUsize,
@@ -126,6 +127,9 @@ struct AsyncRecoveryStore {
     substitute_authorization: Mutex<Option<FinalTaskAccessMetadata>>,
     omit_continuity: AtomicBool,
     fail_authorization: AtomicBool,
+    pause_authorization_after_expiry_scan: AtomicBool,
+    pause_snapshot_after_renewal: AtomicBool,
+    pause_snapshot_after_intent: AtomicBool,
 }
 
 impl AsyncRecoveryStore {
@@ -178,6 +182,9 @@ impl AsyncRecoveryStore {
             substitute_authorization: Mutex::new(None),
             omit_continuity: AtomicBool::new(false),
             fail_authorization: AtomicBool::new(false),
+            pause_authorization_after_expiry_scan: AtomicBool::new(false),
+            pause_snapshot_after_renewal: AtomicBool::new(false),
+            pause_snapshot_after_intent: AtomicBool::new(false),
         }
     }
 
@@ -310,7 +317,6 @@ impl FinalTaskStore for AsyncRecoveryStore {
         fn request_cancellation(&self, task_id: &FinalTaskId) -> McpResult<()>;
         fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool>;
         fn request_cancellation_and_clear_input_if_current(&self, expected: &FinalTaskSnapshot, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<Option<FinalTaskSnapshot>>;
-        fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool>;
         fn retention_clock_now(&self) -> Instant;
     }
 
@@ -432,6 +438,61 @@ impl FinalTaskStore for AsyncRecoveryStore {
                 return Ok(Some(metadata.clone()));
             }
             self.inner.get_task_access_metadata(task_id)
+        })
+    }
+
+    fn get_task_access_metadata_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        task_id: &'a FinalTaskId,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskAccessMetadata>> {
+        self.caller(ctx.cx());
+        Box::pin(async move {
+            self.enter(ctx.cx(), Step::Metadata).await?;
+            ctx.checkpoint()?;
+            if let Some(metadata) = self.substitute_authorization.lock().unwrap().as_ref() {
+                return Ok(Some(metadata.clone()));
+            }
+            self.inner.get_task_access_metadata(task_id)
+        })
+    }
+
+    fn get_task_snapshot_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        task_id: &'a FinalTaskId,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        self.caller(ctx.cx());
+        Box::pin(async move {
+            self.enter(ctx.cx(), Step::Read).await?;
+            ctx.checkpoint()?;
+            let substitute = self.substitute_read.lock().unwrap().take();
+            match substitute {
+                Some(snapshot) => Ok(Some(snapshot)),
+                None => self.inner.get_task_snapshot(task_id),
+            }
+        })
+    }
+
+    fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
+        self.synchronous();
+        self.inner.is_cancellation_requested(task_id)
+    }
+
+    fn is_cancellation_requested_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        task_id: &'a FinalTaskId,
+    ) -> FinalTaskStoreFuture<'a, bool> {
+        self.caller(ctx.cx());
+        Box::pin(async move {
+            self.enter(ctx.cx(), Step::CancellationIntent).await?;
+            ctx.checkpoint()?;
+            let requested = self.inner.is_cancellation_requested(task_id)?;
+            if self.pause_snapshot_after_intent.swap(false, Ordering::SeqCst) {
+                self.gate(Step::Read).close();
+            }
+            Ok(requested)
         })
     }
 
@@ -562,7 +623,16 @@ impl FinalTaskStore for AsyncRecoveryStore {
         self.caller(cx);
         Box::pin(async move {
             self.enter(cx, Step::ExpiredScan).await?;
-            self.inner.next_expired_execution_snapshot()
+            let result = self.inner.next_expired_execution_snapshot();
+            if self
+                .pause_authorization_after_expiry_scan
+                .swap(false, Ordering::SeqCst)
+            {
+                for gate in &self.authorization_gates {
+                    gate.close();
+                }
+            }
+            result
         })
     }
 
@@ -793,7 +863,11 @@ impl FinalTaskStore for AsyncRecoveryStore {
             }
             self.caller(cx);
             cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
-            self.renew_exact_lease(task_id, generation, owner_id, dispatch_fence)
+            let renewed = self.renew_exact_lease(task_id, generation, owner_id, dispatch_fence)?;
+            if self.pause_snapshot_after_renewal.swap(false, Ordering::SeqCst) {
+                self.gate(Step::Read).close();
+            }
+            Ok(renewed)
         })
     }
 
@@ -3383,4 +3457,523 @@ fn trusted_async_read_rejects_missing_and_substituted_task_ids_before_expiry() {
         assert_eq!(fixture.store.count(Step::Expire), 0);
         assert_eq!(fixture.store.sync_calls.load(Ordering::SeqCst), 0);
     });
+}
+
+
+/// These regressions exercise the actual asynchronous entry/maintenance waits.
+/// The outer supervisor's synchronous retirement and Drop paths remain outside
+/// this boundary; disable the fixture's sync trap before explicitly dropping
+/// its guard so that residual contract is neither hidden nor misclaimed.
+async fn supervision_owner(
+    fixture: &Fixture,
+    caller: &Cx,
+    snapshot: &FinalTaskSnapshot,
+    resumed: bool,
+) -> (
+    AuthorizedTaskServiceRunner,
+    FinalTaskExecutionGuard,
+    FinalTaskCancellationWakeRegistration,
+) {
+    let runner = fixture
+        .runtime
+        .install_task_service(2, Arc::new(PendingSupervisor::new()))
+        .unwrap();
+    let handoff = recover(
+        fixture,
+        caller,
+        snapshot,
+        resumed,
+        true,
+        &runner.dispatch_owner,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut guard =
+        FinalTaskExecutionGuard::new(&fixture.runtime, &runner.dispatch_owner, &handoff);
+    assert!(guard.elect_with_cx(caller, &AtomicBool::new(false)).await.unwrap());
+    let wake = fixture
+        .runtime
+        .register_task_cancellation_wake(runner.service_id, guard.task_id())
+        .unwrap();
+    (runner, guard, wake)
+}
+
+fn supervision_operation<'a>(
+    maintenance: bool,
+    executor: &'a FinalTaskHandoffExecutor,
+    caller: &'a Cx,
+    guard: &'a mut FinalTaskExecutionGuard,
+    wake: &'a FinalTaskCancellationWakeRegistration,
+) -> FinalTaskSupervisorFuture<'a> {
+    if maintenance {
+        Box::pin(executor.expire_pending_execution_with_lease_heartbeat(caller, guard, wake))
+    } else {
+        Box::pin(guard.ensure_live_dispatch_for_application_with_cx(caller, wake))
+    }
+}
+
+fn assert_supervision_unchanged(fixture: &Fixture, expected: &FinalTaskSnapshot) {
+    let current = fixture
+        .store
+        .inner
+        .get_task_snapshot(&expected.task().base().task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.generation(), expected.generation());
+    assert_eq!(current.creation_generation(), expected.creation_generation());
+    assert!(final_tasks_match_exactly(current.task(), expected.task()).unwrap());
+    assert!(fixture.emitted.lock().unwrap().is_empty());
+    assert_eq!(fixture.store.sync_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.store.sync_renewal_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.store.sync_settlements.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn async_supervision_entry_awaits_metadata_snapshot_and_intent() {
+    for resumed in [false, true] {
+        for stage in ["metadata", "snapshot", "intent"] {
+            run(|caller| async move {
+                let host = Cx::current().unwrap();
+                let fixture = Fixture::new();
+                let snapshot = fixture.seed("supervision-entry", resumed);
+                let (_runner, guard, wake) =
+                    supervision_owner(&fixture, &caller, &snapshot, resumed).await;
+                let gate = match stage {
+                    "metadata" => &fixture.store.authorization_gates[0],
+                    "snapshot" => fixture.store.gate(Step::Read),
+                    _ => fixture.store.gate(Step::CancellationIntent),
+                };
+                gate.close();
+                fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+                let mut pending =
+                    Box::pin(guard.ensure_live_dispatch_for_application_with_cx(&caller, &wake));
+                drive_until(&host, pending.as_mut(), || {
+                    gate.waiter.lock().unwrap().is_some()
+                })
+                .await;
+                assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 0);
+                assert_supervision_unchanged(&fixture, &snapshot);
+
+                gate.release();
+                pending.await.unwrap();
+                assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(fixture.store.renewals.load(Ordering::SeqCst), 1);
+                assert_supervision_unchanged(&fixture, &snapshot);
+                fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+                drop(guard);
+                fixture.assert_recoverable(&snapshot, resumed);
+            });
+        }
+    }
+}
+
+#[test]
+fn async_supervision_maintenance_retains_ready_result_during_post_proof() {
+    run(|caller| async move {
+        let host = Cx::current().unwrap();
+        let fixture = Fixture::new();
+        let snapshot = fixture.seed("supervision-maintenance-ready", false);
+        let (runner, mut guard, wake) =
+            supervision_owner(&fixture, &caller, &snapshot, false).await;
+        let executor = runner.handoff_executor();
+        let scans = fixture.store.count(Step::ExpiredScan);
+        fixture
+            .store
+            .pause_authorization_after_expiry_scan
+            .store(true, Ordering::SeqCst);
+        fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+        let mut pending = Box::pin(
+            executor.expire_pending_execution_with_lease_heartbeat(&caller, &mut guard, &wake),
+        );
+        drive_until(&host, pending.as_mut(), || {
+            fixture
+                .store
+                .authorization_gates
+                .iter()
+                .any(|gate| gate.waiter.lock().unwrap().is_some())
+        })
+        .await;
+        assert_eq!(fixture.store.count(Step::ExpiredScan), scans + 1);
+        for _ in 0..3 {
+            std::future::poll_fn(|poll| {
+                assert!(pending.as_mut().poll(poll).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+        assert_eq!(fixture.store.count(Step::ExpiredScan), scans + 1);
+        assert_supervision_unchanged(&fixture, &snapshot);
+        for gate in &fixture.store.authorization_gates {
+            gate.release();
+        }
+        pending.await.unwrap();
+        assert_eq!(fixture.store.count(Step::ExpiredScan), scans + 1);
+        assert_supervision_unchanged(&fixture, &snapshot);
+        fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+        drop(guard);
+        fixture.assert_recoverable(&snapshot, false);
+    });
+}
+
+#[test]
+fn async_supervision_entry_retains_ready_renewal_during_post_proof() {
+    run(|caller| async move {
+        let host = Cx::current().unwrap();
+        let fixture = Fixture::new();
+        let snapshot = fixture.seed("supervision-renewal-ready", false);
+        let (_runner, guard, wake) =
+            supervision_owner(&fixture, &caller, &snapshot, false).await;
+        fixture.store.pause_snapshot_after_renewal.store(true, Ordering::SeqCst);
+        fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+        let mut pending =
+            Box::pin(guard.ensure_live_dispatch_for_application_with_cx(&caller, &wake));
+        drive_until(&host, pending.as_mut(), || {
+            fixture.store.gate(Step::Read).waiter.lock().unwrap().is_some()
+        })
+        .await;
+        assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.renewals.load(Ordering::SeqCst), 1);
+        for _ in 0..3 {
+            std::future::poll_fn(|poll| {
+                assert!(pending.as_mut().poll(poll).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        }
+        assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 1);
+        assert_supervision_unchanged(&fixture, &snapshot);
+        fixture.store.gate(Step::Read).release();
+        pending.await.unwrap();
+        assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 1);
+        assert_supervision_unchanged(&fixture, &snapshot);
+        fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+        drop(guard);
+        fixture.assert_recoverable(&snapshot, false);
+    });
+}
+
+#[test]
+fn async_supervision_accepts_current_generation_of_the_same_claim() {
+    for resumed in [false, true] {
+        run(|caller| async move {
+            let host = Cx::current().unwrap();
+            let fixture = Fixture::new();
+            let snapshot = fixture.seed("supervision-current-generation", resumed);
+            let (_runner, guard, wake) =
+                supervision_owner(&fixture, &caller, &snapshot, resumed).await;
+            let task = FinalTask::Working(
+                transition_final_task_base(
+                    snapshot.task().base().clone(),
+                    FinalTaskStatus::Working,
+                    Some("same invocation advanced its status".to_owned()),
+                )
+                .unwrap(),
+            );
+            let current = fixture
+                .store
+                .inner
+                .update_working_status_for_handoff_if_current(
+                    &snapshot,
+                    &guard.owner_id,
+                    guard.dispatch_fence.unwrap(),
+                    task.clone(),
+                    final_task_notification(&task),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(current.generation() > snapshot.generation());
+            fixture
+                .runtime
+                .install_execution_authorizer(Arc::new(RenewalPolicy {
+                    revoked: AtomicBool::new(false),
+                    generation: Some(current.generation()),
+                }))
+                .unwrap();
+            fixture.store.authorization_gates[0].close();
+            fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+            let mut pending =
+                Box::pin(guard.ensure_live_dispatch_for_application_with_cx(&caller, &wake));
+            drive_until(&host, pending.as_mut(), || {
+                fixture.store.authorization_gates[0].waiter.lock().unwrap().is_some()
+            })
+            .await;
+            assert!(!guard.execution_revoked.load(Ordering::Acquire));
+            assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 0);
+            fixture.store.authorization_gates[0].release();
+            pending.await.unwrap();
+            assert_supervision_unchanged(&fixture, &current);
+            fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+            drop(guard);
+            fixture.assert_recoverable(&current, resumed);
+        });
+    }
+}
+
+#[test]
+fn async_supervision_rejects_substituted_authority_and_known_revocation() {
+    for resumed in [false, true] {
+        for invalid in ["snapshot", "principal", "revoked"] {
+            run(|caller| async move {
+                let host = Cx::current().unwrap();
+                let fixture = Fixture::new();
+                let snapshot = fixture.seed("supervision-authority", resumed);
+                let (_runner, guard, wake) =
+                    supervision_owner(&fixture, &caller, &snapshot, resumed).await;
+                let revoked = Arc::clone(&guard.execution_revoked);
+                let gate = if invalid == "snapshot" {
+                    fixture.store.gate(Step::Read)
+                } else {
+                    &fixture.store.authorization_gates[0]
+                };
+                gate.close();
+                fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+                let mut pending =
+                    Box::pin(guard.ensure_live_dispatch_for_application_with_cx(&caller, &wake));
+                drive_until(&host, pending.as_mut(), || {
+                    gate.waiter.lock().unwrap().is_some()
+                })
+                .await;
+                match invalid {
+                    "snapshot" => {
+                        let mut task = snapshot.task().clone();
+                        let FinalTask::Working(base) = &mut task else {
+                            panic!("the elected fixture must be working");
+                        };
+                        base.task_id = FinalTaskId::parse("substituted-supervision-task").unwrap();
+                        *fixture.store.substitute_read.lock().unwrap() = Some(
+                            FinalTaskSnapshot::new(task, snapshot.generation())
+                                .with_creation_generation(snapshot.creation_generation()),
+                        );
+                        gate.release();
+                    }
+                    "principal" => {
+                        *fixture.store.substitute_authorization.lock().unwrap() =
+                            Some(FinalTaskAccessMetadata::new(
+                                snapshot.task().base().task_id.clone(),
+                                snapshot.generation(),
+                                snapshot.creation_generation(),
+                                Some(Sha256Digest::from_bytes([91; 32])),
+                                snapshot.original_operation().cloned(),
+                            ));
+                        gate.release();
+                    }
+                    _ => {
+                        // No provider wake: the retained probe's own local
+                        // checkpoint must observe an already revoked attempt.
+                        revoked.store(true, Ordering::Release);
+                    }
+                }
+                assert!(pending.await.is_err());
+                assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 0);
+                assert_supervision_unchanged(&fixture, &snapshot);
+                fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+                drop(guard);
+            });
+        }
+    }
+}
+
+#[test]
+fn async_supervision_silent_reads_release_on_cancellation_or_drop() {
+    for maintenance in [false, true] {
+        for cancel in [false, true] {
+            run(|caller| async move {
+                let host = Cx::current().unwrap();
+                let fixture = Fixture::new();
+                let snapshot = fixture.seed("supervision-read-abandonment", false);
+                let (runner, mut guard, wake) =
+                    supervision_owner(&fixture, &caller, &snapshot, false).await;
+                let executor = runner.handoff_executor();
+                let gate = fixture.store.gate(Step::CancellationIntent);
+                gate.close();
+                fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+                let mut pending =
+                    supervision_operation(maintenance, &executor, &caller, &mut guard, &wake);
+                drive_until(&host, pending.as_mut(), || {
+                    gate.waiter.lock().unwrap().is_some()
+                })
+                .await;
+                if cancel {
+                    caller.cancel_with(asupersync::types::CancelKind::User, None);
+                    let error = pending.await.unwrap_err();
+                    assert_eq!(error.code, McpError::request_cancelled().code);
+                } else {
+                    drop(pending);
+                }
+                assert!(!gate.open.load(Ordering::SeqCst));
+                assert_eq!(gate.abandoned.load(Ordering::SeqCst), 1);
+                assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 0);
+                assert_supervision_unchanged(&fixture, &snapshot);
+                fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+                drop(guard);
+                fixture.assert_recoverable(&snapshot, false);
+            });
+        }
+    }
+}
+
+#[test]
+fn async_supervision_silent_reads_keep_the_original_caller_deadline() {
+    for maintenance in [false, true] {
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        let setup_caller = runtime.request_cx_with_budget(Budget::INFINITE);
+        let fixture = Fixture::new();
+        let snapshot = fixture.seed("supervision-caller-deadline", false);
+        let (runner, mut guard, wake) =
+            runtime.block_on(supervision_owner(&fixture, &setup_caller, &snapshot, false));
+        let executor = runner.handoff_executor();
+        let caller = runtime.request_cx_with_budget(
+            Budget::INFINITE.with_deadline(setup_caller.now().saturating_add_nanos(1_000_000_000)),
+        );
+        let gate = fixture.store.gate(Step::CancellationIntent);
+        gate.close();
+        fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+        let mut pending =
+            supervision_operation(maintenance, &executor, &caller, &mut guard, &wake);
+        let first = runtime.block_on(std::future::poll_fn(|poll| {
+            Poll::Ready(pending.as_mut().poll(poll))
+        }));
+        assert!(first.is_pending());
+        assert!(gate.waiter.lock().unwrap().is_some());
+        runtime.block_on(async {
+            clock.advance(1_000_000_000);
+            assert!(timer.process_timers() > 0);
+        });
+        let result = runtime.block_on(std::future::poll_fn(|poll| {
+            Poll::Ready(pending.as_mut().poll(poll))
+        }));
+        let Poll::Ready(result) = result else {
+            panic!("the original caller deadline must release silent storage");
+        };
+        assert_eq!(result.unwrap_err().code, McpError::request_cancelled().code);
+        drop(pending);
+        assert!(!caller.is_cancel_requested());
+        assert!(!gate.open.load(Ordering::SeqCst));
+        assert_eq!(gate.abandoned.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 0);
+        assert_supervision_unchanged(&fixture, &snapshot);
+        fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+        drop(guard);
+        drop(wake);
+        drop(executor);
+        drop(runner);
+        drop(fixture);
+        drop(caller);
+        drop(setup_caller);
+        assert_eq!(timer.pending_count(), 0);
+        assert!(runtime.shutdown_timeout(StdDuration::from_secs(2)));
+    }
+}
+
+fn commit_supervision_cancellation(fixture: &Fixture, task_id: &FinalTaskId) -> FinalTaskSnapshot {
+    let expected = fixture.store.inner.get_task_snapshot(task_id).unwrap().unwrap();
+    let cancelled = FinalTask::Cancelled(
+        transition_final_task_base(
+            expected.task().base().clone(),
+            FinalTaskStatus::Cancelled,
+            None,
+        )
+        .unwrap(),
+    );
+    let retained = fixture
+        .store
+        .inner
+        .request_cancellation_and_clear_input_if_current(
+            &expected,
+            cancelled.clone(),
+            final_task_notification(&cancelled),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(matches!(retained.task(), FinalTask::Working(_)));
+    fixture.runtime.signal_task_service_cancellation(task_id.clone());
+    retained
+}
+
+#[test]
+fn async_supervision_cancellation_drops_pending_renewal_before_return() {
+    for resumed in [false, true] {
+        run(|caller| async move {
+            let host = Cx::current().unwrap();
+            let fixture = Fixture::new();
+            let snapshot = fixture.seed("supervision-pending-renewal", resumed);
+            let task_id = snapshot.task().base().task_id.clone();
+            let (_runner, guard, wake) =
+                supervision_owner(&fixture, &caller, &snapshot, resumed).await;
+            *fixture.store.renewal_pause_for.lock().unwrap() = Some(task_id.clone());
+            fixture.store.renewal_gate.close();
+            fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+            let mut pending =
+                Box::pin(guard.ensure_live_dispatch_for_application_with_cx(&caller, &wake));
+            drive_until(&host, pending.as_mut(), || {
+                fixture.store.renewal_gate.waiter.lock().unwrap().is_some()
+            })
+            .await;
+            let retained = commit_supervision_cancellation(&fixture, &task_id);
+            let error = pending.await.unwrap_err();
+            assert_eq!(error.code, McpError::request_cancelled().code);
+            assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.store.renewals.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.store.renewal_gate.abandoned.load(Ordering::SeqCst), 1);
+            assert_supervision_unchanged(&fixture, &retained);
+            assert!(fixture.store.inner.is_cancellation_requested(&task_id).unwrap());
+            fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+            drop(guard);
+            assert!(matches!(
+                fixture.store.inner.get_task(&task_id).unwrap().unwrap(),
+                FinalTask::Cancelled(_)
+            ));
+        });
+    }
+}
+
+#[test]
+fn async_supervision_post_renewal_cancellation_rechecks_consumed_intent() {
+    for resumed in [false, true] {
+        run(|caller| async move {
+            let host = Cx::current().unwrap();
+            let fixture = Fixture::new();
+            let snapshot = fixture.seed("supervision-late-cancellation", resumed);
+            let task_id = snapshot.task().base().task_id.clone();
+            let (_runner, guard, wake) =
+                supervision_owner(&fixture, &caller, &snapshot, resumed).await;
+            fixture.store.pause_snapshot_after_renewal.store(true, Ordering::SeqCst);
+            fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+            let mut pending =
+                Box::pin(guard.ensure_live_dispatch_for_application_with_cx(&caller, &wake));
+            drive_until(&host, pending.as_mut(), || {
+                fixture.store.gate(Step::Read).waiter.lock().unwrap().is_some()
+            })
+            .await;
+            assert_eq!(fixture.store.renewals.load(Ordering::SeqCst), 1);
+            let intent_reads = fixture.store.count(Step::CancellationIntent);
+            fixture.store.pause_snapshot_after_intent.store(true, Ordering::SeqCst);
+            fixture.store.gate(Step::Read).release();
+            drive_until(&host, pending.as_mut(), || {
+                fixture.store.count(Step::CancellationIntent) > intent_reads
+                    && fixture.store.gate(Step::Read).waiter.lock().unwrap().is_some()
+            })
+            .await;
+            // The pending proof has already read false intent. Cancellation
+            // does not need to change the working Task's record generation.
+            let retained = commit_supervision_cancellation(&fixture, &task_id);
+            assert_eq!(retained.generation(), snapshot.generation());
+            fixture.store.gate(Step::Read).release();
+            let error = pending.await.unwrap_err();
+            assert_eq!(error.code, McpError::request_cancelled().code);
+            assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.store.renewals.load(Ordering::SeqCst), 1);
+            assert!(fixture.store.count(Step::CancellationIntent) > intent_reads + 1);
+            assert_supervision_unchanged(&fixture, &retained);
+            fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+            drop(guard);
+        });
+    }
 }

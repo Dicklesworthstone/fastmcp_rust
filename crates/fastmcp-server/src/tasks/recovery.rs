@@ -25,12 +25,12 @@ pub(super) struct FinalTaskLeaseRenewal {
 
 /// A storage wake must survive an intervening authorization read. Wakes from
 /// that read must not themselves cause a busy loop polling a parked renewal.
-struct RenewalOperationWake {
+struct FinalTaskOperationWake {
     notified: Arc<AtomicBool>,
     parent: std::task::Waker,
 }
 
-impl std::task::Wake for RenewalOperationWake {
+impl std::task::Wake for FinalTaskOperationWake {
     fn wake(self: Arc<Self>) {
         self.wake_by_ref();
     }
@@ -131,7 +131,7 @@ impl FinalTaskLeaseRenewal {
             });
             self.operation_woken
                 .store(false, TaskServiceOrdering::Release);
-            let waker = std::task::Waker::from(Arc::new(RenewalOperationWake {
+            let waker = std::task::Waker::from(Arc::new(FinalTaskOperationWake {
                 notified: Arc::clone(&self.operation_woken),
                 parent: task.waker().clone(),
             }));
@@ -312,6 +312,204 @@ impl FinalTaskLeaseRenewal {
                         .attempt_deadline
                         .is_some_and(|deadline| now >= deadline)
             })
+    }
+}
+
+/// One retained, read-only supervision proof. Storage may suspend between
+/// metadata, snapshot and cancellation reads; no application or maintenance
+/// poll may borrow a partially checked result.
+#[derive(Default)]
+pub(super) struct FinalTaskSupervisionProbe {
+    operation: Option<FinalTaskStoreFuture<'static, bool>>,
+    checkpoint: Option<Pin<Box<asupersync::time::Sleep>>>,
+    cancellation_notified: Arc<AtomicBool>,
+}
+
+pub(super) enum FinalTaskSupervisionState {
+    Active { cancellation_requested: bool },
+    Inactive,
+}
+
+impl FinalTaskSupervisionProbe {
+    pub(super) fn poll(
+        &mut self,
+        cx: &Cx,
+        guard: &FinalTaskExecutionGuard,
+        cancellation_wake: &FinalTaskCancellationWakeRegistration,
+        task: &mut std::task::Context<'_>,
+    ) -> Poll<McpResult<FinalTaskSupervisionState>> {
+        let result = self.poll_probe(cx, guard, cancellation_wake, task);
+        if result.is_ready() {
+            self.operation = None;
+            self.checkpoint = None;
+            if matches!(
+                &result,
+                Poll::Ready(Ok(FinalTaskSupervisionState::Active {
+                    cancellation_requested: false,
+                }))
+            ) && self.cancellation_notified.load(TaskServiceOrdering::Acquire)
+            {
+                // Intent may have been sampled before the post-read proof
+                // suspended. A cancellation wake invalidates that false
+                // sample; it never supplies cancellation authority itself.
+                // Keep any enclosing Ready result while a fresh proof runs.
+                task.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        }
+        result
+    }
+
+    fn poll_probe(
+        &mut self,
+        cx: &Cx,
+        guard: &FinalTaskExecutionGuard,
+        cancellation_wake: &FinalTaskCancellationWakeRegistration,
+        task: &mut std::task::Context<'_>,
+    ) -> Poll<McpResult<FinalTaskSupervisionState>> {
+        match Self::terminal(cx, guard) {
+            Ok(Some(state)) => return Poll::Ready(Ok(state)),
+            Ok(None) => {}
+            Err(error) => return Poll::Ready(Err(error)),
+        }
+        if self.operation.is_none() {
+            // Reset only when beginning a new complete proof. The following
+            // reads observe any cancellation that preceded this registration.
+            self.cancellation_notified
+                .store(false, TaskServiceOrdering::Release);
+        }
+        let cancellation_waker = std::task::Waker::from(Arc::new(FinalTaskOperationWake {
+            notified: Arc::clone(&self.cancellation_notified),
+            parent: task.waker().clone(),
+        }));
+        cancellation_wake.register_waker(&cancellation_waker);
+        // Storage and timer futures retain the ordinary task waker below, so
+        // their progress cannot be mistaken for durable cancellation.
+        if self.operation.is_none() {
+            let caller = match final_task_service_caller(cx) {
+                Ok(caller) => caller,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            let authority = match guard.authority() {
+                Ok(authority) => authority,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            self.operation = Some(Box::pin(async move {
+                authority.cancellation_requested_with_cx(&caller).await
+            }));
+        }
+        let observed = self
+            .operation
+            .as_mut()
+            .expect("supervision proof is retained")
+            .as_mut()
+            .poll(task);
+        // Storage and policy callbacks may cancel the caller, consume the
+        // original budget, or revoke registration while producing a receipt.
+        match Self::terminal(cx, guard) {
+            Ok(Some(state)) => return Poll::Ready(Ok(state)),
+            Ok(None) => {}
+            Err(error) => return Poll::Ready(Err(error)),
+        }
+        if let Poll::Ready(result) = observed {
+            return Poll::Ready(result.map(|cancellation_requested| {
+                FinalTaskSupervisionState::Active {
+                    cancellation_requested,
+                }
+            }));
+        }
+        // Worker reads already subscribe to caller cancellation and its mapped
+        // deadline. Also sample the backend clock when an otherwise silent
+        // provider spans an authoritative clock advance.
+        let checkpoint = self.checkpoint.get_or_insert_with(|| {
+            Box::pin(asupersync::time::sleep(
+                cx.now(),
+                RECOVERY_CHECKPOINT_INTERVAL,
+            ))
+        });
+        if checkpoint.as_mut().poll(task).is_ready() {
+            checkpoint.set(asupersync::time::sleep(
+                cx.now(),
+                RECOVERY_CHECKPOINT_INTERVAL,
+            ));
+            task.waker().wake_by_ref();
+        }
+        Poll::Pending
+    }
+
+    /// These checks are local. Current-generation policy is evaluated only
+    /// after the awaitable worker proof obtains fresh continuity metadata.
+    fn terminal(
+        cx: &Cx,
+        guard: &FinalTaskExecutionGuard,
+    ) -> McpResult<Option<FinalTaskSupervisionState>> {
+        final_task_service_caller(cx)?;
+        if guard.pending_write.application_closed() {
+            return Err(McpError::request_cancelled());
+        }
+        if guard
+            .transition_committed
+            .load(TaskServiceOrdering::Acquire)
+            || FinalTaskLeaseRenewal::expired(guard)
+        {
+            // Return custody to the outer executor. It owns terminalization
+            // and region settlement; this read-only wait never retires work.
+            return Ok(Some(FinalTaskSupervisionState::Inactive));
+        }
+        let expected = guard.execution_authorization.as_ref().ok_or_else(|| {
+            McpError::internal_error(
+                "Final task handoff has no execution authorization binding",
+            )
+        })?;
+        if guard.execution_revoked.load(TaskServiceOrdering::Acquire)
+            || expected
+                .original_operation()
+                .is_some_and(|operation| !operation.is_registered())
+        {
+            guard
+                .execution_revoked
+                .store(true, TaskServiceOrdering::Release);
+            return Err(authorization::task_execution_denied());
+        }
+        Ok(None)
+    }
+}
+
+/// A renewal whose pre- and post-poll cancellation proofs may await storage.
+/// A Ready renewal remains retained until its post-proof settles; a parked
+/// renewal is preceded by another fresh proof before it is polled again.
+#[derive(Default)]
+pub(super) struct FinalTaskSupervisedRenewal {
+    renewal: FinalTaskLeaseRenewal,
+    supervision: FinalTaskSupervisionProbe,
+    completed: Option<bool>,
+}
+
+impl FinalTaskSupervisedRenewal {
+    pub(super) fn poll(
+        &mut self,
+        cx: &Cx,
+        guard: &FinalTaskExecutionGuard,
+        cancellation_wake: &FinalTaskCancellationWakeRegistration,
+        task: &mut std::task::Context<'_>,
+    ) -> Poll<McpResult<Option<bool>>> {
+        loop {
+            match std::task::ready!(self.supervision.poll(cx, guard, cancellation_wake, task)) {
+                Ok(FinalTaskSupervisionState::Active {
+                    cancellation_requested: false,
+                }) => {}
+                Ok(_) => return Poll::Ready(Ok(None)),
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+            if let Some(renewed) = self.completed.take() {
+                return Poll::Ready(Ok(Some(renewed)));
+            }
+            match self.renewal.poll(cx, guard, task) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(renewed)) => self.completed = Some(renewed),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            }
+        }
     }
 }
 
@@ -1215,22 +1413,43 @@ impl FinalTaskHandoffExecutor {
             let mut maintenance = None;
             let mut completed = None;
             let mut heartbeat = None;
-            let mut renewal = FinalTaskLeaseRenewal::default();
+            let mut renewal = FinalTaskSupervisedRenewal::default();
+            let mut supervision = FinalTaskSupervisionProbe::default();
+            let mut checked_before = false;
+            let mut checked_after = false;
+            let mut maintenance_polled = false;
+            let maintenance_woken = Arc::new(AtomicBool::new(false));
             std::future::poll_fn(|task| {
-                match std::task::ready!(Self::poll_maintenance_checkpoint(
+                // These local checks also run while a retained proof or
+                // renewal is parked. A silent provider cannot hide expiry,
+                // caller cancellation, or an already committed worker write.
+                match std::task::ready!(Self::poll_maintenance_local_checkpoint(
                     cx,
                     guard,
-                    cancellation_wake,
                     task,
                 )) {
                     Ok(true) => {}
                     Ok(false) => return Poll::Ready(Ok(())),
                     Err(error) => return Poll::Ready(Err(error)),
                 }
+                if !checked_before {
+                    match std::task::ready!(Self::poll_maintenance_checkpoint(
+                        cx,
+                        guard,
+                        cancellation_wake,
+                        &mut supervision,
+                        task,
+                    )) {
+                        Ok(true) => checked_before = true,
+                        Ok(false) => return Poll::Ready(Ok(())),
+                        Err(error) => return Poll::Ready(Err(error)),
+                    }
+                }
                 if heartbeat.is_none() {
                     let interval = match std::task::ready!(Self::poll_renew_maintenance_lease(
                         cx,
                         guard,
+                        cancellation_wake,
                         &mut renewal,
                         task,
                     )) {
@@ -1240,36 +1459,45 @@ impl FinalTaskHandoffExecutor {
                     };
                     heartbeat = Some(Box::pin(asupersync::time::sleep(cx.now(), interval)));
                 }
-                if completed.is_none() {
-                    // Check before constructing the provider future too: a
-                    // factory may perform synchronous admission work.
+                if !maintenance_polled {
+                    // The phase survives an asynchronous post-poll proof.
+                    // Neither a Ready provider nor its original result may
+                    // be reconstructed or polled again during that wait.
                     if let Err(error) = final_task_service_caller(cx) {
                         return Poll::Ready(Err(error));
                     }
                     let operation = maintenance.get_or_insert_with(|| {
                         Box::pin(self.runtime.expire_pending_execution_with_cx(cx))
                     });
-                    if let Poll::Ready(result) = operation.as_mut().poll(task) {
-                        // Settlement can suspend below. Preserve Ready rather
-                        // than polling a completed provider a second time.
+                    maintenance_woken.store(false, TaskServiceOrdering::Release);
+                    let waker = std::task::Waker::from(Arc::new(FinalTaskOperationWake {
+                        notified: Arc::clone(&maintenance_woken),
+                        parent: task.waker().clone(),
+                    }));
+                    if let Poll::Ready(result) = operation
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(&waker))
+                    {
                         completed = Some(result);
                     }
+                    maintenance_polled = true;
                 }
-                match std::task::ready!(Self::poll_maintenance_checkpoint(
-                    cx,
-                    guard,
-                    cancellation_wake,
-                    task,
-                )) {
-                    Ok(true) => {}
-                    Ok(false) => return Poll::Ready(Ok(())),
-                    Err(error) => return Poll::Ready(Err(error)),
+                if !checked_after {
+                    match std::task::ready!(Self::poll_maintenance_checkpoint(
+                        cx,
+                        guard,
+                        cancellation_wake,
+                        &mut supervision,
+                        task,
+                    )) {
+                        Ok(true) => checked_after = true,
+                        Ok(false) => return Poll::Ready(Ok(())),
+                        Err(error) => return Poll::Ready(Err(error)),
+                    }
                 }
                 if let Some(result) = completed.take() {
                     return Poll::Ready(result);
                 }
-                // The checkpoint above admits this caller before Sleep can
-                // register a wake; a narrowed host cannot borrow a timer.
                 if let Err(error) = final_task_service_caller(cx) {
                     return Poll::Ready(Err(error));
                 }
@@ -1278,6 +1506,7 @@ impl FinalTaskHandoffExecutor {
                     let interval = match std::task::ready!(Self::poll_renew_maintenance_lease(
                         cx,
                         guard,
+                        cancellation_wake,
                         &mut renewal,
                         task,
                     )) {
@@ -1290,19 +1519,23 @@ impl FinalTaskHandoffExecutor {
                     // spinning through a ready or zero-duration deadline.
                     task.waker().wake_by_ref();
                 }
+                checked_before = false;
+                checked_after = false;
+                maintenance_polled = false;
+                // A provider wake may have been consumed while the post-proof
+                // was pending. Preserve it until the next actual provider poll.
+                if maintenance_woken.load(TaskServiceOrdering::Acquire) {
+                    task.waker().wake_by_ref();
+                }
                 Poll::Pending
             })
             .await
         })
     }
 
-    /// Returns false when the ordinary supervisor monitor should regain
-    /// control. In particular, durable task cancellation does not revoke its
-    /// cooperative cleanup opportunity.
-    fn poll_maintenance_checkpoint(
+    fn poll_maintenance_local_checkpoint(
         cx: &Cx,
         guard: &mut FinalTaskExecutionGuard,
-        cancellation_wake: &FinalTaskCancellationWakeRegistration,
         task: &mut std::task::Context<'_>,
     ) -> Poll<McpResult<bool>> {
         // A committed worker mutation may be waiting to deliver its receipt.
@@ -1317,38 +1550,38 @@ impl FinalTaskHandoffExecutor {
         if guard.pending_write.outcome_uncertain() {
             return Poll::Ready(Err(worker::worker_outcome_unknown()));
         }
-        if guard.pending_write.application_closed() {
-            return Poll::Ready(Err(McpError::request_cancelled()));
+        Poll::Ready(
+            FinalTaskSupervisionProbe::terminal(cx, guard)
+                .map(|terminal| terminal.is_none()),
+        )
+    }
+
+    /// Returns false when the ordinary supervisor monitor should regain
+    /// control. In particular, durable task cancellation does not revoke its
+    /// cooperative cleanup opportunity. The proof is retained across all
+    /// asynchronous metadata, snapshot and cancellation-intent reads.
+    fn poll_maintenance_checkpoint(
+        cx: &Cx,
+        guard: &mut FinalTaskExecutionGuard,
+        cancellation_wake: &FinalTaskCancellationWakeRegistration,
+        supervision: &mut FinalTaskSupervisionProbe,
+        task: &mut std::task::Context<'_>,
+    ) -> Poll<McpResult<bool>> {
+        match std::task::ready!(Self::poll_maintenance_local_checkpoint(
+            cx,
+            guard,
+            task,
+        )) {
+            Ok(true) => {}
+            result => return Poll::Ready(result),
         }
-        cancellation_wake.register_waker(task.waker());
-        if let Err(error) = final_task_service_caller(cx) {
-            return Poll::Ready(Err(error));
-        }
-        if guard
-            .transition_committed
-            .load(TaskServiceOrdering::Acquire)
-        {
-            // The private commit receipt permits bounded application cleanup,
-            // not further maintenance under a now-consumed dispatch lease.
-            return Poll::Ready(Ok(false));
-        }
-        match guard.retire_if_execution_expired() {
-            Ok(true) => return Poll::Ready(Ok(false)),
-            Ok(false) => {}
-            Err(error) => return Poll::Ready(Err(error)),
-        }
-        if guard.is_authoritatively_expired() {
-            return Poll::Ready(Ok(false));
-        }
-        match guard.retire_if_execution_authorization_lost() {
-            Ok(true) => return Poll::Ready(Ok(false)),
-            Ok(false) => {}
-            Err(error) => return Poll::Ready(Err(error)),
-        }
-        match guard.is_cancellation_requested() {
-            Ok(requested) => Poll::Ready(Ok(!requested)),
-            Err(error) => Poll::Ready(Err(error)),
-        }
+        Poll::Ready(match std::task::ready!(supervision.poll(cx, guard, cancellation_wake, task)) {
+            Ok(FinalTaskSupervisionState::Active {
+                cancellation_requested,
+            }) => Ok(!cancellation_requested),
+            Ok(FinalTaskSupervisionState::Inactive) => Ok(false),
+            Err(error) => Err(error),
+        })
     }
 
     /// Renews only the guard's exact owner/fence and returns its next bounded
@@ -1356,11 +1589,13 @@ impl FinalTaskHandoffExecutor {
     fn poll_renew_maintenance_lease(
         cx: &Cx,
         guard: &mut FinalTaskExecutionGuard,
-        renewal: &mut FinalTaskLeaseRenewal,
+        cancellation_wake: &FinalTaskCancellationWakeRegistration,
+        renewal: &mut FinalTaskSupervisedRenewal,
         task: &mut std::task::Context<'_>,
     ) -> Poll<McpResult<Option<StdDuration>>> {
-        let renewed = match std::task::ready!(renewal.poll(cx, guard, task)) {
-            Ok(renewed) => renewed,
+        let renewed = match std::task::ready!(renewal.poll(cx, guard, cancellation_wake, task)) {
+            Ok(Some(renewed)) => renewed,
+            Ok(None) => return Poll::Ready(Ok(None)),
             Err(error) => return Poll::Ready(Err(error)),
         };
         Poll::Ready(Self::maintenance_interval_after_renewal(cx, guard, renewed))
@@ -1372,24 +1607,17 @@ impl FinalTaskHandoffExecutor {
         renewed: bool,
     ) -> McpResult<Option<StdDuration>> {
         final_task_service_caller(cx)?;
-        if !renewed {
-            if guard
-                .transition_committed
-                .load(TaskServiceOrdering::Acquire)
-                || guard.retire_if_execution_expired()?
-                || guard.is_authoritatively_expired()
-            {
-                return Ok(None);
-            }
-            return Err(McpError::internal_error(
-                "Final task dispatch lease was lost while application work was running",
-            ));
-        }
         if guard
             .transition_committed
             .load(TaskServiceOrdering::Acquire)
+            || FinalTaskLeaseRenewal::expired(guard)
         {
             return Ok(None);
+        }
+        if !renewed {
+            return Err(McpError::internal_error(
+                "Final task dispatch lease was lost while application work was running",
+            ));
         }
         let backend_interval = guard.bounded_heartbeat_interval()?;
         final_task_service_caller(cx)?;

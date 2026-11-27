@@ -12450,6 +12450,7 @@ impl FinalTaskExecutionGuard {
         Ok(true)
     }
 
+    #[cfg(test)]
     async fn renew_with_cx(&self, cx: &Cx) -> McpResult<bool> {
         let mut renewal = recovery::FinalTaskLeaseRenewal::default();
         std::future::poll_fn(|poll| renewal.poll(cx, self, poll)).await
@@ -12506,31 +12507,21 @@ impl FinalTaskExecutionGuard {
         cx: &Cx,
         cancellation_wake: &FinalTaskCancellationWakeRegistration,
     ) -> McpResult<()> {
-        let mut renewal = std::pin::pin!(self.renew_with_cx(cx));
+        let mut renewal = recovery::FinalTaskSupervisedRenewal::default();
         let renewed = std::future::poll_fn(|task| {
-            if let Err(error) = final_task_service_caller(cx) {
-                return std::task::Poll::Ready(Err(error));
-            }
-            cancellation_wake.register_waker(task.waker());
-            // No application future exists yet, so cancellation needs no
-            // cooperative grace and must not wait for a parked provider.
-            match self.is_cancellation_requested() {
-                Ok(true) => return std::task::Poll::Ready(Err(McpError::request_cancelled())),
-                Ok(false) => {}
-                Err(error) => return std::task::Poll::Ready(Err(error)),
-            }
-            renewal.as_mut().poll(task)
+            // No application future exists yet. Await a complete owner-bound
+            // cancellation proof before polling renewal and after its result.
+            // The retained state also observes cancellation while renewal is
+            // pending, without synchronously reading the store.
+            renewal.poll(cx, self, cancellation_wake, task)
         })
         .await?;
-        if self.is_cancellation_requested()? {
-            return Err(McpError::request_cancelled());
-        }
-        if renewed {
-            Ok(())
-        } else {
-            Err(McpError::internal_error(
+        match renewed {
+            Some(true) => Ok(()),
+            Some(false) => Err(McpError::internal_error(
                 "Final task dispatch lease was lost while application work was running",
-            ))
+            )),
+            None => Err(McpError::request_cancelled()),
         }
     }
 
