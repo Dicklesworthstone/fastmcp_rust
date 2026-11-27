@@ -2772,6 +2772,210 @@ while IFS= read -r unexpected; do exit 65; done
 
     #[cfg(feature = "tasks")]
     #[test]
+    fn modern_async_tasks_follow_public_input_responders_without_losing_outcomes() {
+        fn responses(input: &modern::InputRequiredResult) -> modern::MrtrInputResponses {
+            assert_eq!(input.request_state(), Some("task-continuation"));
+            assert!(input.input_requests().unwrap().get("roots-input").is_some());
+            modern::MrtrInputResponses::from([(
+                "roots-input".to_owned(),
+                json!({"roots": []}),
+            )])
+        }
+
+        fn async_response<'a>(
+            cx: &'a Cx,
+            input: &'a modern::InputRequiredResult,
+            calls: Arc<AtomicUsize>,
+        ) -> modern::MrtrResponderFuture<'a> {
+            Box::pin(async move {
+                assert!(cx.blocking_pool_handle().is_none());
+                asupersync::runtime::yield_now().await;
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(responses(input))
+            })
+        }
+
+        for mode in ["unhandled", "installed", "sync", "async"] {
+            run(|cx| async move {
+                let handled = mode != "unhandled";
+                let task_result = mode != "sync";
+                let input = json!({
+                    "resultType": "input_required",
+                    "requestState": "task-continuation",
+                    "inputRequests": {"roots-input": {"method": "roots/list"}},
+                });
+                let terminal = if task_result {
+                    json!({
+                        "resultType": "task",
+                        "taskId": "task-after-input",
+                        "status": "working",
+                        "createdAt": "2026-07-28T12:00:00Z",
+                        "lastUpdatedAt": "2026-07-28T12:00:00Z",
+                        "ttlMs": null,
+                        "_meta": {"example.test/receipt": "retained"},
+                    })
+                } else {
+                    json!({
+                        "resultType": "complete",
+                        "content": [{"type": "text", "text": "completed after input"}],
+                        "_meta": {"example.test/receipt": "retained"},
+                    })
+                };
+                let mut script = [DISCOVER, r#"
+read_request
+case "$request" in *'"method":"tools/call"'*) ;; *) exit 70 ;; esac
+case "$request" in *'"name":"interactive-task"'*) ;; *) exit 71 ;; esac
+case "$request" in *'"arguments":{"subject":"retained"}'*) ;; *) exit 72 ;; esac
+case "$request" in *'"io.modelcontextprotocol/tasks":{}'*) ;; *) exit 73 ;; esac
+case "$request" in *'"requestState"'*|*'"inputResponses"'*) exit 74 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$3"
+"#].concat();
+                if handled {
+                    script.push_str(r#"
+read_request
+case "$request" in *'"method":"tools/call"'*) ;; *) exit 75 ;; esac
+case "$request" in *'"name":"interactive-task"'*) ;; *) exit 76 ;; esac
+case "$request" in *'"arguments":{"subject":"retained"}'*) ;; *) exit 77 ;; esac
+case "$request" in *'"io.modelcontextprotocol/tasks":{}'*) ;; *) exit 78 ;; esac
+case "$request" in *'"requestState":"task-continuation"'*) ;; *) exit 79 ;; esac
+case "$request" in *'"inputResponses":{"roots-input":{"roots":[]}}'*) ;; *) exit 80 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$2"
+"#);
+                }
+                script.push_str(r#"
+read_request
+case "$request" in *'"method":"server/discover"'*) ;; *) exit 81 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$1"
+while IFS= read -r unexpected; do exit 82; done
+"#);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let mut builder = modern::ClientBuilder::new()
+                    .capabilities(serde_json::from_value(json!({"roots": {}})).unwrap());
+                if mode == "installed" {
+                    let calls = Arc::clone(&calls);
+                    builder = builder.modern_reverse_request_handlers(
+                        modern::ReverseRequestHandlers::new().with_modern_roots_list(
+                            move |caller, _, _| {
+                                let calls = Arc::clone(&calls);
+                                Box::pin(async move {
+                                    assert!(caller.blocking_pool_handle().is_none());
+                                    asupersync::runtime::yield_now().await;
+                                    calls.fetch_add(1, Ordering::AcqRel);
+                                    serde_json::from_value(json!({"roots": []})).map_err(|_| {
+                                        modern::McpError::internal_error("invalid roots fixture")
+                                    })
+                                })
+                            },
+                        ),
+                    );
+                }
+                let discovery = discovery_with_extensions(std::collections::BTreeMap::from([(
+                    modern::TASKS_EXTENSION.to_owned(),
+                    json!({}),
+                )]));
+                let mut client = builder
+                    .max_retries(0)
+                    .request_timeout_policy(
+                        modern::RequestTimeoutPolicy::new(
+                            Duration::from_secs(5),
+                            Duration::from_secs(5),
+                        )
+                        .unwrap(),
+                    )
+                    .connect_stdio_with_cx(
+                        &cx,
+                        "sh",
+                        &[
+                            "-c",
+                            &script,
+                            "public-task-mrtr-peer",
+                            &discovery,
+                            &terminal.to_string(),
+                            &input.to_string(),
+                        ],
+                    )
+                    .await
+                    .unwrap();
+                let cancellation = modern::McpRequestCancellation::new();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let outcome = match mode {
+                    "sync" => require_send(client.call_tool_outcome_with_mrtr_retry(
+                        &cx,
+                        &cancellation,
+                        deadline,
+                        "interactive-task",
+                        json!({"subject": "retained"}),
+                        |input| {
+                            calls.fetch_add(1, Ordering::AcqRel);
+                            Ok(responses(input))
+                        },
+                    ))
+                    .await,
+                    "async" => {
+                        let calls = Arc::clone(&calls);
+                        require_send(client.call_tool_outcome_with_async_mrtr_retry(
+                            &cx,
+                            &cancellation,
+                            deadline,
+                            "interactive-task",
+                            json!({"subject": "retained"}),
+                            move |caller, input| {
+                                async_response(caller, input, Arc::clone(&calls))
+                            },
+                        ))
+                        .await
+                    }
+                    _ => require_send(client.call_tool_outcome_with_handlers(
+                        &cx,
+                        &cancellation,
+                        "interactive-task",
+                        json!({"subject": "retained"}),
+                    ))
+                    .await,
+                }
+                .unwrap();
+                let retained = match outcome {
+                    modern::FinalToolCallOutcome::Task(result) if handled && task_result => {
+                        assert_eq!(result.task.base().task_id.as_str(), "task-after-input");
+                        serde_json::to_value(result).unwrap()
+                    }
+                    modern::FinalToolCallOutcome::Complete(result) if handled && !task_result => {
+                        serde_json::from_str(
+                            &fastmcp_rust::CoreResult::Final(modern::FinalCoreResult::ToolsCall {
+                                result,
+                                diagnostic: None,
+                            })
+                            .encode()
+                            .unwrap(),
+                        )
+                        .unwrap()
+                    }
+                    modern::FinalToolCallOutcome::InputRequired(result) if !handled => {
+                        serde_json::from_str(
+                            &fastmcp_rust::CoreResult::Final(modern::FinalCoreResult::ToolsCallInputRequired {
+                                result,
+                                diagnostic: None,
+                            })
+                            .encode()
+                            .unwrap(),
+                        )
+                        .unwrap()
+                    }
+                    other => panic!("public Tasks responder lost its result branch: {other:?}"),
+                };
+                assert_eq!(retained, if handled { terminal } else { input });
+                assert_eq!(calls.load(Ordering::Acquire), usize::from(handled));
+                // This sentinel rejects implicit Task polling, cancellation,
+                // or replay before the caller's independent next operation.
+                require_send(client.ping_with_cx(&cx, &cancellation)).await.unwrap();
+                client.close_with_cx(&cx).await.unwrap();
+                assert!(cx.checkpoint().is_ok());
+            });
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
     fn modern_async_tasks_preserve_outcomes_inputs_and_live_listener_ownership() {
         run(|cx| async move {
             let script = [DISCOVER, r#"

@@ -7361,6 +7361,96 @@ pub mod modern {
                 .await
         }
 
+        /// Calls a Tasks-capable tool and answers input-required rounds with
+        /// the installed modern handlers on the caller's Unix runtime.
+        ///
+        /// The original cancellation domain and absolute timeout cover discovery,
+        /// requests, and callbacks. Without installed handlers, input-required
+        /// remains a distinct outcome. An admitted Task receipt keeps its Task ID
+        /// even when cancellation becomes visible in the same receive poll.
+        /// This operation does not poll or cancel the returned Task.
+        #[cfg(all(unix, feature = "tasks"))]
+        pub async fn call_tool_outcome_with_handlers(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<FinalToolCallOutcome> {
+            self.inner
+                .call_tool_final_outcome_with_handlers_with_cx(
+                    cx,
+                    cancellation,
+                    name,
+                    arguments,
+                )
+                .await
+        }
+
+        /// Calls a Tasks-capable tool with an operation-local input responder.
+        ///
+        /// The earlier of `deadline` and the configured absolute timeout applies
+        /// to every round. Input batches are admitted before callbacks run, and
+        /// their response keys must match exactly. Each continuation retains the
+        /// original arguments, metadata, and Tasks capability advertisement.
+        /// Complete, Task, and unhandled input-required outcomes stay distinct.
+        #[cfg(all(unix, feature = "tasks"))]
+        pub async fn call_tool_outcome_with_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            respond: F,
+        ) -> McpResult<FinalToolCallOutcome>
+        where
+            F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        {
+            self.inner
+                .call_tool_final_outcome_with_mrtr_retry_with_cx(
+                    cx,
+                    cancellation,
+                    deadline,
+                    name,
+                    arguments,
+                    respond,
+                )
+                .await
+        }
+
+        /// Calls a Tasks-capable tool with a caller-owned asynchronous responder.
+        ///
+        /// The callback may borrow this round's input batch and caller context.
+        /// Cancellation, deadline expiry, or dropping the operation drops a
+        /// pending responder before it can publish another continuation. An
+        /// already-admitted Task receipt remains available to the caller.
+        /// The operation never starts automatic Task polling or transport replay.
+        #[cfg(all(unix, feature = "tasks"))]
+        pub async fn call_tool_outcome_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            respond: F,
+        ) -> McpResult<FinalToolCallOutcome>
+        where
+            F: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+        {
+            self.inner
+                .call_tool_final_outcome_with_async_mrtr_retry_with_cx(
+                    cx,
+                    cancellation,
+                    deadline,
+                    name,
+                    arguments,
+                    respond,
+                )
+                .await
+        }
+
         /// Reads one task while yielding between bounded stdio receive turns.
         #[cfg(all(unix, feature = "tasks"))]
         pub async fn get_task_with_cx(

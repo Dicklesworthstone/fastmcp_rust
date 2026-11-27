@@ -21323,11 +21323,11 @@ impl Client {
     /// ```
     pub fn stdio_with_cx(cx: Cx, command: &str, args: &[&str]) -> McpResult<Self> {
         // The public convenience constructor follows the same modern-first,
-        // bounded Auto selection as ClientBuilder. A correlated discovery
-        // MethodNotFound or Unix-observable clean first-probe timeout closes
-        // the disposable child before opening one fresh exact-2024 child;
-        // malformed discoveries and every other failure are never replayed as
-        // legacy traffic.
+        // bounded Auto selection as ClientBuilder. A correlated nonmodern
+        // discovery error or Unix-observable clean first-probe timeout closes
+        // the disposable child before opening one fresh exact-2024 child.
+        // Recognized modern errors, malformed replies, and transport failures
+        // never authorize legacy replay.
         Self::stdio_with_protocol_plan_with_cx(
             cx,
             command,
@@ -21342,9 +21342,9 @@ impl Client {
     /// `ModernOnly` performs a modern `server/discover` exchange, while
     /// `LegacyOnly` performs the exact 2024-11-05 initialization lifecycle.
     /// `Auto` first probes a disposable modern process and starts a fresh
-    /// exact-2024 process only for a correlated discovery refusal or an
-    /// Unix-observable clean first-probe timeout. Transport failures and
-    /// malformed modern discovery never authorize a downgrade.
+    /// exact-2024 process only for a correlated nonmodern discovery error or a
+    /// Unix-observable clean first-probe timeout. Recognized modern errors,
+    /// transport failures, and malformed discovery never authorize a downgrade.
     ///
     /// ```compile_fail
     /// use fastmcp_client::{Client, ClientProtocolPlan, ProtocolPolicy};
@@ -22998,6 +22998,25 @@ impl Client {
         parameters: serde_json::Value,
         allow_tasks: bool,
     ) -> McpResult<StdioFinalMrtrExecution> {
+        self.start_yielding_final_mrtr_request_with_cancellation_until(
+            cx,
+            cancellation,
+            method,
+            parameters,
+            allow_tasks,
+            None,
+        )
+    }
+
+    fn start_yielding_final_mrtr_request_with_cancellation_until(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        method: &str,
+        parameters: serde_json::Value,
+        allow_tasks: bool,
+        operation_deadline: Option<Instant>,
+    ) -> McpResult<StdioFinalMrtrExecution> {
         if cx.checkpoint().is_err()
             || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
         {
@@ -23020,6 +23039,7 @@ impl Client {
             method,
             parameters,
             allow_tasks,
+            operation_deadline,
         )
     }
 
@@ -23044,7 +23064,7 @@ impl Client {
                 "Yielding final catalog requires a modern list method",
             ));
         }
-        self.start_prepared_yielding_final_request(cx, None, method, parameters, false)
+        self.start_prepared_yielding_final_request(cx, None, method, parameters, false, None)
     }
 
     fn start_prepared_yielding_final_request(
@@ -23054,6 +23074,7 @@ impl Client {
         method: &str,
         parameters: serde_json::Value,
         allow_tasks: bool,
+        operation_deadline: Option<Instant>,
     ) -> McpResult<StdioFinalMrtrExecution> {
         if allow_tasks && (method != "tools/call" || !cfg!(feature = "tasks")) {
             return Err(McpError::invalid_params(
@@ -23088,6 +23109,12 @@ impl Client {
         // Do not prepare the parameters again: that would re-advertise Tasks.
         // The connection owns I/O; the caller owns only this execution.
         executor.service(&self.cx)?;
+        // Servicing predecessor cleanup may consume the remaining operation
+        // budget. Recheck immediately before allocating or committing this
+        // round, as for ordinary yielding requests.
+        if let Some(deadline) = operation_deadline {
+            check_mrtr_operation(cx, cancellation, deadline)?;
+        }
         let execution = match cancellation {
             Some(cancellation) => {
                 executor.execute_prepared_with_cancellation(cx, cancellation, method, parameters)
@@ -31887,20 +31914,53 @@ impl Client {
     ) -> McpResult<FinalToolCallOutcome> {
         self.ensure_initialized_with_cancellation(cx, Some(cancellation))
             .await?;
+        self.request_tasks_tool_outcome_with_cx_until(
+            cx,
+            cancellation,
+            serde_json::json!({"name": name, "arguments": arguments}),
+            None,
+        )
+        .await
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    async fn request_tasks_tool_outcome_with_cx_until(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        parameters: serde_json::Value,
+        operation_deadline: Option<Instant>,
+    ) -> McpResult<FinalToolCallOutcome> {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
         }
-        let mut execution = self.start_yielding_final_mrtr_request_with_cancellation(
+        if let Some(deadline) = operation_deadline {
+            check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        }
+        let mut execution = self.start_yielding_final_mrtr_request_with_cancellation_until(
             cx,
             Some(cancellation),
             "tools/call",
-            serde_json::json!({"name": name, "arguments": arguments}),
+            parameters,
             true,
+            operation_deadline,
         )?;
         loop {
-            let cancelled = cancellation.is_cancel_requested() || cx.checkpoint().is_err();
-            if let Some(result) =
-                self.try_take_yielding_final_mrtr_response(&mut execution, cancelled)?
+            let stopped = if let Some(deadline) = operation_deadline {
+                check_mrtr_operation(cx, Some(cancellation), deadline).err()
+            } else {
+                (cancellation.is_cancel_requested() || cx.checkpoint().is_err())
+                    .then(McpError::request_cancelled)
+            };
+            if let Some(result) = self
+                .try_take_yielding_final_mrtr_response(&mut execution, stopped.is_some())
+                .map_err(|error| {
+                    if error.code == McpErrorCode::RequestCancelled {
+                        stopped.unwrap_or(error)
+                    } else {
+                        error
+                    }
+                })?
             {
                 return match result {
                     CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
@@ -31915,9 +31975,188 @@ impl Client {
                     _ => Err(unexpected_convenience_result("tools/call")),
                 };
             }
-            self.drive_yielding_stdio_slice()?;
+            self.drive_yielding_stdio_slice_until(operation_deadline)?;
             asupersync::runtime::yield_now().await;
         }
+    }
+
+    /// Calls a Tasks-capable tool and answers input-required rounds with the
+    /// installed modern handlers while yielding the caller's Unix runtime.
+    ///
+    /// Discovery, requests, and callbacks share the original cancellation
+    /// domain and one absolute timeout. Every input batch is admitted against
+    /// the initial capability advertisement before handlers run. With no
+    /// modern handlers installed, an input-required result is returned intact.
+    ///
+    /// An already-admitted Task receipt survives same-poll cancellation or
+    /// timeout so the caller retains its durable identifier. This operation
+    /// neither polls the Task nor replays a failed tool request.
+    #[cfg(all(unix, feature = "tasks"))]
+    pub async fn call_tool_final_outcome_with_handlers_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<FinalToolCallOutcome> {
+        let deadline = mrtr_operation_deadline(cx, self.timeout_policy)?;
+        let responder: OperationMrtrResponder =
+            OperationMrtrResponder::Installed(self.reverse_request_handlers.clone());
+        // Keep the installed responder's nested Send proof inside this crate
+        // instead of imposing its depth on downstream callers.
+        let operation: ReverseRequestFuture<'_, FinalToolCallOutcome> = Box::pin(
+            self.follow_tasks_mrtr_with_cx(cx, cancellation, deadline, name, arguments, responder),
+        );
+        operation.await
+    }
+
+    /// Calls a Tasks-capable tool with a bounded operation-local responder.
+    ///
+    /// The deadline may tighten the configured absolute timeout. Each continuation
+    /// preserves the original tool arguments, request metadata, and Tasks
+    /// negotiation; callbacks and retries never restart the deadline. The
+    /// complete input batch must be admitted before the responder runs, and its
+    /// answers must exactly match that batch's keys.
+    ///
+    /// A synchronous responder must return cooperatively. Cancellation and
+    /// timeout are checked again before sending its answers. An already-admitted
+    /// Task receipt remains available when either stop becomes visible in the
+    /// same receive poll; remote Task cancellation remains a caller decision.
+    #[cfg(all(unix, feature = "tasks"))]
+    pub async fn call_tool_final_outcome_with_mrtr_retry_with_cx<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        respond: F,
+    ) -> McpResult<FinalToolCallOutcome>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        self.follow_tasks_mrtr_with_cx(
+            cx,
+            cancellation,
+            deadline,
+            name,
+            arguments,
+            OperationMrtrResponder::<F, AsyncMrtrResponderFn>::Caller(respond),
+        )
+        .await
+    }
+
+    /// Calls a Tasks-capable tool with a caller-owned asynchronous responder.
+    ///
+    /// The callback may borrow the caller context and this round's admitted
+    /// input descriptors. Its future stays inside the original cancellation
+    /// domain and absolute deadline; stopping or dropping the operation drops
+    /// the callback before any rejected continuation can be sent. No detached
+    /// responder, automatic Task polling, or transport replay is started.
+    ///
+    /// The complete, durable Task, and unhandled input-required outcomes retain
+    /// their exact result algebra. A Task receipt already elected by the native
+    /// receive owner survives a subsequently observed cancellation or timeout.
+    #[cfg(all(unix, feature = "tasks"))]
+    pub async fn call_tool_final_outcome_with_async_mrtr_retry_with_cx<A>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        respond: A,
+    ) -> McpResult<FinalToolCallOutcome>
+    where
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+    {
+        self.follow_tasks_mrtr_with_cx(
+            cx,
+            cancellation,
+            deadline,
+            name,
+            arguments,
+            OperationMrtrResponder::<SyncMrtrResponderFn, A>::Async(respond),
+        )
+        .await
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    async fn follow_tasks_mrtr_with_cx<F, A>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        mut responder: OperationMrtrResponder<F, A>,
+    ) -> McpResult<FinalToolCallOutcome>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        A: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+    {
+        let deadline = deadline.min(mrtr_operation_deadline(cx, self.timeout_policy)?);
+        check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        self.ensure_initialized_with_cancellation_until(cx, Some(cancellation), Some(deadline))
+            .await?;
+        let original_parameters = self.with_final_tasks_client_capability(serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+        }))?;
+        let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
+        let mut parameters = original_parameters.clone();
+        let mut driver = MrtrDriver::new(
+            cx,
+            deadline,
+            MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?,
+        )?;
+
+        fastmcp_core::runtime::CallerContextFuture::new(cx, async {
+            loop {
+                driver.before_request()?;
+                check_mrtr_operation(cx, Some(cancellation), deadline)?;
+                let outcome = self
+                    .request_tasks_tool_outcome_with_cx_until(
+                        cx,
+                        cancellation,
+                        parameters,
+                        Some(deadline),
+                    )
+                    .await?;
+                // The sole ingress owner already admitted and retired this
+                // durable receipt. A late stop must not hide work that the
+                // caller now needs to address by its Task ID.
+                if matches!(outcome, FinalToolCallOutcome::Task(_)) {
+                    return Ok(outcome);
+                }
+                check_mrtr_operation(cx, Some(cancellation), deadline)?;
+                let input_required = match outcome {
+                    FinalToolCallOutcome::Complete(_) => return Ok(outcome),
+                    FinalToolCallOutcome::InputRequired(input_required) => input_required,
+                    FinalToolCallOutcome::Task(_) => unreachable!("Task receipt returned above"),
+                };
+                if !responder.has_handler() {
+                    return Ok(FinalToolCallOutcome::InputRequired(input_required));
+                }
+                driver.begin_continuation()?;
+                let input_responses = responder
+                    .respond(
+                        cx,
+                        Some(cancellation),
+                        deadline,
+                        &mut driver,
+                        &capabilities,
+                        &input_required,
+                    )
+                    .await?;
+                parameters = mrtr_retry_parameters(
+                    original_parameters.clone(),
+                    &input_required,
+                    input_responses,
+                )?;
+            }
+        })
+        .await
     }
 
     /// Reads one final task while yielding the caller's Unix stdio runtime.
