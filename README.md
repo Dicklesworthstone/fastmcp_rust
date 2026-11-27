@@ -821,11 +821,12 @@ a global logger or render banners, traffic previews, or statistics panels.
 `console`. The idempotent `without_banner()` and `plain_mode()` helpers work
 in both profiles.
 
-This removes the direct server's `fastmcp-console` / `rich_rust` rendering
-dependency. It does not promise a `chrono`-free graph: Tasks and OAuth use
-timestamps for protocol and security behavior. The `fastmcp-rust` facade
-retains its existing console-enabled behavior, so depend on `fastmcp-server`
-directly when that dependency boundary is required.
+The direct headless server builds without `fastmcp-console`, `rich_rust`, or
+`chrono`. This also applies when enabling just `legacy-2024-11-05`. The
+`log-timestamps` feature adds an RFC 3339 prefix to framework-generated legacy
+log messages and is included with `console`. The `tasks` feature uses
+`chrono` for Task timestamps and retention. The `fastmcp-rust` facade enables
+the console by default. Use `fastmcp-server` directly for a headless build.
 This feature selection does not change the transport qualification boundaries
 described above.
 

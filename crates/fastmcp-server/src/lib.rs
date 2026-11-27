@@ -27462,8 +27462,9 @@ impl Server {
             return;
         }
 
-        let ts = chrono::Utc::now().to_rfc3339();
-        let text = format!("{ts} {}", message.into());
+        let text = message.into();
+        #[cfg(feature = "log-timestamps")]
+        let text = format!("{} {text}", chrono::Utc::now().to_rfc3339());
         let params = LogMessageParams {
             level,
             logger: Some("fastmcp_rust::server".to_string()),

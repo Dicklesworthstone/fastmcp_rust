@@ -18,7 +18,10 @@ exclude = ["src/docket.rs"]
 default = ["legacy-2024-11-05", "console"]
 # Headless embeddings can omit terminal rendering without losing protocol
 # logging, statistics, or any selected transport/extension implementation.
-console = ["dep:fastmcp-console"]
+console = ["dep:fastmcp-console", "log-timestamps"]
+# RFC 3339 prefix on framework-generated legacy protocol log messages.
+# Headless servers may opt in independently of terminal rendering.
+log-timestamps = ["dep:chrono"]
 # Direct server consumers retain the historical dual-era default. The facade
 # disables dependency defaults and forwards this feature explicitly, so every
 # no-legacy facade profile excludes the dated runtime graph.
@@ -32,6 +35,7 @@ legacy-2024-11-05 = [
 # lockstep with the server. The `?` avoids adding a client dependency to a
 # server that enables Tasks without proxy support.
 tasks = [
+    "dep:chrono",
     "fastmcp-protocol/tasks",
     "fastmcp-console?/tasks",
     "fastmcp-client?/tasks",
@@ -73,7 +77,7 @@ asupersync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
-chrono.workspace = true
+chrono = { workspace = true, optional = true }
 base64.workspace = true
 url.workspace = true
 cap-std.workspace = true
@@ -85,6 +89,7 @@ argon2 = { version = "=0.6.0", default-features = false, features = ["alloc", "p
 # Crypto flows through fastmcp-core; Redis Tasks belongs to a later package.
 
 [dev-dependencies]
+chrono.workspace = true
 # The private runtime bridge exists only in test builds, never the product graph.
 fastmcp-core = { workspace = true, features = ["test-runtime"] }
 fastmcp-derive.workspace = true

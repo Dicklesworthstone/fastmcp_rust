@@ -2976,13 +2976,15 @@ mod router_tests {
         let log = logs.pop().expect("log message");
         assert_eq!(log.level, LogLevel::Info);
         let text = log.data.as_str().expect("log data string");
-        // The handled-notification deliberately reports the sanitized method
-        // key (after its timestamp prefix), never the raw peer-visible
-        // method literal.
-        assert!(text.ends_with(&format!(
-            "Handled method={}",
-            crate::safe_peer_log_key("tools/call")
-        )));
+        let expected = format!("Handled method={}", crate::safe_peer_log_key("tools/call"));
+        #[cfg(feature = "log-timestamps")]
+        {
+            let (timestamp, message) = text.split_once(' ').expect("timestamp prefix");
+            chrono::DateTime::parse_from_rfc3339(timestamp).expect("RFC 3339 timestamp");
+            assert_eq!(message, expected);
+        }
+        #[cfg(not(feature = "log-timestamps"))]
+        assert_eq!(text, expected);
         assert!(!text.contains("tools/call"));
         info!(
             target: targets::SESSION,
