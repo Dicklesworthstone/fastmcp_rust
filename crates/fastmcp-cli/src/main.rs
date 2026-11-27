@@ -7562,13 +7562,44 @@ async fn task_aware_http_tool_call(
     )
     .await
     .map_err(|_| OperationBudget::timeout_error())
-    .and_then(|result| {
-        result.map_err(|_| {
-            fastmcp_core::McpError::internal_error("task observation failed; no action was retried")
-        })
-    });
+    .and_then(|result| result.map_err(http_task_observation_failure));
     finish_operation_task_wait(connection, task.task(), outcome)?;
     Ok(None)
+}
+
+#[cfg(feature = "tasks")]
+fn http_task_observation_failure(error: fastmcp_client::HttpClientError) -> fastmcp_core::McpError {
+    // Preserve a typed validation or cancellation failure without copying peer
+    // text or data into the CLI diagnostic. Only status reads can be repeated.
+    match error {
+        fastmcp_client::HttpClientError::CoreResult(cause) => fastmcp_core::McpError::new(
+            cause.code,
+            "HTTP Task status read failed. Only reads can repeat and no action was retried.",
+        ),
+        _ => fastmcp_core::McpError::internal_error(
+            "HTTP Task observation failed. Status reads may have been retried. After acceptance, no action was retried.",
+        ),
+    }
+}
+
+#[cfg(all(test, feature = "tasks"))]
+#[test]
+fn http_task_observation_preserves_error_codes_without_exposing_peer_details() {
+    use fastmcp_client::HttpClientError;
+    use fastmcp_core::{McpError, McpErrorCode};
+
+    let cause = McpError::with_data(
+        McpErrorCode::InvalidRequest,
+        "private response",
+        serde_json::json!({"detail":"private data"}),
+    );
+    let error = http_task_observation_failure(HttpClientError::CoreResult(cause));
+    assert_eq!(error.code, McpErrorCode::InvalidRequest);
+    assert!(error.data.is_none());
+    assert!(!error.message.contains("private"));
+    let error = http_task_observation_failure(HttpClientError::RequestIdExhausted);
+    assert_eq!(error.code, McpErrorCode::InternalError);
+    assert!(error.message.contains("Status reads may have been retried"));
 }
 
 #[cfg(feature = "tasks")]
