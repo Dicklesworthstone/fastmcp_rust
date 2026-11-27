@@ -514,19 +514,7 @@ impl FinalTaskRuntime {
         else {
             return Ok(None);
         };
-        let committed =
-            self.validate_loaded_task_snapshot(committed, Some(&expected.task().base().task_id))?;
-        if !matches!(committed.task(), FinalTask::Failed { .. })
-            || committed.generation() <= expected.generation()
-            || committed.authenticated_principal() != expected.authenticated_principal()
-            || committed.original_operation() != expected.original_operation()
-            || committed.creation_generation() != expected.creation_generation()
-        {
-            return Err(McpError::internal_error(
-                "Final task store returned an invalid execution-expiry commit",
-            ));
-        }
-        validate_final_task_transition(expected.task(), committed.task())?;
+        let committed = self.validate_execution_expiry_receipt(expected, committed)?;
         Ok(Some(committed))
     }
 
@@ -772,7 +760,7 @@ impl FinalTaskRuntime {
 
 /// A read may be abandoned when its request loses authority. Arm cancellation
 /// before polling storage, and a deadline timer when storage suspends.
-async fn await_control_read<T>(
+pub(super) async fn await_control_read<T>(
     ctx: &McpContext,
     mut future: FinalTaskStoreFuture<'_, T>,
     admit: impl Fn() -> McpResult<()> + Send,

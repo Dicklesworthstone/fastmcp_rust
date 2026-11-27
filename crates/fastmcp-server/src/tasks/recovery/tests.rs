@@ -2748,3 +2748,71 @@ fn task_dispatch_async_settlement_keeps_committed_success_through_custodian_canc
         });
     }
 }
+
+#[test]
+fn trusted_async_read_expires_once_and_returns_the_committed_result() {
+    run(|caller| async move {
+        let fixture = Fixture::with_store(AsyncRecoveryStore::with_limits(
+            FinalTaskExecutionLimits::new(
+                StdDuration::from_millis(100),
+                StdDuration::from_millis(100),
+                3,
+            )
+            .unwrap(),
+        ));
+        let snapshot = fixture.seed("trusted-observation", false);
+        let task_id = &snapshot.task().base().task_id;
+        fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+        let observed = fixture.runtime.get_task_with_cx(&caller, task_id).await.unwrap();
+        assert!(final_tasks_match_exactly(snapshot.task(), &observed.task).unwrap());
+        assert!(fixture.emitted.lock().unwrap().is_empty());
+
+        *fixture.store.clock.lock().unwrap() += StdDuration::from_millis(100);
+        let expired = fixture.runtime.get_task_with_cx(&caller, task_id).await.unwrap();
+        assert!(matches!(&expired.task, FinalTask::Failed { .. }));
+        let observed = fixture.runtime.get_task_with_cx(&caller, task_id).await.unwrap();
+        assert!(final_tasks_match_exactly(&expired.task, &observed.task).unwrap());
+        assert_eq!(fixture.emitted.lock().unwrap().len(), 1);
+        assert_eq!(fixture.store.count(Step::Expire), 2);
+        assert_eq!(fixture.store.sync_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.store.claimed.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn trusted_async_read_cancels_parked_snapshot_or_expiry_without_storage_progress() {
+    for step in [Step::Read, Step::Expire] {
+        run(|caller| async move {
+            let host = Cx::current().unwrap();
+            let fixture = Fixture::new();
+            let snapshot = fixture.seed("trusted-cancelled-read", false);
+            let task_id = &snapshot.task().base().task_id;
+            fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+            fixture.store.gate(step).close();
+            let mut read = Box::pin(fixture.runtime.get_task_with_cx(&caller, task_id));
+            drive_until(&host, read.as_mut(), || fixture.store.count(step) == 1).await;
+            caller.cancel_with(asupersync::types::CancelKind::User, None);
+            assert_eq!(read.await.unwrap_err().code, McpError::request_cancelled().code);
+            assert_eq!(fixture.store.gate(step).abandoned.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.store.sync_calls.load(Ordering::SeqCst), 0);
+            assert!(fixture.emitted.lock().unwrap().is_empty());
+        });
+    }
+}
+
+#[test]
+fn trusted_async_read_rejects_missing_and_substituted_task_ids_before_expiry() {
+    run(|caller| async move {
+        let fixture = Fixture::new();
+        let snapshot = fixture.seed("other-task", false);
+        let requested = FinalTaskId::parse("trusted-missing-task").unwrap();
+        fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+        let missing = fixture.runtime.get_task_with_cx(&caller, &requested).await.unwrap_err();
+        assert_eq!(missing.message, "Task not found");
+        *fixture.store.substitute_read.lock().unwrap() = Some(snapshot);
+        let wrong = fixture.runtime.get_task_with_cx(&caller, &requested).await.unwrap_err();
+        assert_eq!(wrong.message, "Final task store returned a task under the wrong identifier");
+        assert_eq!(fixture.store.count(Step::Expire), 0);
+        assert_eq!(fixture.store.sync_calls.load(Ordering::SeqCst), 0);
+    });
+}
