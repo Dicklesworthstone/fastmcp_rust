@@ -9900,8 +9900,17 @@ async fn inspect_catalog_pages<Legacy: Serialize, Final: Serialize>(
     let mut budget = InspectItemBudget::default();
     let mut catalog = None;
     let mut cursor = None::<String>;
+    let mut catalog_scope = None;
     for page_index in 0..max_pages {
-        let (page, next_cursor) = decode(client.page(cx, method, cursor.as_deref()).await?)?;
+        let result = client.page(cx, method, cursor.as_deref()).await?;
+        if let Some(scope) = inspect_catalog_scope(&result)
+            && catalog_scope.replace(scope).is_some_and(|prior| prior != scope)
+        {
+            return Err(fastmcp_core::McpError::invalid_request(format!(
+                "inspect received inconsistent cacheScope across pages of {method}"
+            )));
+        }
+        let (page, next_cursor) = decode(result)?;
         let (page, local_truncated) = budget.retain_catalog(page, method)?;
         append_inspect_catalog(&mut catalog, page, method)?;
         let peer_has_more = next_cursor.is_some();
@@ -9924,6 +9933,25 @@ async fn inspect_catalog_pages<Legacy: Serialize, Final: Serialize>(
         cursor = next_cursor;
     }
     Err(unexpected_inspect_result(method))
+}
+
+/// Modern list pages in one result set must agree on their scope, including
+/// the terminal page. Legacy list results have no cacheScope field.
+fn inspect_catalog_scope(
+    result: &fastmcp_client::CoreResult,
+) -> Option<fastmcp_protocol::CacheScope> {
+    use fastmcp_client::FinalCoreResult;
+
+    let fastmcp_client::CoreResult::Final(result) = result else {
+        return None;
+    };
+    match result {
+        FinalCoreResult::ToolsList { result, .. } => Some(result.payload.cache_scope),
+        FinalCoreResult::ResourcesList { result, .. } => Some(result.payload.cache_scope),
+        FinalCoreResult::ResourceTemplatesList { result, .. } => Some(result.payload.cache_scope),
+        FinalCoreResult::PromptsList { result, .. } => Some(result.payload.cache_scope),
+        _ => None,
+    }
 }
 
 fn append_inspect_catalog<Legacy, Final>(

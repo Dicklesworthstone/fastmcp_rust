@@ -6368,6 +6368,8 @@ def respond(request):
         result = {families[method]: members}
         if era == "modern":
             result.update({"resultType": "complete", "ttlMs": 60000, "cacheScope": "private"})
+        if mode == "scope_" + method and page == 2:
+            result["cacheScope"] = "public"
         if page < 2:
             result["nextCursor"] = ""
     return {"jsonrpc": "2.0", "id": request["id"], "result": result}
@@ -6578,6 +6580,29 @@ else:
                 "do not fetch a third tools page after the aggregate item limit",
             );
             assert_eq!(requests.len(), 1 + 2 + 3 * 3);
+        }
+    }
+
+    #[test]
+    fn cli_inspect_refuses_a_terminal_scope_change_before_publishing() {
+        for (method, http) in [
+            ("tools/list", false),
+            ("resources/list", true),
+            ("resources/templates/list", false),
+            ("prompts/list", true),
+        ] {
+            let mode = format!("scope_{method}");
+            let (output, requests, saved) = inspect(&mode, http, false, Some("3"), true);
+            assert!(!output.status.success(), "{method} must reject the third page");
+            assert_eq!(saved.as_deref(), Some(SAVED_REPORT));
+            let error = inspect_json_stdout(&output);
+            assert_eq!(error["schema"], "fastmcp.cli.error/v2");
+            assert!(error.get("tools").is_none());
+            assert_eq!(requests.last().unwrap()["method"], method);
+            assert_eq!(
+                requests.iter().filter(|request| request["method"] == method).count(),
+                3
+            );
         }
     }
 
