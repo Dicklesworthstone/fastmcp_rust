@@ -18358,12 +18358,14 @@ impl HttpClient {
     /// never sends `logging/setLevel`. An exact 2024-11-05 session must use
     /// the legacy `logging/setLevel` verb instead.
     pub fn set_log_level_typed(&mut self, level: LoggingLevel) -> Result<(), HttpClientError> {
-        match self.selected_protocol_era() {
-            ProtocolEra::Modern2026 => {
+        match &mut self.connection {
+            ClientHttpConnection::Modern(client) => {
+                client.set_log_level(level);
                 self.final_log_level = Some(level);
                 Ok(())
             }
-            ProtocolEra::Legacy2024 => Err(HttpClientError::CoreResult(McpError::invalid_params(
+            #[cfg(feature = "legacy-2024-11-05")]
+            ClientHttpConnection::LegacySse(_) => Err(HttpClientError::CoreResult(McpError::invalid_params(
                 "modern request logLevel metadata is only for MCP 2026-07-28",
             ))),
         }
