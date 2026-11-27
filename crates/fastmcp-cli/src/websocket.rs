@@ -1,8 +1,9 @@
-//! Explicit ModernOnly WebSocket CLI operations on the native client.
+//! Selected-era WebSocket CLI operations on the native client.
 //!
 //! Upgrade, discovery and every request share the command's original budget.
 //! The connection remains owned until explicit close, including when a request
-//! times out. No connection reconnect or application replay is part of this path.
+//! times out. Auto may open one fresh transport after an eligible modern
+//! discovery refusal; application requests are never replayed or downgraded.
 
 use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::net::TcpStream;
@@ -20,13 +21,18 @@ pub(super) enum Connection {
 }
 
 impl Connection {
-    async fn connect(cx: &Cx, url: &str, budget: OperationBudget) -> McpResult<Self> {
+    async fn connect(
+        cx: &Cx,
+        url: &str,
+        protocol_policy: CliProtocolPolicy,
+        budget: OperationBudget,
+    ) -> McpResult<Self> {
         let remaining = budget.remaining(cx)?;
         let policy = OperationBudget::request_policy(remaining)?;
         asupersync::time::timeout(
             cx.now(),
             remaining,
-            Box::pin(Self::connect_with_policy(cx, url, policy)),
+            Box::pin(Self::connect_with_policy(cx, url, protocol_policy, policy)),
         )
         .await
         .map_err(|_| OperationBudget::timeout_error())?
@@ -37,8 +43,10 @@ impl Connection {
     async fn connect_with_policy(
         cx: &Cx,
         url: &str,
+        protocol_policy: CliProtocolPolicy,
         policy: fastmcp_client::RequestTimeoutPolicy,
     ) -> McpResult<Self> {
+        validate_websocket_cli_policy(protocol_policy)?;
         if url.len() > 8192
             || url.chars().any(char::is_control)
             || !(url.starts_with("ws://") || url.starts_with("wss://"))
@@ -53,20 +61,36 @@ impl Connection {
             McpError::invalid_params("--websocket-url must be a valid ws:// or wss:// URL")
         })?;
         if endpoint.tls {
-            let transport = AsyncWsClientTransport::connect_wss(cx, url)
-                .await
-                .map_err(|_| {
-                    McpError::internal_error("could not establish the TLS WebSocket transport")
-                })?;
             Ok(Self::Tls(Box::new(
-                connect_client(cx, transport, policy).await?,
+                connect_client(cx, protocol_policy, policy, |factory_cx| {
+                    let factory_cx = factory_cx.clone();
+                    async move {
+                        AsyncWsClientTransport::connect_wss(&factory_cx, url)
+                            .await
+                            .map_err(|_| {
+                                McpError::internal_error(
+                                    "could not establish the TLS WebSocket transport",
+                                )
+                            })
+                    }
+                })
+                .await?,
             )))
         } else {
-            let transport = AsyncWsClientTransport::connect(cx, url)
-                .await
-                .map_err(|_| McpError::internal_error("could not establish the WebSocket transport"))?;
             Ok(Self::Plain(Box::new(
-                connect_client(cx, transport, policy).await?,
+                connect_client(cx, protocol_policy, policy, |factory_cx| {
+                    let factory_cx = factory_cx.clone();
+                    async move {
+                        AsyncWsClientTransport::connect(&factory_cx, url)
+                            .await
+                            .map_err(|_| {
+                                McpError::internal_error(
+                                    "could not establish the WebSocket transport",
+                                )
+                            })
+                    }
+                })
+                .await?,
             )))
         }
     }
@@ -106,22 +130,59 @@ impl Connection {
     }
 }
 
-async fn connect_client<IO>(
+async fn connect_client<IO, F, Fut>(
     cx: &Cx,
-    transport: AsyncWsClientTransport<IO>,
+    protocol_policy: CliProtocolPolicy,
     policy: fastmcp_client::RequestTimeoutPolicy,
+    mut fresh_transport: F,
 ) -> McpResult<WebSocketClient<IO>>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: FnMut(&Cx) -> Fut,
+    Fut: std::future::Future<Output = McpResult<AsyncWsClientTransport<IO>>>,
 {
-    Box::pin(
-        ClientBuilder::new()
-            .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
-            .request_timeout_policy(policy)
-            .connect_websocket_with_cx(cx, transport),
-    )
-    .await
-    .map_err(|error| operation_failure(error, "WebSocket MCP discovery failed"))
+    let builder = ClientBuilder::new()
+        .protocol_plan(ClientProtocolPlan::websocket(
+            protocol_policy.protocol_policy(),
+        ))
+        .request_timeout_policy(policy);
+    // The native Auto driver owns fallback eligibility, first-connection
+    // cleanup and the shared deadline. Every factory invocation receives its
+    // narrowed caller and opens the same immutable URL with the same TLS policy.
+    let connection = if protocol_policy == CliProtocolPolicy::Auto {
+        Box::pin(builder.connect_websocket_auto_with_cx(cx, fresh_transport)).await
+    } else {
+        let transport = Box::pin(fresh_transport(cx)).await?;
+        Box::pin(builder.connect_websocket_with_cx(cx, transport)).await
+    };
+    connection.map_err(|error| operation_failure(error, "WebSocket MCP negotiation failed"))
+}
+
+fn session_capabilities(session: &fastmcp_client::ClientSession) -> McpResult<InspectCapabilities> {
+    match session.selected_era() {
+        Some(ProtocolEra::Modern2026) => {
+            let discovery = session.server_discovery().ok_or_else(|| {
+                McpError::internal_error(
+                    "modern WebSocket negotiation completed without a discovery result",
+                )
+            })?;
+            Ok(InspectCapabilities::final_from_discovery(
+                discovery.capabilities(),
+            ))
+        }
+        #[cfg(feature = "legacy-2024-11-05")]
+        Some(ProtocolEra::Legacy2024) => Ok(InspectCapabilities::Legacy(
+            session.server_capabilities().clone(),
+        )),
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        Some(_) => Err(McpError::invalid_params(format!(
+            "FeatureUnavailable: {} is compiled out; legacy WebSocket inspection cannot run",
+            LEGACY_PROTOCOL_POLICY_FEATURE,
+        ))),
+        None => Err(McpError::internal_error(
+            "WebSocket negotiation completed without a selected protocol era",
+        )),
+    }
 }
 
 pub(super) async fn operation(
@@ -133,7 +194,7 @@ pub(super) async fn operation(
     budget: OperationBudget,
     mode: CallTaskMode,
 ) -> McpResult<Option<CoreResult>> {
-    let mut client = Connection::connect(cx, url, budget).await?;
+    let mut client = Connection::connect(cx, url, connection.protocol_policy, budget).await?;
     let acquisition = match &mut client {
         Connection::Plain(client) => {
             Box::pin(execute(
@@ -295,22 +356,20 @@ where
 pub(super) async fn inspect(
     cx: &Cx,
     url: &str,
+    protocol_policy: CliProtocolPolicy,
     format: InspectFormat,
     output: Option<&Path>,
     max_pages: u32,
     timeout: u64,
 ) -> McpResult<()> {
     let budget = OperationBudget::new(timeout)?;
-    let mut client = Connection::connect(cx, url, budget).await?;
+    let mut client = Connection::connect(cx, url, protocol_policy, budget).await?;
     let acquisition = async {
         let session = client.session();
-        let discovery = session.server_discovery().ok_or_else(|| {
-            McpError::internal_error("WebSocket inspect has no admitted modern discovery")
-        })?;
-        let info = InspectIdentity::from_discovery(session.server_info(), Some(discovery));
-        let capabilities = InspectCapabilities::final_from_discovery(&discovery.capabilities);
-        let status =
-            InspectProtocolStatus::new(CliProtocolPolicy::ModernOnly, session.protocol_version())?;
+        let info =
+            InspectIdentity::from_discovery(session.server_info(), session.server_discovery());
+        let capabilities = session_capabilities(session)?;
+        let status = InspectProtocolStatus::new(protocol_policy, session.protocol_version())?;
         let catalogs = asupersync::time::timeout(
             cx.now(),
             budget.remaining(cx)?,
@@ -348,6 +407,7 @@ pub(super) async fn inspect(
 pub(super) async fn test(
     cx: &Cx,
     url: &str,
+    protocol_policy: CliProtocolPolicy,
     idle_timeout_secs: u64,
     absolute_timeout_secs: u64,
     verbose: bool,
@@ -373,7 +433,7 @@ pub(super) async fn test(
     let connection = bounded_websocket_test(
         cx,
         budget.remaining(cx)?,
-        Connection::connect_with_policy(cx, url, policy),
+        Connection::connect_with_policy(cx, url, protocol_policy, policy),
     )
     .await;
     let mut client = match connection {
@@ -465,18 +525,20 @@ async fn test_probes<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let Some(discovery) = client.session().server_discovery() else {
-        return vec![failed_test_result(
-            "capabilities",
-            std::time::Duration::ZERO,
-            &McpError::internal_error("WebSocket test has no admitted modern discovery"),
-        )];
+    let capabilities = match session_capabilities(client.session()) {
+        Ok(capabilities) => capabilities,
+        Err(error) => {
+            return vec![failed_test_result(
+                "capabilities",
+                std::time::Duration::ZERO,
+                &error,
+            )];
+        }
     };
-    let capabilities = InspectCapabilities::final_from_discovery(&discovery.capabilities);
     let mut results = vec![
         run_test(cx, "ping", async |cx| {
-            // Modern MCP liveness is a fresh server/discover round-trip; the
-            // removed ping method must never be sent on this ModernOnly path.
+            // The native client selects server/discover for modern liveness
+            // and the exact ping method for an initialized legacy connection.
             bounded_websocket_test(cx, absolute_timeout, client.ping(cx)).await?;
             Ok("server responded".to_owned())
         })
@@ -542,7 +604,8 @@ pub(super) async fn tasks(
     let operation_budget = OperationBudget {
         deadline: budget.deadline,
     };
-    let mut client = Connection::connect(cx, url, operation_budget).await?;
+    let mut client =
+        Connection::connect(cx, url, CliProtocolPolicy::ModernOnly, operation_budget).await?;
     // Keep the connection outside the timeout future so cleanup still runs
     // when an in-flight RPC, output or subscription wait is abandoned.
     let acquisition = async {

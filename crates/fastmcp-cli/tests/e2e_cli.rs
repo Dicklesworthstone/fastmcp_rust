@@ -103,6 +103,45 @@ fn websocket_tasks_cli_without_feature_refuses_before_contact() {
     }
 }
 
+#[cfg(all(feature = "websocket-experimental", not(feature = "legacy-2024-11-05")))]
+#[test]
+fn websocket_cli_unavailable_legacy_policies_refuse_before_contact() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("ws://{}/mcp", listener.local_addr().unwrap());
+    for policy in ["auto", "legacy-only"] {
+        for prefix in [
+            vec!["inspect", "--format", "json"],
+            vec!["test", "--json"],
+            vec!["call", "echo", "--json"],
+            vec!["read", "test://status", "--json"],
+            vec!["prompt", "greeting", "--json"],
+            vec![
+                "complete",
+                "--prompt",
+                "greeting",
+                "--argument",
+                "name",
+                "--value",
+                "Al",
+                "--json",
+            ],
+        ] {
+            let mut arguments = prefix;
+            arguments.extend(["--websocket-url", &endpoint, "--protocol-policy", policy]);
+            let output = run_cli(&arguments);
+            assert!(!output.status.success());
+            let diagnostics = format!("{}{}", stdout_str(&output), stderr_str(&output));
+            assert!(diagnostics.contains("FeatureUnavailable"), "{diagnostics}");
+            assert!(diagnostics.contains("legacy-2024-11-05"), "{diagnostics}");
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+}
+
 struct TestTempDir {
     path: PathBuf,
 }

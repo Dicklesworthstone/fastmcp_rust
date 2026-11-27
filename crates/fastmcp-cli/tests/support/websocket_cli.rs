@@ -46,15 +46,20 @@ impl Fixture {
     }
 
     fn run(&self, arguments: &[&str], timeout: u64) -> Output {
+        self.run_with_policy(arguments, timeout, Some("modern-only"))
+    }
+
+    fn run_with_policy(&self, arguments: &[&str], timeout: u64, policy: Option<&str>) -> Output {
         let mut command = Command::new(get_binary_path());
         command.args(arguments).args([
             "--websocket-url",
             &self.endpoint,
-            "--protocol-policy",
-            "modern-only",
             "--timeout",
             &timeout.to_string(),
         ]);
+        if let Some(policy) = policy {
+            command.args(["--protocol-policy", policy]);
+        }
         run_with_deadline(command, Duration::from_secs(15)).expect("bounded WebSocket CLI child")
     }
 
@@ -364,19 +369,29 @@ fn websocket_cli_inspect_reads_the_real_catalog() {
 }
 
 fn run_connectivity_test(endpoint: &str, idle: u64, absolute: u64) -> Output {
+    run_connectivity_test_with_policy(endpoint, idle, absolute, Some("modern-only"))
+}
+
+fn run_connectivity_test_with_policy(
+    endpoint: &str,
+    idle: u64,
+    absolute: u64,
+    policy: Option<&str>,
+) -> Output {
     let mut command = Command::new(get_binary_path());
     command.args([
         "test",
         "--websocket-url",
         endpoint,
-        "--protocol-policy",
-        "modern-only",
         "--idle-timeout",
         &idle.to_string(),
         "--absolute-timeout",
         &absolute.to_string(),
         "--json",
     ]);
+    if let Some(policy) = policy {
+        command.args(["--protocol-policy", policy]);
+    }
     run_with_deadline(command, Duration::from_secs(15)).expect("bounded WebSocket connectivity test")
 }
 
@@ -409,6 +424,486 @@ fn websocket_cli_test_probes_real_catalogs_and_closes() {
         ["server/discover", "server/discover", "tools/list", "resources/list", "prompts/list"]
     );
     fixture.stop();
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn websocket_cli_default_auto_and_explicit_legacy_use_real_server_verbs() {
+    for policy in [None, Some("legacy-only")] {
+        let fixture = Fixture::start();
+        let modern = policy.is_none();
+        let version = if modern { "2026-07-28" } else { "2024-11-05" };
+        let output = fixture.run_with_policy(
+            &["inspect", "--format", "json", "--max-pages", "2"],
+            5,
+            policy,
+        );
+        assert!(output.status.success(), "{}", stderr_str(&output));
+        let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(document["protocol"]["policy"], policy.unwrap_or("auto"));
+        assert_eq!(document["protocol"]["version"], version);
+        assert_eq!(
+            document["schema"],
+            if modern {
+                "fastmcp.cli.inspect/v2"
+            } else {
+                "fastmcp.cli.inspect/v1"
+            }
+        );
+        assert_eq!(document["server"]["name"], "fastmcp-cli-e2e-server");
+        assert!(
+            document["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "echo")
+        );
+        assert_eq!(document["resources"][0]["uri"], "test://status");
+        assert_eq!(document["prompts"][0]["name"], "greeting");
+        if modern {
+            assert!(document["capabilities"]["tools"].is_object());
+        } else {
+            assert_eq!(document["capabilities"]["tools"], true);
+        }
+
+        let message = format!("selected {version} {}", fixture.root.display());
+        let arguments = json!({"message": message}).to_string();
+        let output = fixture.run_with_policy(
+            &["call", "echo", "--arguments", &arguments, "--json"],
+            5,
+            policy,
+        );
+        assert!(output.status.success(), "{}", stderr_str(&output));
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["content"][0]["text"], message);
+        assert_eq!(result.get("resultType").is_some(), modern);
+
+        let output = fixture.run_with_policy(&["read", "test://status", "--json"], 5, policy);
+        assert!(output.status.success(), "{}", stderr_str(&output));
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["contents"][0]["uri"], "test://status");
+        assert_eq!(result["contents"][0]["text"], "ready");
+        assert_eq!(result.get("resultType").is_some(), modern);
+
+        let arguments = json!({"name": message}).to_string();
+        let output = fixture.run_with_policy(
+            &["prompt", "greeting", "--arguments", &arguments, "--json"],
+            5,
+            policy,
+        );
+        assert!(output.status.success(), "{}", stderr_str(&output));
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            result["messages"][0]["content"]["text"],
+            format!("Hello, {message}!")
+        );
+        assert_eq!(result.get("resultType").is_some(), modern);
+
+        let output = run_connectivity_test_with_policy(&fixture.endpoint, 2, 3, policy);
+        assert!(output.status.success(), "{}", stderr_str(&output));
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["success"], true);
+        let tests = report["tests"].as_array().unwrap();
+        assert_eq!(tests.len(), 6);
+        assert_eq!(
+            tests[0]["details"],
+            format!("protocol {version} over WebSocket")
+        );
+        assert!(
+            tests
+                .iter()
+                .all(|test| test["success"] == true && test["skipped"] != true)
+        );
+        let requests = fixture.requests();
+        let forbidden = if modern {
+            "initialize"
+        } else {
+            "server/discover"
+        };
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request["method"] == forbidden)
+        );
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request["method"] == method)
+                    .count(),
+                1
+            );
+        }
+        fixture.stop();
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[derive(Clone, Copy, Debug)]
+enum PolicyPeerMode {
+    LegacyFallback,
+    ModernOnlyRefusal,
+    UpgradeUnauthorized,
+    DiscoveryForbidden,
+    MalformedDiscovery,
+    ApplicationRefusal,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+struct PolicyPeer {
+    endpoint: String,
+    finished: mpsc::SyncSender<()>,
+    worker: std::thread::JoinHandle<Vec<Vec<Value>>>,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl PolicyPeer {
+    fn start(mode: PolicyPeerMode) -> Self {
+        let (ready, address) = mpsc::sync_channel(1);
+        let (finished, child_finished) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            use asupersync::io::AsyncWriteExt as _;
+
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let cx = asupersync::Cx::current().unwrap();
+                let listener =
+                    fastmcp_transport::websocket::WebSocketListener::bind("127.0.0.1:0")
+                        .await
+                        .unwrap();
+                ready.send(listener.local_addr().unwrap()).unwrap();
+                asupersync::time::timeout(cx.now(), Duration::from_secs(15), async {
+                    let attempts = if matches!(mode, PolicyPeerMode::LegacyFallback) { 2 } else { 1 };
+                    let mut connections = Vec::new();
+                    for attempt in 0..attempts {
+                        let upgrade = listener.accept(&cx).await.unwrap();
+                        assert_eq!(upgrade.path(), "/mcp?route=kept%2Fexact&tenant=cli");
+                        if matches!(mode, PolicyPeerMode::UpgradeUnauthorized) {
+                            let mut stream = upgrade.into_stream();
+                            stream.write_all(
+                                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\nWWW-Authenticate: Bearer\r\n\r\n"
+                            ).await.unwrap();
+                            connections.push(Vec::new());
+                            continue;
+                        }
+                        let mut transport =
+                            upgrade.into_admission().unwrap().complete(&cx).await.unwrap();
+                        let mut requests = Vec::new();
+                        let mut initialized = false;
+                        loop {
+                            let request = match transport.recv(&cx).await {
+                                Ok(fastmcp_protocol::JsonRpcMessage::Request(request)) => request,
+                                Err(fastmcp_transport::TransportError::Closed) => break,
+                                other => panic!("expected an MCP request or explicit close: {other:?}"),
+                            };
+                            requests.push(serde_json::to_value(&request).unwrap());
+                            let response = if attempt == 0 {
+                                if requests.len() == 1 {
+                                    assert_eq!(request.method, "server/discover");
+                                    assert_eq!(request.id, Some(fastmcp_protocol::RequestId::Number(1)));
+                                    let mut response = json!({
+                                        "jsonrpc": "2.0", "id": request.id,
+                                        "result": {
+                                            "resultType": "complete",
+                                            "supportedVersions": ["2026-07-28"],
+                                            "capabilities": {"tools": {}},
+                                            "ttlMs": 0, "cacheScope": "private",
+                                        },
+                                    });
+                                    match mode {
+                                        PolicyPeerMode::LegacyFallback | PolicyPeerMode::ModernOnlyRefusal => {
+                                            response = json!({
+                                                "jsonrpc": "2.0", "id": request.id,
+                                                "error": {"code": -32601, "message": "unknown discovery"},
+                                            });
+                                        }
+                                        PolicyPeerMode::DiscoveryForbidden => {
+                                            response = json!({
+                                                "jsonrpc": "2.0", "id": request.id,
+                                                "error": {"code": -32002, "message": "access denied"},
+                                            });
+                                        }
+                                        PolicyPeerMode::MalformedDiscovery => {
+                                            response["result"]["cacheScope"] = json!("invalid");
+                                        }
+                                        PolicyPeerMode::ApplicationRefusal => {}
+                                        PolicyPeerMode::UpgradeUnauthorized => unreachable!(),
+                                    }
+                                    response
+                                } else {
+                                    assert!(matches!(mode, PolicyPeerMode::ApplicationRefusal));
+                                    assert_eq!(requests.len(), 2);
+                                    assert_eq!(request.method, "tools/call");
+                                    json!({
+                                        "jsonrpc": "2.0", "id": request.id,
+                                        "error": {"code": -32601, "message": "unknown application tool"},
+                                    })
+                                }
+                            } else {
+                                if request.method == "notifications/initialized" {
+                                    assert_eq!(requests.len(), 2);
+                                    assert!(request.id.is_none());
+                                    initialized = true;
+                                    continue;
+                                }
+                                if request.method == "initialize" {
+                                    assert_eq!(requests.len(), 1);
+                                    assert_eq!(
+                                        request.params.as_ref().unwrap()["protocolVersion"],
+                                        "2024-11-05"
+                                    );
+                                } else {
+                                    assert!(initialized, "legacy application traffic must follow initialization");
+                                }
+                                json!({
+                                    "jsonrpc": "2.0", "id": request.id,
+                                    "result": legacy_policy_result(&request),
+                                })
+                            };
+                            transport.send(
+                                &cx,
+                                &serde_json::from_value(response).unwrap(),
+                            ).await.unwrap();
+                        }
+                        connections.push(requests);
+                    }
+                    // Keep the listener alive until the actual CLI has exited.
+                    // An unintended fallback then remains observable in its
+                    // accept queue even if that extra handshake timed out.
+                    child_finished.recv_timeout(Duration::from_secs(10))
+                        .expect("CLI must finish before the no-extra-connection check");
+                    assert!(
+                        asupersync::time::timeout(
+                            cx.now(), Duration::from_millis(100), listener.accept(&cx),
+                        ).await.is_err(),
+                        "a terminal refusal must not open another WebSocket connection",
+                    );
+                    connections
+                }).await.expect("policy peer must observe bounded CLI cleanup")
+            })
+        });
+        let address = address.recv_timeout(Duration::from_secs(5)).unwrap();
+        Self {
+            endpoint: format!("ws://{address}/mcp?route=kept%2Fexact&tenant=cli"),
+            finished,
+            worker,
+        }
+    }
+
+    fn finish(self) -> Vec<Vec<Value>> {
+        let _ = self.finished.send(());
+        self.worker.join().expect("native WebSocket policy peer")
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn legacy_policy_result(request: &fastmcp_protocol::JsonRpcRequest) -> Value {
+    let parameters = request.params.clone().unwrap_or_else(|| json!({}));
+    match request.method.as_str() {
+        "initialize" => json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+            "serverInfo": {"name": "legacy-policy-peer", "version": "1"},
+        }),
+        "ping" => json!({}),
+        "tools/list" => json!({"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]}),
+        "resources/list" => json!({"resources": [{"uri": "test://status", "name": "status"}]}),
+        "resources/templates/list" => json!({"resourceTemplates": []}),
+        "prompts/list" => json!({"prompts": [{"name": "greeting"}]}),
+        "tools/call" => json!({
+            "content": [{"type": "text", "text": parameters["arguments"]["message"]}],
+            "isError": false,
+        }),
+        "resources/read" => json!({
+            "contents": [{"uri": parameters["uri"], "text": "ready"}],
+        }),
+        "prompts/get" => json!({"messages": [{
+            "role": "user", "content": {
+                "type": "text",
+                "text": format!("Hello, {}!", parameters["arguments"]["name"].as_str().unwrap()),
+            },
+        }]}),
+        "completion/complete" => json!({"completion": {
+            "values": ["Alice"], "total": 1, "hasMore": false,
+        }}),
+        method => panic!("unexpected legacy operation {method}"),
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn websocket_cli_auto_fallback_opens_fresh_legacy_connections_for_every_command() {
+    let message = format!(
+        "exact fallback {}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    );
+    let call_arguments = json!({"message": message}).to_string();
+    let prompt_arguments = json!({"name": message}).to_string();
+    for arguments in [
+        vec!["inspect", "--format", "json", "--max-pages", "2"],
+        vec!["call", "echo", "--arguments", &call_arguments, "--json"],
+        vec!["read", "test://status", "--json"],
+        vec![
+            "prompt",
+            "greeting",
+            "--arguments",
+            &prompt_arguments,
+            "--json",
+        ],
+        vec![
+            "complete",
+            "--prompt",
+            "greeting",
+            "--argument",
+            "name",
+            "--value",
+            "Al",
+            "--json",
+        ],
+        vec![
+            "test",
+            "--idle-timeout",
+            "2",
+            "--absolute-timeout",
+            "3",
+            "--json",
+        ],
+    ] {
+        let peer = PolicyPeer::start(PolicyPeerMode::LegacyFallback);
+        let mut command = Command::new(get_binary_path());
+        command.args(&arguments).args([
+            "--websocket-url",
+            &peer.endpoint,
+            "--protocol-policy",
+            "auto",
+        ]);
+        if arguments[0] != "test" {
+            command.args(["--timeout", "5"]);
+        }
+        let output = run_with_deadline(command, Duration::from_secs(15)).unwrap();
+        let connections = peer.finish();
+        assert!(
+            output.status.success(),
+            "{}: {}",
+            arguments[0],
+            stderr_str(&output)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        match arguments[0] {
+            "inspect" => {
+                assert_eq!(result["schema"], "fastmcp.cli.inspect/v1");
+                assert_eq!(result["protocol"]["policy"], "auto");
+                assert_eq!(result["protocol"]["version"], "2024-11-05");
+                assert_eq!(result["server"]["name"], "legacy-policy-peer");
+                assert_eq!(result["capabilities"]["tools"], true);
+                assert_eq!(result["tools"][0]["name"], "echo");
+                assert_eq!(result["resources"][0]["uri"], "test://status");
+                assert_eq!(result["prompts"][0]["name"], "greeting");
+            }
+            "call" => assert_eq!(result["content"][0]["text"], message),
+            "read" => assert_eq!(result["contents"][0]["text"], "ready"),
+            "prompt" => {
+                assert_eq!(
+                    result["messages"][0]["content"]["text"],
+                    format!("Hello, {message}!")
+                );
+            }
+            "complete" => assert_eq!(result["completion"]["values"], json!(["Alice"])),
+            "test" => {
+                assert_eq!(result["success"], true);
+                assert_eq!(
+                    result["tests"][0]["details"],
+                    "protocol 2024-11-05 over WebSocket"
+                );
+                assert!(
+                    result["tests"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|test| test["success"] == true && test["skipped"] != true)
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(connections.len(), 2);
+        assert_eq!(
+            connections[0].len(),
+            1,
+            "no operation may run on the refused connection"
+        );
+        assert_eq!(connections[0][0]["method"], "server/discover");
+        assert_eq!(connections[1][0]["method"], "initialize");
+        assert_eq!(
+            connections[1][0]["id"], 1,
+            "the second transport has a fresh allocator"
+        );
+        assert_eq!(connections[1][1]["method"], "notifications/initialized");
+        assert!(
+            !connections[1]
+                .iter()
+                .any(|request| request["method"] == "server/discover")
+        );
+        if arguments[0] == "call" {
+            let calls: Vec<_> = connections[1]
+                .iter()
+                .filter(|request| request["method"] == "tools/call")
+                .collect();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["params"]["arguments"]["message"], message);
+        }
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn websocket_cli_refusals_never_downgrade_or_replay_application_work() {
+    for (mode, policy, expected_requests) in [
+        (PolicyPeerMode::UpgradeUnauthorized, "auto", 0),
+        (PolicyPeerMode::DiscoveryForbidden, "auto", 1),
+        (PolicyPeerMode::MalformedDiscovery, "auto", 1),
+        (PolicyPeerMode::ApplicationRefusal, "auto", 2),
+        (PolicyPeerMode::ModernOnlyRefusal, "modern-only", 1),
+    ] {
+        let peer = PolicyPeer::start(mode);
+        let mut command = Command::new(get_binary_path());
+        command.args([
+            "call",
+            "echo",
+            "--arguments",
+            r#"{"message":"one action"}"#,
+            "--json",
+            "--websocket-url",
+            &peer.endpoint,
+            "--protocol-policy",
+            policy,
+            "--timeout",
+            "3",
+        ]);
+        let output = run_with_deadline(command, Duration::from_secs(15)).unwrap();
+        let connections = peer.finish();
+        assert!(!output.status.success(), "{mode:?}");
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].len(), expected_requests, "{mode:?}");
+        let calls = connections[0]
+            .iter()
+            .filter(|request| request["method"] == "tools/call")
+            .count();
+        assert_eq!(
+            calls,
+            usize::from(matches!(mode, PolicyPeerMode::ApplicationRefusal))
+        );
+        assert!(
+            !connections[0]
+                .iter()
+                .any(|request| request["method"] == "initialize")
+        );
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -586,8 +1081,7 @@ fn websocket_cli_test_invalid_options_fail_before_contact() {
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("ws://{}/mcp", listener.local_addr().unwrap());
     for extra in [
-        vec!["--protocol-policy", "auto"],
-        vec!["--protocol-policy", "legacy-only"],
+        vec!["--protocol-policy", "unknown"],
         vec!["--http-url", "http://127.0.0.1:1/mcp"],
         vec!["--legacy-sse-url", "http://127.0.0.1:1/sse"],
         vec!["--legacy-message-url", "http://127.0.0.1:1/messages"],
@@ -740,14 +1234,6 @@ fn websocket_cli_incompatible_options_fail_before_contact() {
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("ws://{}/mcp", listener.local_addr().unwrap());
     for arguments in [
-        vec!["call", "echo", "--protocol-policy", "auto", "--json"],
-        vec![
-            "inspect",
-            "--protocol-policy",
-            "legacy-only",
-            "--format",
-            "json",
-        ],
         vec![
             "call",
             "echo",

@@ -657,8 +657,8 @@ enum Commands {
         #[arg(long, value_name = "URL")]
         http_url: Option<String>,
 
-        /// Explicit ws:// or wss:// MCP endpoint; requires modern-only and
-        /// the websocket-experimental feature. TLS uses WebPKI trust roots.
+        /// Explicit ws:// or wss:// MCP endpoint; requires the
+        /// websocket-experimental feature. TLS uses WebPKI trust roots.
         #[arg(long, value_name = "URL", conflicts_with_all = [
             "server", "http_url", "bearer_token_file", "legacy_sse_url", "legacy_message_url",
         ])]
@@ -843,7 +843,7 @@ enum Commands {
     /// Test MCP server connectivity.
     ///
     /// Tests negotiation, liveness, and advertised capability catalogs over
-    /// stdio, explicit HTTP endpoints, or modern WebSocket connections.
+    /// stdio, explicit HTTP endpoints, or WebSocket connections.
     /// Subprocess testing also verifies cleanup and is Unix-only.
     Test {
         /// Server command or path. Omit when using explicit network endpoints.
@@ -860,8 +860,8 @@ enum Commands {
         #[arg(long, value_name = "URL")]
         http_url: Option<String>,
 
-        /// Explicit ws:// or wss:// MCP endpoint; requires modern-only and
-        /// the websocket-experimental feature. TLS uses WebPKI trust roots.
+        /// Explicit ws:// or wss:// MCP endpoint; requires the
+        /// websocket-experimental feature. TLS uses WebPKI trust roots.
         #[arg(long, value_name = "URL", conflicts_with_all = [
             "server", "http_url", "bearer_token_file", "legacy_sse_url", "legacy_message_url",
         ])]
@@ -1035,8 +1035,8 @@ struct OperationConnection {
     /// Explicit modern Streamable HTTP MCP POST endpoint.
     #[arg(long, value_name = "URL")]
     http_url: Option<String>,
-    /// Explicit ws:// or wss:// MCP endpoint; requires modern-only and
-    /// the websocket-experimental feature. TLS uses WebPKI trust roots.
+    /// Explicit ws:// or wss:// MCP endpoint; requires the
+    /// websocket-experimental feature. TLS uses WebPKI trust roots.
     #[arg(long, value_name = "URL", conflicts_with_all = [
         "server", "http_url", "bearer_token_file", "legacy_sse_url", "legacy_message_url",
     ])]
@@ -1306,12 +1306,7 @@ fn validate_websocket_cli_policy(policy: CliProtocolPolicy) -> McpResult<()> {
             "FeatureUnavailable: --websocket-url requires --features websocket-experimental",
         ));
     }
-    if policy != CliProtocolPolicy::ModernOnly {
-        return Err(fastmcp_core::McpError::invalid_params(
-            "--websocket-url requires --protocol-policy modern-only",
-        ));
-    }
-    Ok(())
+    validate_cli_protocol_policy(policy)
 }
 
 /// The immutable policy selected by the CLI and the exact protocol revision
@@ -1657,6 +1652,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                     Box::pin(websocket::inspect(
                         cx,
                         url,
+                        protocol_policy,
                         format,
                         output.as_deref(),
                         max_pages,
@@ -1758,6 +1754,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                     Box::pin(websocket::test(
                         cx,
                         url,
+                        protocol_policy,
                         idle_timeout,
                         absolute_timeout,
                         verbose,
