@@ -2768,8 +2768,22 @@ fn trusted_async_read_expires_once_and_returns_the_committed_result() {
         assert!(fixture.emitted.lock().unwrap().is_empty());
 
         *fixture.store.clock.lock().unwrap() += StdDuration::from_millis(100);
-        let expired = fixture.runtime.get_task_with_cx(&caller, task_id).await.unwrap();
+        let received = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&received);
+        let _observer = fixture.runtime.add_owned_notification_emitter(Arc::new(move |_, _| {
+            assert!(!Cx::current().unwrap().capabilities().spawn);
+            count.fetch_add(1, Ordering::SeqCst);
+        }));
+        let read = {
+            // Expiry publication runs on the application caller. It performs
+            // bounded store I/O and does not need permission to spawn a service.
+            use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+            let _restriction = Cx::push_restriction(CapSet::<false, true, true, true, true>::MASK);
+            fixture.runtime.get_task_with_cx(&caller, task_id)
+        };
+        let expired = read.await.unwrap();
         assert!(matches!(&expired.task, FinalTask::Failed { .. }));
+        assert_eq!(received.load(Ordering::SeqCst), 1);
         let observed = fixture.runtime.get_task_with_cx(&caller, task_id).await.unwrap();
         assert!(final_tasks_match_exactly(&expired.task, &observed.task).unwrap());
         assert_eq!(fixture.emitted.lock().unwrap().len(), 1);
