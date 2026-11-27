@@ -557,6 +557,8 @@ enum Step {
         status: u16,
         extra_headers: &'static [(&'static str, &'static str)],
     },
+    /// Accepts the POST and holds it after the supplied reply prefix.
+    HoldPost(&'static [u8]),
     /// One chunk written on the most recently held stream.
     Write(Vec<u8>),
     /// Ends the most recently held stream.
@@ -810,6 +812,15 @@ impl Peer {
                         log.heads.push(head);
                         log.posts.push((request_line, body));
                         write_post_reply(&mut post, status, extra_headers);
+                    }
+                    Step::HoldPost(prefix) => {
+                        let mut post = accept_bounded(&listener);
+                        let (head, body) = read_request(&mut post);
+                        log.posts.push((head.lines().next().unwrap().to_owned(), body));
+                        log.heads.push(head);
+                        post.write_all(prefix).expect("write partial POST reply");
+                        post.flush().expect("flush partial reply");
+                        held.push(post);
                     }
                     Step::Write(bytes) => {
                         let stream = held.last_mut().expect("a held stream to write");
@@ -1291,6 +1302,76 @@ fn legacy_sse_reconnect_absolute_lifetime_includes_response_headers() {
     assert_eq!(log.held_closed_by_client, Some(true));
     assert!(log.posts.is_empty());
     log.assert_legacy_hygiene("expired legacy reconnect");
+}
+
+#[test]
+fn legacy_direct_post_lifetime_covers_stalled_head_and_body() {
+    let partial_reply = b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\nx";
+    for (prefix, idle) in [(b"".as_slice(), false), (partial_reply.as_slice(), true)] {
+        let clock = Arc::new(VirtualClock::new());
+        let (accepted, waiting) = mpsc::channel();
+        let peer = Peer::serve(move |message| {
+            let stream = || Step::Stream {
+                extra_headers: &[],
+                events: vec![endpoint_event(message)],
+                end: false,
+            };
+            let accepted_post = || Step::Post {
+                status: 202,
+                extra_headers: &[],
+            };
+            let mut steps = vec![Step::ModernProbe, stream()];
+            if idle {
+                steps.push(accepted_post());
+            }
+            steps.extend([
+                Step::HoldPost(prefix),
+                Step::Signal(accepted),
+                Step::ExpectHeldClosed,
+                stream(),
+                accepted_post(),
+            ]);
+            steps
+        });
+        virtual_runtime(&clock).block_on(Box::pin(async {
+            let cx = Cx::current().unwrap();
+            let mut client = open_legacy(&cx, &peer).await.unwrap();
+            if idle {
+                client.send(&cx, &ping(1)).await.unwrap();
+            }
+            let elapsed = lifetime_nanos(if idle {
+                "guarded-idle-lifetime"
+            } else {
+                "absolute-lifetime"
+            });
+            let request = ping(2);
+            let (outcome, ()) = pair(client.send(&cx, &request), async {
+                bounded_ready(poll_fn(|_| match waiting.try_recv() {
+                    Ok(()) => Poll::Ready(()),
+                    Err(mpsc::TryRecvError::Empty) => Poll::Pending,
+                    Err(mpsc::TryRecvError::Disconnected) => panic!("peer dropped before POST"),
+                }))
+                .await;
+                clock.advance(elapsed);
+            })
+            .await;
+            assert!(matches!(
+                (idle, outcome),
+                (false, Err(LegacySseHttpClientError::SseStreamLifetimeExpired))
+                    | (true, Err(LegacySseHttpClientError::SseIdleLifetimeExceeded))
+            ));
+            assert!(matches!(
+                client.send(&cx, &ping(3)).await,
+                Err(LegacySseHttpClientError::StreamGenerationEnded)
+            ));
+            client.reconnect(&cx).await.unwrap();
+            client.send(&cx, &ping(4)).await.unwrap();
+        }));
+        let log = peer.finish();
+        assert_eq!(log.posts.len(), if idle { 3 } else { 2 });
+        assert_eq!(log.held_closed_by_client, Some(true));
+        log.assert_legacy_hygiene("generation expiry during POST");
+    }
 }
 
 #[test]

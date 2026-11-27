@@ -6775,8 +6775,7 @@ impl ClientHttpConnection {
                 }
                 let request = JsonRpcRequest::new(method, Some(parameters), request_id.clone());
                 if let Err(error) = client
-                    .outbound()
-                    .send(cx, &JsonRpcMessage::Request(request))
+                    .send_admitted(cx, &JsonRpcMessage::Request(request))
                     .await
                 {
                     let LegacySseOutboundSendError {
@@ -6794,7 +6793,6 @@ impl ClientHttpConnection {
                     }
                     return Err(ClientHttpConnectionError::Legacy(error));
                 }
-                client.note_request_sent(cx.now());
                 let mut interleaved_control_frames = 0_usize;
                 loop {
                     let message = client
@@ -12376,10 +12374,10 @@ impl LegacySseHttpClient {
 
     /// Sets the absolute lifetime of the current and every later stream
     /// generation, measured from when each generation was opened. The default
-    /// is 15 minutes. When it ends, the next read that would wait for more
-    /// bytes returns [`LegacySseHttpClientError::SseStreamLifetimeExpired`]
-    /// and the generation's POST target is invalidated; [`Self::reconnect`]
-    /// may open a new one.
+    /// is 15 minutes. When it ends, a pending POST or a read waiting for more
+    /// bytes returns [`LegacySseHttpClientError::SseStreamLifetimeExpired`].
+    /// The generation's POST target is invalidated. [`Self::reconnect`] may
+    /// open a new one.
     ///
     /// # Errors
     ///
@@ -12619,24 +12617,54 @@ impl LegacySseHttpClient {
         message: &JsonRpcMessage,
     ) -> Result<(), LegacySseHttpClientError> {
         self.admit_send(cx)?;
-        self.outbound()
-            .send(cx, message)
+        self.send_admitted(cx, message)
             .await
-            .map_err(|error| error.error)?;
-        if let JsonRpcMessage::Request(request) = message
-            && !request.is_notification()
-        {
-            self.note_request_sent(cx.now());
-        }
-        Ok(())
+            .map_err(|error| error.error)
     }
 
-    /// Starts the current generation's guarded idle clock for one request
-    /// that now awaits its response.
-    pub(crate) fn note_request_sent(&mut self, now: Time) {
-        if let Some(stream) = self.stream.as_mut() {
-            stream.request_sent(now);
+    /// The direct client owns the stream while sending, so no separate reader
+    /// can invalidate an exchange parked on the POST head or body.
+    async fn send_admitted(
+        &mut self,
+        cx: &Cx,
+        message: &JsonRpcMessage,
+    ) -> Result<(), LegacySseOutboundSendError> {
+        let outbound = self.outbound();
+        let stream = self.stream.as_mut().ok_or_else(|| {
+            LegacySseOutboundSendError::not_submitted(
+                LegacySseHttpClientError::ReceiverOwnedByReadyClient,
+            )
+        })?;
+        let deadline = stream
+            .idle_deadline()
+            .map_or(stream.deadline, |idle| idle.min(stream.deadline));
+        let mut expiry = std::pin::pin!(asupersync::time::sleep_until(deadline));
+        let mut exchange = std::pin::pin!(outbound.send_native(cx, message));
+        let mut polled = false;
+        poll_fn(|task_cx| {
+            {
+                let _caller = Cx::set_current(Some(cx.clone()));
+                if cx.now() >= deadline || expiry.as_mut().poll(task_cx).is_ready() {
+                    let error = if deadline == stream.deadline {
+                        LegacySseHttpClientError::SseStreamLifetimeExpired
+                    } else {
+                        LegacySseHttpClientError::SseIdleLifetimeExceeded
+                    };
+                    stream.close_for_cancellation();
+                    return Poll::Ready(Err(LegacySseOutboundSendError {
+                        error,
+                        request_may_have_reached_peer: polled,
+                    }));
+                }
+            }
+            polled = true;
+            exchange.as_mut().poll(task_cx)
+        })
+        .await?;
+        if matches!(message, JsonRpcMessage::Request(request) if !request.is_notification()) {
+            stream.request_sent(cx.now());
         }
+        Ok(())
     }
 
     /// Waits for the next legacy SSE `message` JSON-RPC envelope.
