@@ -97,7 +97,9 @@ impl FinalTaskRuntime {
         status_message: Option<String>,
     ) -> impl Future<Output = McpResult<CreateTaskResult>> + Send + 'a {
         CallerContextFuture::new(cx, async move {
-            let ctx = McpContext::new(cx.clone(), 0);
+            let caller = Cx::current()
+                .ok_or_else(|| McpError::internal_error("Task creation has no installed caller"))?;
+            let ctx = McpContext::new(caller, 0);
             ctx.checkpoint()?;
             let task = self.new_task_for_creation(status_message)?;
             let (permit, notification) =
@@ -122,7 +124,7 @@ impl FinalTaskRuntime {
             let committed = settle_creation(&ctx, &receipt, pending).await?;
             let committed = self.validate_committed_new_task(&task, None, None, committed)?;
             self.signal_task_service(task.base().task_id.clone());
-            self.emit_recovery_commit(ctx.cx(), &committed).await;
+            self.emit_embedding_commit(&ctx, &committed).await;
             drop(permit);
             Ok(CreateTaskResult {
                 task,
