@@ -61,6 +61,8 @@ const MAX_TEST_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
 const MAX_TEST_ABSOLUTE_TIMEOUT_SECS: u64 = 15 * 60;
 #[cfg(feature = "tasks")]
 const MAX_TASK_WATCH_RECONNECTS: u64 = 3;
+#[cfg(feature = "tasks")]
+const MAX_HTTP_TASK_POLL_RETRIES: u8 = 3;
 const CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: &str = "fastmcpCleanupUnverified";
 const CLIENT_CLEANUP_DURATION_MS_DATA_KEY: &str = "cleanupDurationMs";
 const FASTMCP_PROTOCOL_POLICY_ENV: &str = "FASTMCP_PROTOCOL_POLICY";
@@ -720,7 +722,8 @@ enum Commands {
         /// Observe an accepted Task on the same connection (Unix, modern-only).
         /// Emits acceptance, then the latest Task snapshot when observation ends;
         /// --json emits one or two JSON lines. No callbacks, task cancellation,
-        /// or tool-call retries are performed. Requires Tasks support.
+        /// or tool-call retries are performed. Transient HTTP failures allow up to
+        /// three extra read-only polls within the original timeout. Requires Tasks support.
         /// Snapshot output to ordinary Unix pipes/sockets has a separate 250ms
         /// settlement bound; regular files/devices follow OS blocking behavior.
         #[arg(long, hide = !cfg!(feature = "tasks"))]
@@ -7553,7 +7556,7 @@ async fn task_aware_http_tool_call(
     let outcome = asupersync::time::timeout(
         cx.now(),
         remaining,
-        task.wait(cx, client, cancellation, policy),
+        task.wait_with_http_recovery(cx, client, cancellation, policy, MAX_HTTP_TASK_POLL_RETRIES),
     )
     .await
     .map_err(|_| OperationBudget::timeout_error())

@@ -5440,6 +5440,8 @@ def respond(request):
         })
     elif method == "tools/call":
         assert called_at is None, "tool creation must never replay"
+        if mode == "lost_creation":
+            return None
         params = request["params"]
         assert params["name"] == "background"
         assert params["arguments"] == {"work": task_id}
@@ -5517,6 +5519,9 @@ def respond(request):
             result = result.replace(',"pollIntervalMs":80', '')
     elif method == "tasks/get":
         assert called_at is not None, "observation must follow creation"
+        reads += 1
+        if mode == "lost_every_read" or (mode == "lost_first_read" and reads == 1):
+            return None
         assert request["params"]["taskId"] == task_id
         if mode != "accept_followup":
             assert event["elapsed_ms"] >= 70, "creation pollIntervalMs was shortened"
@@ -5550,6 +5555,9 @@ else:
             assert 0 < length <= 65536
             request = json.loads(self.rfile.read(length))
             response = respond(request)
+            if response is None:
+                self.close_connection = True
+                return
             stream = isinstance(response, list)
             if stream:
                 response = "".join("data: " + frame + "\n\n" for frame in response)
@@ -5898,6 +5906,30 @@ else:
             assert!(stdout_str(&output).contains(r#""com.example\/number":1.20e+4"#));
             assert!(stdout_str(&output).contains(r#""com.example/big":9007199254740993"#));
             assert!(events[2]["elapsed_ms"].as_f64().unwrap() >= 70.0);
+        }
+    }
+
+    #[test]
+    fn call_wait_recovers_only_accepted_http_task_reads() {
+        for (mode, gets, success) in [
+            ("lost_first_read", 2, true),
+            ("lost_every_read", 4, false),
+            ("lost_creation", 0, false),
+        ] {
+            let (output, events) = call(mode, true, true, &[]);
+            assert_eq!(output.status.success(), success, "{mode}: {output:?}");
+            let mut expected = vec!["server/discover", "tools/call"];
+            expected.extend(std::iter::repeat_n("tasks/get", gets));
+            assert_exchange(&events, &expected);
+            let snapshots = documents(&output);
+            if gets == 0 {
+                assert!(snapshots.is_empty(), "no Task was acknowledged");
+            } else {
+                assert_eq!(snapshots.len(), 2);
+                assert_eq!(snapshots[0]["status"], "working");
+                assert_eq!(snapshots[1]["taskId"], snapshots[0]["taskId"]);
+                assert_eq!(snapshots[1]["status"], if success { "completed" } else { "working" });
+            }
         }
     }
 
