@@ -103,7 +103,12 @@ impl FinalTaskStore for AsyncCreationStore {
         Box::pin(async move {
             let ctx = admission.context();
             assert!(ctx.auth().is_none(), "embedding does not invent credentials");
-            assert!(Cx::current().is_some(), "provider inherits the caller's Cx");
+            let installed = Cx::current().expect("provider inherits the caller's Cx");
+            assert_eq!(
+                ctx.cx().capabilities().spawn,
+                installed.capabilities().spawn,
+                "an explicit provider context must retain the host's restriction",
+            );
             self.create_calls.fetch_add(1, Ordering::SeqCst);
             self.before_commit.wait().await;
             admission.checkpoint_before_write()?;
@@ -784,7 +789,11 @@ fn async_embedding_creation_retains_admission_and_exact_recoverable_work() {
         let mut fixture = Fixture::new();
         fixture.store.before_commit.close();
         let runtime = fixture.runtime.clone();
-        let mut create = Box::pin(runtime.create_task_with_work_with_cx(&cx, work(), None));
+        let mut create = {
+            use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+            let _restriction = Cx::push_restriction(CapSet::<false, true, true, true, true>::MASK);
+            Box::pin(runtime.create_task_with_work_with_cx(&cx, work(), None))
+        };
         assert!(poll_once(create.as_mut()).is_pending());
         assert_eq!(fixture.store.create_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.store.inner.task_count(), 0);
