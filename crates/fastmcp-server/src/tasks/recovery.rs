@@ -222,6 +222,39 @@ async fn await_recovery_store_while<T>(
     .await
 }
 
+/// Service notifications retain their service admission and periodic checks.
+/// Application-owned operations only need their original read authority.
+#[derive(Clone, Copy)]
+enum NotificationCaller<'a> {
+    Service(&'a Cx),
+    Application(&'a McpContext),
+}
+
+impl<'a> NotificationCaller<'a> {
+    fn cx(self) -> &'a Cx {
+        match self {
+            Self::Service(cx) => cx,
+            Self::Application(ctx) => ctx.cx(),
+        }
+    }
+
+    fn check(self) -> McpResult<()> {
+        match self {
+            Self::Service(cx) => final_task_service_caller(cx).map(|_| ()),
+            Self::Application(ctx) => ctx.ensure_live().map_err(|_| McpError::request_cancelled()),
+        }
+    }
+
+    async fn read<T>(self, operation: FinalTaskStoreFuture<'_, T>) -> McpResult<T> {
+        match self {
+            Self::Service(cx) => await_recovery_store(cx, operation, false).await,
+            Self::Application(ctx) => {
+                control::await_control_read(ctx, operation, || self.check()).await
+            }
+        }
+    }
+}
+
 impl FinalTaskRuntime {
     /// Reads a Task for a trusted embedding application using its caller's storage hooks.
     ///
@@ -260,7 +293,7 @@ impl FinalTaskRuntime {
                 .await?;
                 if let Some(committed) = expired {
                     snapshot = self.validate_execution_expiry_receipt(&snapshot, committed)?;
-                    self.emit_recovery_commit(ctx.cx(), &snapshot).await;
+                    self.emit_embedding_commit(&ctx, &snapshot).await;
                 }
             }
             live()?;
@@ -625,13 +658,31 @@ impl FinalTaskRuntime {
     }
 
     pub(super) async fn emit_recovery_commit(&self, cx: &Cx, committed: &FinalTaskSnapshot) {
-        if final_task_service_caller(cx).is_err() {
+        self.emit_task_notification(NotificationCaller::Service(cx), committed)
+            .await;
+    }
+
+    pub(super) async fn emit_embedding_commit(
+        &self,
+        ctx: &McpContext,
+        committed: &FinalTaskSnapshot,
+    ) {
+        self.emit_task_notification(NotificationCaller::Application(ctx), committed)
+            .await;
+    }
+
+    async fn emit_task_notification(
+        &self,
+        caller: NotificationCaller<'_>,
+        committed: &FinalTaskSnapshot,
+    ) {
+        if caller.check().is_err() {
             return;
         }
         let task_id = &committed.task().base().task_id;
-        let Ok(Some(current)) =
-            await_recovery_store(cx, self.store.get_task_snapshot_with_cx(cx, task_id), false)
-                .await
+        let Ok(Some(current)) = caller
+            .read(self.store.get_task_snapshot_with_cx(caller.cx(), task_id))
+            .await
         else {
             return;
         };
@@ -665,15 +716,12 @@ impl FinalTaskRuntime {
             panicked_emitter_count += 1;
         }
         for weak in &emitters {
-            if final_task_service_caller(cx).is_err() {
+            if caller.check().is_err() {
                 break;
             }
-            let current = await_recovery_store(
-                cx,
-                self.store.get_task_access_metadata_with_cx(cx, task_id),
-                false,
-            )
-            .await;
+            let current = caller
+                .read(self.store.get_task_access_metadata_with_cx(caller.cx(), task_id))
+                .await;
             if !current.is_ok_and(|current| {
                 current.is_some_and(|current| {
                     current.task_id() == task_id
