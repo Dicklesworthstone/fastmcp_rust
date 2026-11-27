@@ -314,6 +314,8 @@ impl SamplingToolLoop {
     /// Appends one user message consisting solely of results for the entire
     /// pending batch. Missing, duplicate, foreign and mixed-content results are
     /// refused atomically. Host completion order need not equal model order.
+    /// After the first completed batch, an explicit `required` choice becomes
+    /// `auto` on the next request so the model can finish or ask for more tools.
     /// Explicit JSON null structured content is retained, not treated as absent.
     pub fn submit_tool_results(
         &mut self,
@@ -331,6 +333,11 @@ impl SamplingToolLoop {
             .as_ref()
             .ok_or(SamplingToolLoopError::Closed)?
             .clone();
+        if let Some(tool_choice) = &mut next.tool_choice
+            && tool_choice.mode == Some(FinalToolChoiceMode::Required)
+        {
+            tool_choice.mode = Some(FinalToolChoiceMode::Auto);
+        }
         next.messages.push(FinalSamplingMessage {
             role: Role::User,
             content: FinalSamplingMessageContent::Blocks(results),
@@ -622,6 +629,42 @@ mod tests {
             ready().accept_response(reply),
             Err(SamplingToolLoopError::InvalidResponse)
         );
+    }
+
+    #[test]
+    fn required_tool_choice_is_satisfied_only_by_a_completed_batch() {
+        let mut req = request();
+        req.tool_choice = Some(serde_json::from_value(json!({"mode":"required"})).unwrap());
+        let limits = SamplingToolLoopLimits::new(2, 1, 4096).unwrap();
+        let mut run = SamplingToolLoop::new(req, limits).unwrap();
+        let final_reply = response(json!({"type":"text","text":"sunny"}));
+
+        assert_eq!(
+            run.accept_response(final_reply.clone()),
+            Err(SamplingToolLoopError::ToolChoiceViolation)
+        );
+        assert_eq!(
+            run.accept_response(response(call("weather-1"))),
+            Ok(SamplingToolLoopStep::Tools { count: 1 })
+        );
+        assert_eq!(
+            run.submit_tool_results(vec![answer("foreign")]),
+            Err(SamplingToolLoopError::InvalidToolResults)
+        );
+        assert!(run.request().is_none());
+        run.submit_tool_results(vec![answer("weather-1")]).unwrap();
+        let follow_up = run.request().unwrap();
+        assert_eq!(choice(follow_up), Some(FinalToolChoiceMode::Auto));
+        assert_eq!(
+            serde_json::to_value(follow_up).unwrap()["toolChoice"]["mode"],
+            "auto"
+        );
+        assert_eq!(
+            run.accept_response(final_reply),
+            Ok(SamplingToolLoopStep::Complete)
+        );
+        assert_eq!(run.round_count(), 2);
+        assert_eq!(run.tool_call_count(), 1);
     }
 
     #[test]
