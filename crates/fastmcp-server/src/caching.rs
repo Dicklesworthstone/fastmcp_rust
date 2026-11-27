@@ -66,6 +66,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::Deserialize;
+
 use fastmcp_core::{
     McpContext, McpError, McpResult, ResponseCacheNotificationGuard, Sha256Digest, sha256_bounded,
 };
@@ -101,8 +103,11 @@ const CACHE_BYTES_GROWTH_CHUNK: usize = 4 * 1024;
 
 /// Conservative accounting for the entry, duplicate map/order keys, hash-table
 /// bucket/control storage, the `Arc` allocation header, and allocator metadata.
-/// The encoded payload length is added separately.
+/// Encoded payload and resource dependency allocations are added separately.
 const CACHE_ENTRY_METADATA_BYTES: usize = 512;
+
+/// The two reference counters preceding a retained resource-dependency slice.
+const CACHE_RESOURCE_DEPENDENCIES_HEADER_BYTES: usize = 2 * std::mem::size_of::<usize>();
 
 /// Domain separators for cache request and authorization/session partitions.
 const CACHE_REQUEST_KEY_DOMAIN: &[u8] = b"fastmcp-response-cache-request-v2\0";
@@ -129,6 +134,9 @@ struct CacheEntry {
     expires_at: Instant,
     size_bytes: usize,
     notification_guard: Option<ResponseCacheNotificationGuard>,
+    // Only validated contents establish that a read is unrelated to an update.
+    // None keeps invalid/over-budget dependency sets conservatively invalidated.
+    resource_dependencies: Option<Arc<[Sha256Digest]>>,
 }
 
 impl std::fmt::Debug for CacheEntry {
@@ -159,6 +167,7 @@ impl CacheEntry {
             expires_at,
             size_bytes,
             notification_guard: None,
+            resource_dependencies: None,
         })
     }
 
@@ -172,6 +181,14 @@ impl CacheEntry {
                 .notification_guard
                 .as_ref()
                 .is_none_or(|guard| !guard.has_notifications())
+    }
+
+    fn resource_contents_may_include(&self, digest: Sha256Digest) -> bool {
+        self.resource_dependencies.as_ref().is_none_or(|dependencies| {
+            dependencies
+                .binary_search_by(|candidate| candidate.as_bytes().cmp(digest.as_bytes()))
+                .is_ok()
+        })
     }
 }
 
@@ -464,6 +481,48 @@ fn encode_json_bounded(value: &serde_json::Value, max_bytes: usize) -> Option<Ar
 
 fn decode_cached_json(encoded: &[u8]) -> Option<serde_json::Value> {
     serde_json::from_slice(encoded).ok()
+}
+
+/// Index only the selected `contents[].uri` fields of a validated read result.
+/// The caller has already admitted the response's encoded size and JSON shape.
+/// Unknown members, including URI lookalikes, never establish dependencies.
+fn resource_read_dependencies(
+    response: &serde_json::Value,
+    max_bytes: usize,
+) -> Option<Arc<[Sha256Digest]>> {
+    let contents = response.get("contents")?.as_array()?;
+    let allocation_bytes = contents
+        .len()
+        .checked_mul(std::mem::size_of::<Sha256Digest>())?
+        .checked_add(CACHE_RESOURCE_DEPENDENCIES_HEADER_BYTES)?;
+    if contents.len() > MAX_CACHE_JSON_NODES || allocation_bytes > max_bytes {
+        return None;
+    }
+    match response.get("resultType") {
+        Some(serde_json::Value::String(kind)) if kind == "complete" => {
+            fastmcp_protocol::FinalReadResourceResult::deserialize(response).ok()?;
+        }
+        None => {
+            fastmcp_protocol::ReadResourceResult::deserialize(response).ok()?;
+        }
+        _ => return None,
+    }
+    let mut dependencies = Vec::new();
+    dependencies.try_reserve_exact(contents.len()).ok()?;
+    for content in contents {
+        // Typed admission proved that this selected field is a string.
+        // Reuse the exact resource-update digest, including its domain and
+        // method binding. No normalization can merge distinct wire URIs.
+        let uri = content.get("uri")?;
+        dependencies.push(CacheKey::try_digest(
+            CACHE_RESOURCE_KEY_DOMAIN,
+            "resources/read",
+            Some(uri),
+        )?);
+    }
+    dependencies.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    dependencies.dedup();
+    Some(Arc::from(dependencies.into_boxed_slice()))
 }
 
 #[derive(Clone, Copy)]
@@ -903,6 +962,7 @@ impl LruCache {
         encoded: Arc<[u8]>,
         ttl: Duration,
         notification_guard: ResponseCacheNotificationGuard,
+        resource_dependencies: Option<Arc<[Sha256Digest]>>,
     ) {
         if encoded.len() > self.max_item_size {
             return;
@@ -910,7 +970,17 @@ impl LruCache {
         let Some(mut entry) = CacheEntry::new_encoded(encoded, ttl) else {
             return;
         };
+        if let Some(dependencies) = resource_dependencies.as_ref() {
+            let Some(size_bytes) = std::mem::size_of_val(dependencies.as_ref())
+                .checked_add(CACHE_RESOURCE_DEPENDENCIES_HEADER_BYTES)
+                .and_then(|bytes| entry.size_bytes.checked_add(bytes))
+            else {
+                return;
+            };
+            entry.size_bytes = size_bytes;
+        }
         entry.notification_guard = Some(notification_guard);
+        entry.resource_dependencies = resource_dependencies;
         self.insert_entry(key, entry);
     }
 
@@ -978,25 +1048,26 @@ impl LruCache {
     }
 
     fn remove_invalidation_digest(&mut self, invalidation_digest: Sha256Digest) {
-        self.remove_matching(|key| key.invalidation_digest == invalidation_digest);
+        self.remove_matching(|key, _| key.invalidation_digest == invalidation_digest);
     }
 
-    fn remove_matching(&mut self, matches: impl Fn(&CacheKey) -> bool) {
+    fn remove_matching(&mut self, matches: impl Fn(&CacheKey, &CacheEntry) -> bool) {
         let mut retained_size = self.current_size_bytes;
         self.entries.retain(|key, entry| {
-            if matches(key) {
+            if matches(key, entry) {
                 retained_size = retained_size.saturating_sub(entry.size_bytes);
                 false
             } else {
                 true
             }
         });
-        self.order.retain(|key| !matches(key));
+        let entries = &self.entries;
+        self.order.retain(|key| entries.contains_key(key));
         self.current_size_bytes = retained_size;
     }
 
     fn remove_discovery_entries(&mut self) {
-        self.remove_matching(|key| matches!(key.binding, CacheEntryBinding::Discovery(_)));
+        self.remove_matching(|key, _| matches!(key.binding, CacheEntryBinding::Discovery(_)));
     }
 
     fn evict_expired(&mut self) {
@@ -1450,8 +1521,15 @@ impl ResponseCachingMiddleware {
         if catalog_changed {
             self.advance_discovery_generation();
         }
-        cache.remove_matching(|key| {
+        cache.remove_matching(|key, entry| {
             key.notification_scope == changed
+                || match (changed, key.notification_scope) {
+                    (
+                        CacheNotificationScope::ResourceRead(Some(digest)),
+                        CacheNotificationScope::ResourceRead(_),
+                    ) => entry.resource_contents_may_include(digest),
+                    _ => false,
+                }
                 || (catalog_changed && key.notification_scope == CacheNotificationScope::Discovery)
                 || matches!(
                     (changed, key.notification_scope),
@@ -1809,20 +1887,32 @@ impl Middleware for ResponseCachingMiddleware {
             },
         };
 
-        let admission_limit = {
+        let (admission_limit, entry_capacity) = {
             let cache = self
                 .cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.max_item_size.min(
-                cache
-                    .max_size_bytes
-                    .saturating_sub(CACHE_ENTRY_METADATA_BYTES),
+            (
+                cache.max_item_size.min(
+                    cache.max_size_bytes.saturating_sub(CACHE_ENTRY_METADATA_BYTES),
+                ),
+                cache.max_size_bytes,
             )
         };
         let Some(encoded) = encode_json_bounded(&response, admission_limit) else {
             return Ok(response);
         };
+        let resource_dependencies =
+            if matches!(key.notification_scope, CacheNotificationScope::ResourceRead(_)) {
+                resource_read_dependencies(
+                    &response,
+                    entry_capacity
+                        .saturating_sub(CACHE_ENTRY_METADATA_BYTES)
+                        .saturating_sub(encoded.len()),
+                )
+            } else {
+                None
+            };
         let mut cache = self
             .cache
             .lock()
@@ -1840,7 +1930,13 @@ impl Middleware for ResponseCachingMiddleware {
         {
             return Ok(response);
         }
-        cache.insert_encoded(key, encoded, ttl, ctx.response_cache_notification_guard());
+        cache.insert_encoded(
+            key,
+            encoded,
+            ttl,
+            ctx.response_cache_notification_guard(),
+            resource_dependencies,
+        );
 
         Ok(response)
     }
@@ -2066,6 +2162,262 @@ mod tests {
                 assert_eq!(hit, index == 3, "only the unrelated URI remains cacheable");
             }
         }
+    }
+
+    fn resource_read_cache_result(
+        modern: bool,
+        contents: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut result = serde_json::json!({"contents": contents});
+        if modern {
+            result["resultType"] = serde_json::json!("complete");
+            result["ttlMs"] = serde_json::json!(30_000);
+            result["cacheScope"] = serde_json::json!("private");
+        }
+        result
+    }
+
+    #[test]
+    fn server_resource_dependency_updates_invalidate_aggregate_reads() {
+        for modern in [false, true] {
+            let cache = Arc::new(ResponseCachingMiddleware::new());
+            let server = crate::Server::new("aggregate-resource-cache", "1")
+                .middleware(Arc::clone(&cache))
+                .build();
+            let requests = [
+                test_request(
+                    "resources/read",
+                    Some(serde_json::json!({"uri": "file:///aggregate"})),
+                ),
+                test_request(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "uri": "file:///aggregate", "cursor": "opaque-page-two"
+                    })),
+                ),
+                test_request(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "uri": "file:///aggregate", "_meta": {"example/shape": "expanded"}
+                    })),
+                ),
+                test_request(
+                    "resources/read",
+                    Some(serde_json::json!({"uri": "file:///unrelated"})),
+                ),
+            ];
+            for subject in ["alice", "bob"] {
+                for (index, request) in requests.iter().enumerate() {
+                    let uri = if index == 3 {
+                        "file:///unrelated-content"
+                    } else {
+                        "file:///embedded"
+                    };
+                    let mut result = resource_read_cache_result(
+                        modern,
+                        serde_json::json!([
+                            {"uri": uri, "text": "snapshot"},
+                            {"uri": "file:///binary", "blob": "eA=="}
+                        ]),
+                    );
+                    result["example/opaque"] =
+                        serde_json::json!({"uri": "file:///lookalike"});
+                    let ctx = McpContext::new(Cx::for_testing(), 1)
+                        .with_auth(AuthContext::with_subject(subject));
+                    assert!(matches!(
+                        cache.on_request(&ctx, request).unwrap(),
+                        MiddlewareDecision::Continue
+                    ));
+                    cache.on_response(&ctx, request, result).unwrap();
+                }
+            }
+            assert_eq!(cache.stats().entries, 8);
+            let publisher = server.subscription_publisher();
+            let before = cache.stats();
+            let mut malformed = resource_change("file:///embedded");
+            let ServerNotification::ResourceUpdated(params) = &mut malformed else {
+                unreachable!();
+            };
+            params
+                .additional
+                .insert("uri".to_owned(), serde_json::json!("file:///embedded"));
+            assert!(publisher.publish(malformed).is_err());
+            assert_eq!(cache.stats(), before, "rejected notifications have no effect");
+            assert_eq!(
+                publisher.publish(resource_change("file:///lookalike")).unwrap(),
+                0
+            );
+            assert_eq!(cache.stats(), before, "unknown siblings grant no dependency");
+
+            assert_eq!(
+                publisher.publish(resource_change("file:///embedded")).unwrap(),
+                0
+            );
+            assert_eq!(cache.stats().entries, 2);
+            for subject in ["alice", "bob"] {
+                for (index, request) in requests.iter().enumerate() {
+                    let ctx = McpContext::new(Cx::for_testing(), 2)
+                        .with_auth(AuthContext::with_subject(subject));
+                    assert_eq!(
+                        matches!(
+                            cache.on_request(&ctx, request).unwrap(),
+                            MiddlewareDecision::Respond(_)
+                        ),
+                        index == 3,
+                        "every affected page and principal must miss; unrelated reads stay cached"
+                    );
+                }
+            }
+            assert_eq!(
+                publisher.publish(resource_change("file:///binary")).unwrap(),
+                0
+            );
+            assert_eq!(cache.stats().entries, 0, "blob dependencies also invalidate");
+            assert_eq!(cache.stats().size_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn server_resource_dependency_updates_fence_inflight_fills() {
+        for modern in [false, true] {
+            let cache = Arc::new(ResponseCachingMiddleware::new());
+            let server = crate::Server::new("aggregate-resource-race", "1")
+                .middleware(Arc::clone(&cache))
+                .build();
+            let request = test_request(
+                "resources/read",
+                Some(serde_json::json!({"uri": "file:///aggregate"})),
+            );
+            let old_ctx = test_context();
+            assert!(matches!(
+                cache.on_request(&old_ctx, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+            server
+                .publish_subscription_notification(resource_change("file:///embedded"))
+                .unwrap();
+            let mut result = resource_read_cache_result(
+                modern,
+                serde_json::json!([{"uri": "file:///embedded", "text": "old"}]),
+            );
+            cache.on_response(&old_ctx, &request, result.clone()).unwrap();
+            assert_eq!(
+                cache.stats().entries,
+                0,
+                "a late aggregate fill cannot repopulate"
+            );
+            assert_eq!(cache.stats().size_bytes, 0);
+
+            let new_ctx = test_context();
+            assert!(matches!(
+                cache.on_request(&new_ctx, &request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+            result["contents"][0]["text"] = serde_json::json!("new");
+            cache.on_response(&new_ctx, &request, result).unwrap();
+            let MiddlewareDecision::Respond(hit) =
+                cache.on_request(&test_context(), &request).unwrap()
+            else {
+                panic!("the freshly fetched aggregate must be cacheable");
+            };
+            assert_eq!(hit["contents"][0]["text"], serde_json::json!("new"));
+        }
+    }
+
+    #[test]
+    fn server_resource_dependency_index_is_bounded_shared_and_accounted() {
+        let result = resource_read_cache_result(
+            true,
+            serde_json::json!([
+                {"uri": "file:///dependency-a", "text": "first"},
+                {"uri": "file:///dependency-a", "blob": "eA=="},
+                {"uri": "file:///dependency-b", "text": "second"}
+            ]),
+        );
+        let dependencies = resource_read_dependencies(&result, 4096).unwrap();
+        assert_eq!(dependencies.len(), 2, "repeated URIs retain one digest");
+        assert!(resource_read_dependencies(&result, 0).is_none());
+        let mut malformed = result.clone();
+        malformed["contents"][0]["blob"] = serde_json::json!("eA==");
+        assert!(
+            resource_read_dependencies(&malformed, 4096).is_none(),
+            "a contents object with both text and blob cannot prove unrelatedness"
+        );
+
+        let base_bytes =
+            serde_json::to_vec(&result).unwrap().len() + CACHE_ENTRY_METADATA_BYTES;
+        let dependency_bytes = std::mem::size_of_val(dependencies.as_ref())
+            + CACHE_RESOURCE_DEPENDENCIES_HEADER_BYTES;
+        let entry_bytes = base_bytes + dependency_bytes;
+        let cache = ResponseCachingMiddleware::new().max_size_bytes(entry_bytes * 2 - 1);
+        let first = test_request(
+            "resources/read",
+            Some(serde_json::json!({"uri": "file:///aggregate-one"})),
+        );
+        let second = test_request(
+            "resources/read",
+            Some(serde_json::json!({"uri": "file:///aggregate-two"})),
+        );
+        for request in [&first, &second] {
+            let ctx = test_context();
+            assert!(matches!(
+                cache.on_request(&ctx, request).unwrap(),
+                MiddlewareDecision::Continue
+            ));
+            cache.on_response(&ctx, request, result.clone()).unwrap();
+            assert_eq!(
+                cache.stats().entries,
+                1,
+                "the full index charge enforces LRU capacity"
+            );
+            assert_eq!(cache.stats().size_bytes, entry_bytes);
+        }
+        assert!(matches!(
+            cache.on_request(&test_context(), &first).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        assert!(matches!(
+            cache.on_request(&test_context(), &second).unwrap(),
+            MiddlewareDecision::Respond(_)
+        ));
+        let retained = {
+            let inner = cache.cache.lock().unwrap();
+            inner.entries.values().next().unwrap().clone()
+        };
+        let cloned = retained.clone();
+        assert!(Arc::ptr_eq(
+            retained.resource_dependencies.as_ref().unwrap(),
+            cloned.resource_dependencies.as_ref().unwrap()
+        ));
+        assert_eq!(retained.size_bytes, entry_bytes);
+
+        // If the payload fits but its complete index does not, keeping no
+        // index is safe only when every resource update invalidates the entry.
+        let capacity = entry_bytes - 1;
+        let bounded = Arc::new(ResponseCachingMiddleware::new().max_size_bytes(capacity));
+        let server = crate::Server::new("bounded-resource-dependencies", "1")
+            .middleware(Arc::clone(&bounded))
+            .build();
+        let ctx = test_context();
+        assert!(matches!(
+            bounded.on_request(&ctx, &first).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        bounded.on_response(&ctx, &first, result).unwrap();
+        assert_eq!(bounded.stats().entries, 1);
+        assert_eq!(bounded.stats().size_bytes, base_bytes);
+        assert!(bounded.stats().size_bytes <= capacity);
+        {
+            let inner = bounded.cache.lock().unwrap();
+            assert!(
+                inner.entries.values().next().unwrap().resource_dependencies.is_none()
+            );
+        }
+        server
+            .publish_subscription_notification(resource_change("file:///otherwise-unrelated"))
+            .unwrap();
+        assert_eq!(bounded.stats().entries, 0);
+        assert_eq!(bounded.stats().size_bytes, 0);
     }
 
     #[test]
