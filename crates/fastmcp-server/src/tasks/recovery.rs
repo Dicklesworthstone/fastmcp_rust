@@ -17,7 +17,28 @@ const RECOVERY_CHECKPOINT_INTERVAL: StdDuration = StdDuration::from_millis(25);
 #[derive(Default)]
 pub(super) struct FinalTaskLeaseRenewal {
     operation: Option<FinalTaskStoreFuture<'static, bool>>,
+    authorization: Option<FinalTaskStoreFuture<'static, ()>>,
+    observed: Option<Poll<McpResult<bool>>>,
+    operation_woken: Arc<AtomicBool>,
     checkpoint: Option<Pin<Box<asupersync::time::Sleep>>>,
+}
+
+/// A storage wake must survive an intervening authorization read. Wakes from
+/// that read must not themselves cause a busy loop polling a parked renewal.
+struct RenewalOperationWake {
+    notified: Arc<AtomicBool>,
+    parent: std::task::Waker,
+}
+
+impl std::task::Wake for RenewalOperationWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notified.store(true, TaskServiceOrdering::Release);
+        self.parent.wake_by_ref();
+    }
 }
 
 impl FinalTaskLeaseRenewal {
@@ -32,6 +53,8 @@ impl FinalTaskLeaseRenewal {
             // Also drop an abandoned provider before its guard can restore
             // the lease. A completed provider is never polled a second time.
             self.operation = None;
+            self.authorization = None;
+            self.observed = None;
             self.checkpoint = None;
         }
         result
@@ -47,63 +70,220 @@ impl FinalTaskLeaseRenewal {
             Ok(caller) => caller,
             Err(error) => return Poll::Ready(Err(error)),
         };
-        if Self::expired(guard) {
-            return Poll::Ready(Ok(false));
-        }
-        if let Err(error) = guard.ensure_execution_authorized() {
-            return Poll::Ready(Err(error));
-        }
-        // Only this attempt's private commit receipt permits its bounded
-        // cleanup after the transition has consumed the dispatch lease.
-        if guard
-            .transition_committed
-            .load(TaskServiceOrdering::Acquire)
-        {
-            return Poll::Ready(Ok(true));
+        if let Some(result) = Self::terminal(cx, guard) {
+            return Poll::Ready(result);
         }
         let Some(fence) = guard.dispatch_fence else {
             return Poll::Ready(Ok(false));
         };
-        let operation = self.operation.get_or_insert_with(|| {
-            let store = Arc::clone(&guard.runtime.store);
-            let task_id = guard.task_id.clone();
-            let generation = guard.generation;
-            let owner = guard.owner_id.clone();
-            Box::pin(async move {
-                CallerContextFuture::new(&caller, async {
-                    store
-                        .renew_handoff_dispatch_if_current_with_cx(
-                            &caller, &task_id, generation, &owner, fence,
-                        )
-                        .await
+        loop {
+            // Keep both the pre-poll and post-poll probes across suspension.
+            // Neither authority reads nor renewal I/O may fall back to a
+            // synchronous metadata lookup on this asynchronous service path.
+            if self.authorization.is_none() {
+                self.authorization = Some(Self::authorization(&caller, guard, fence));
+            }
+            let authorization = self.authorization.as_mut().expect("authorization is owned");
+            let result = match authorization.as_mut().poll(task) {
+                Poll::Pending => return self.wait(cx, guard, task),
+                Poll::Ready(result) => result,
+            };
+            self.authorization = None;
+            // Metadata callbacks may cancel the caller or advance the backend
+            // clock. A late proof never extends this attempt's original bound.
+            if let Some(result) = Self::terminal(cx, guard) {
+                return Poll::Ready(result);
+            }
+            if let Err(error) = result {
+                guard
+                    .execution_revoked
+                    .store(true, TaskServiceOrdering::Release);
+                return Poll::Ready(Err(error));
+            }
+            if let Some(observed) = self.observed.take() {
+                // Preserve Ready while its post-poll proof awaits storage;
+                // polling an already completed provider again is invalid.
+                if let Poll::Ready(result) = observed {
+                    return Poll::Ready(result);
+                }
+                if self.operation_woken.load(TaskServiceOrdering::Acquire) {
+                    task.waker().wake_by_ref();
+                }
+                return self.wait(cx, guard, task);
+            }
+            let operation = self.operation.get_or_insert_with(|| {
+                let store = Arc::clone(&guard.runtime.store);
+                let task_id = guard.task_id.clone();
+                let generation = guard.generation;
+                let owner = guard.owner_id.clone();
+                let caller = caller.clone();
+                Box::pin(async move {
+                    CallerContextFuture::new(&caller, async {
+                        final_task_service_caller(&caller)?;
+                        store
+                            .renew_handoff_dispatch_if_current_with_cx(
+                                &caller, &task_id, generation, &owner, fence,
+                            )
+                            .await
+                    })
+                    .await
                 })
-                .await
-            })
-        });
-        if let Poll::Ready(result) = operation.as_mut().poll(task) {
-            // A receipt can arrive with cancellation, expiry or revocation.
-            // It may describe a committed extension but grants no application
-            // poll after the original caller or execution bound has expired.
-            if let Err(error) = final_task_service_caller(cx) {
-                return Poll::Ready(Err(error));
+            });
+            self.operation_woken
+                .store(false, TaskServiceOrdering::Release);
+            let waker = std::task::Waker::from(Arc::new(RenewalOperationWake {
+                notified: Arc::clone(&self.operation_woken),
+                parent: task.waker().clone(),
+            }));
+            self.observed = Some(
+                operation
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(&waker)),
+            );
+            if let Some(result) = Self::terminal(cx, guard) {
+                return Poll::Ready(result);
             }
-            if Self::expired(guard) {
-                return Poll::Ready(Ok(false));
-            }
-            if let Err(error) = guard.ensure_execution_authorized() {
-                return Poll::Ready(Err(error));
-            }
-            return Poll::Ready(result);
         }
+    }
+
+    /// Reproduce the synchronous guard's continuity and exact-generation
+    /// fallback checks using only the store's awaitable metadata entrypoints.
+    fn authorization(
+        caller: &Cx,
+        guard: &FinalTaskExecutionGuard,
+        fence: u64,
+    ) -> FinalTaskStoreFuture<'static, ()> {
+        let caller = caller.clone();
+        let runtime = guard.runtime.clone();
+        let expected = guard.execution_authorization.clone();
+        let owner = guard.owner_id.clone();
+        Box::pin(async move {
+            CallerContextFuture::new(&caller, async {
+                let expected = expected.ok_or_else(|| {
+                    McpError::internal_error(
+                        "Final task handoff has no execution authorization binding",
+                    )
+                })?;
+                final_task_service_caller(&caller)?;
+                let ctx = McpContext::new(caller.clone(), 0);
+                let continuity = runtime
+                    .store
+                    .get_handoff_access_metadata_with_context(
+                        &ctx,
+                        expected.task_id(),
+                        expected.generation(),
+                        &owner,
+                        fence,
+                    )
+                    .await
+                    .map_err(|_| authorization::task_execution_denied())?;
+                final_task_service_caller(&caller)?;
+                let current = if let Some(current) = continuity {
+                    if current.generation() < expected.generation() {
+                        return Err(authorization::task_execution_denied());
+                    }
+                    current
+                } else {
+                    // Preserve anonymous, policy-free stores whose historical
+                    // contract has no metadata endpoint. The exact owner/fence
+                    // remains enforced by the renewal transaction itself.
+                    if expected.authenticated_principal().is_none()
+                        && expected.original_operation().is_none()
+                        && runtime
+                            .execution_authorizers
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_empty()
+                    {
+                        return runtime.authorize_task_execution(&expected);
+                    }
+                    let current = runtime
+                        .store
+                        .get_task_access_metadata_with_cx(&caller, expected.task_id())
+                        .await
+                        .map_err(|_| authorization::task_execution_denied())?
+                        .ok_or_else(authorization::task_execution_denied)?;
+                    final_task_service_caller(&caller)?;
+                    if current.generation() != expected.generation() {
+                        return Err(authorization::task_execution_denied());
+                    }
+                    current
+                };
+                if current.task_id() != expected.task_id()
+                    || current.creation_generation() != expected.creation_generation()
+                    || current.authenticated_principal() != expected.authenticated_principal()
+                    || current.original_operation() != expected.original_operation()
+                {
+                    return Err(authorization::task_execution_denied());
+                }
+                runtime.authorize_task_execution(&current)
+            })
+            .await
+        })
+    }
+
+    fn terminal(cx: &Cx, guard: &FinalTaskExecutionGuard) -> Option<McpResult<bool>> {
         if let Err(error) = final_task_service_caller(cx) {
-            return Poll::Ready(Err(error));
+            return Some(Err(error));
         }
         if Self::expired(guard) {
-            return Poll::Ready(Ok(false));
+            return Some(Ok(false));
         }
-        if let Err(error) = guard.ensure_execution_authorized() {
-            return Poll::Ready(Err(error));
+        if guard.execution_revoked.load(TaskServiceOrdering::Acquire) {
+            return Some(Err(authorization::task_execution_denied()));
         }
+        let Some(expected) = guard.execution_authorization.as_ref() else {
+            return Some(Err(McpError::internal_error(
+                "Final task handoff has no execution authorization binding",
+            )));
+        };
+        if expected
+            .original_operation()
+            .is_some_and(|operation| !operation.is_registered())
+        {
+            guard
+                .execution_revoked
+                .store(true, TaskServiceOrdering::Release);
+            return Some(Err(authorization::task_execution_denied()));
+        }
+        // Only this attempt's private commit receipt permits bounded cleanup.
+        // No storage I/O is needed after the dispatch lease is consumed.
+        if guard
+            .transition_committed
+            .load(TaskServiceOrdering::Acquire)
+        {
+            if let Err(error) = guard.runtime.authorize_task_execution(expected) {
+                guard
+                    .execution_revoked
+                    .store(true, TaskServiceOrdering::Release);
+                return Some(Err(error));
+            }
+            // Policy is application code: it may cancel the caller or advance
+            // a backend clock while returning success.
+            if let Err(error) = final_task_service_caller(cx) {
+                return Some(Err(error));
+            }
+            if Self::expired(guard) {
+                return Some(Ok(false));
+            }
+            return Some(Ok(true));
+        }
+        None
+    }
+
+    fn wait(
+        &mut self,
+        cx: &Cx,
+        guard: &FinalTaskExecutionGuard,
+        task: &mut std::task::Context<'_>,
+    ) -> Poll<McpResult<bool>> {
+        if let Some(result) = Self::terminal(cx, guard) {
+            return Poll::Ready(result);
+        }
+        // While metadata is pending, no renewal or application poll is
+        // admitted. Current policy must use the fresh proof when it arrives:
+        // an older record generation cannot decide a newer status update's
+        // generation-sensitive policy.
         // A silent provider cannot hide caller cancellation or the original
         // backend execution/retention deadline. This timer only checks those
         // bounds; it never renews a lease or resets an execution budget.

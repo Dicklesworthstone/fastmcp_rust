@@ -121,6 +121,11 @@ struct AsyncRecoveryStore {
     renewal_pause_for: Mutex<Option<FinalTaskId>>,
     async_renewal_calls: AtomicUsize,
     sync_renewal_calls: AtomicUsize,
+    authorization_gates: [Gate; 2],
+    authorization_calls: AtomicUsize,
+    substitute_authorization: Mutex<Option<FinalTaskAccessMetadata>>,
+    omit_continuity: AtomicBool,
+    fail_authorization: AtomicBool,
 }
 
 impl AsyncRecoveryStore {
@@ -168,6 +173,11 @@ impl AsyncRecoveryStore {
             renewal_pause_for: Mutex::new(None),
             async_renewal_calls: AtomicUsize::new(0),
             sync_renewal_calls: AtomicUsize::new(0),
+            authorization_gates: std::array::from_fn(|_| Gate::new()),
+            authorization_calls: AtomicUsize::new(0),
+            substitute_authorization: Mutex::new(None),
+            omit_continuity: AtomicBool::new(false),
+            fail_authorization: AtomicBool::new(false),
         }
     }
 
@@ -292,7 +302,6 @@ macro_rules! forward_store {
 impl FinalTaskStore for AsyncRecoveryStore {
     forward_store! {
         fn execution_limits(&self) -> McpResult<FinalTaskExecutionLimits>;
-        fn get_handoff_access_metadata(&self, task_id: &FinalTaskId, generation: u64, owner_id: &str, fence: u64) -> McpResult<Option<FinalTaskAccessMetadata>>;
         fn create_task(&self, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<()>;
         fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>>;
         fn replace_task(&self, task: FinalTask, notification: FinalTaskStatusNotification) -> McpResult<()>;
@@ -419,7 +428,52 @@ impl FinalTaskStore for AsyncRecoveryStore {
         self.caller(cx);
         Box::pin(async move {
             self.enter(cx, Step::Metadata).await?;
+            if let Some(metadata) = self.substitute_authorization.lock().unwrap().as_ref() {
+                return Ok(Some(metadata.clone()));
+            }
             self.inner.get_task_access_metadata(task_id)
+        })
+    }
+
+    fn get_handoff_access_metadata(
+        &self,
+        task_id: &FinalTaskId,
+        generation: u64,
+        owner_id: &str,
+        fence: u64,
+    ) -> McpResult<Option<FinalTaskAccessMetadata>> {
+        self.synchronous();
+        self.inner
+            .get_handoff_access_metadata(task_id, generation, owner_id, fence)
+    }
+
+    fn get_handoff_access_metadata_with_context<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        task_id: &'a FinalTaskId,
+        generation: u64,
+        owner_id: &'a str,
+        fence: u64,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskAccessMetadata>> {
+        self.caller(ctx.cx());
+        Box::pin(async move {
+            let call = self.authorization_calls.fetch_add(1, Ordering::SeqCst);
+            self.authorization_gates[call % 2].wait().await;
+            self.caller(ctx.cx());
+            ctx.checkpoint()?;
+            if self.fail_authorization.load(Ordering::SeqCst) {
+                return Err(McpError::internal_error(
+                    "private metadata provider failure",
+                ));
+            }
+            if self.omit_continuity.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            if let Some(metadata) = self.substitute_authorization.lock().unwrap().as_ref() {
+                return Ok(Some(metadata.clone()));
+            }
+            self.inner
+                .get_handoff_access_metadata(task_id, generation, owner_id, fence)
         })
     }
 
@@ -2130,6 +2184,506 @@ fn task_dispatch_async_expiry_receipt_cancellation_prevents_next_provider_factor
         assert!(guard.elect_with_cx(&caller, &stop).await.is_err());
         assert_eq!(fixture.store.budget_factories.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.store.count(Step::Election), 0);
+        drop(guard);
+        fixture.assert_recoverable(&snapshot, false);
+    });
+}
+
+#[test]
+fn async_dispatch_renewal_authorization_yields_and_preserves_ready_receipt() {
+    for resumed in [false, true] {
+        run(|caller| async move {
+            let host = Cx::current().unwrap();
+            let fixture = Fixture::new();
+            let snapshot = fixture.seed("renewal-async-authority", resumed);
+            let (guard, _handoff) = settlement_guard(&fixture, &caller, &snapshot, resumed).await;
+            let original_budget = guard.execution_budget;
+            let task_id = &snapshot.task().base().task_id;
+            let original_lease = elected_lease(&fixture.store, task_id);
+            fixture.store.authorization_gates[0].close();
+            fixture.store.authorization_gates[1].close();
+            fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+            let mut renewal = Box::pin(guard.renew_with_cx(&caller));
+            drive_until(&host, renewal.as_mut(), || {
+                fixture.store.authorization_gates[0]
+                    .waiter
+                    .lock()
+                    .unwrap()
+                    .is_some()
+            })
+            .await;
+            assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(elected_lease(&fixture.store, task_id), original_lease);
+            let progressed = Arc::new(AtomicBool::new(false));
+            let sibling_progressed = Arc::clone(&progressed);
+            let mut sibling = host
+                .spawn(move |_| async move {
+                    sibling_progressed.store(true, Ordering::SeqCst);
+                })
+                .unwrap();
+            sibling.join(&host).await.unwrap();
+            assert!(progressed.load(Ordering::SeqCst));
+
+            *fixture.store.clock.lock().unwrap() += StdDuration::from_secs(1);
+            fixture.store.authorization_gates[0].release();
+            drive_until(&host, renewal.as_mut(), || {
+                fixture.store.authorization_gates[1]
+                    .waiter
+                    .lock()
+                    .unwrap()
+                    .is_some()
+            })
+            .await;
+            assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.store.renewals.load(Ordering::SeqCst), 1);
+            assert_ne!(elected_lease(&fixture.store, task_id), original_lease);
+            assert_eq!(guard.execution_budget, original_budget);
+            fixture.store.authorization_gates[1].release();
+            assert!(renewal.await.unwrap());
+            // The renewal future has completed before its post-poll proof.
+            // Re-polling it instead of retaining Ready would panic here.
+            assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.store.authorization_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(fixture.store.sync_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.store.sync_renewal_calls.load(Ordering::SeqCst), 0);
+            fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+            drop(guard);
+            fixture.assert_recoverable(&snapshot, resumed);
+        });
+    }
+}
+
+#[test]
+fn async_dispatch_renewal_rejects_changed_authority_on_both_sides() {
+    for after_renewal in [false, true] {
+        for invalid in 0..5 {
+            run(|caller| async move {
+                let host = Cx::current().unwrap();
+                let fixture = Fixture::new();
+                let snapshot = fixture.seed("renewal-authority-substitution", false);
+                let (guard, _handoff) = settlement_guard(&fixture, &caller, &snapshot, false).await;
+                let expected = guard.execution_authorization.as_ref().unwrap();
+                let gate = &fixture.store.authorization_gates[usize::from(after_renewal)];
+                gate.close();
+                fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+                let mut renewal = Box::pin(guard.renew_with_cx(&caller));
+                drive_until(&host, renewal.as_mut(), || {
+                    gate.waiter.lock().unwrap().is_some()
+                })
+                .await;
+                let lease = elected_lease(&fixture.store, expected.task_id());
+                if invalid == 4 {
+                    fixture
+                        .store
+                        .fail_authorization
+                        .store(true, Ordering::SeqCst);
+                } else {
+                    *fixture.store.substitute_authorization.lock().unwrap() =
+                        Some(FinalTaskAccessMetadata::new(
+                            if invalid == 0 {
+                                FinalTaskId::parse("another-renewal-task").unwrap()
+                            } else {
+                                expected.task_id().clone()
+                            },
+                            if invalid == 1 {
+                                expected.generation().checked_sub(1).unwrap()
+                            } else {
+                                expected.generation()
+                            },
+                            expected.creation_generation() + u64::from(invalid == 2),
+                            if invalid == 3 {
+                                Some(Sha256Digest::from_bytes([91; 32]))
+                            } else {
+                                expected.authenticated_principal()
+                            },
+                            expected.original_operation().cloned(),
+                        ));
+                }
+                gate.release();
+                let error = renewal.await.unwrap_err();
+                assert_eq!(error.message, "Task execution is no longer authorized");
+                assert!(guard.execution_revoked.load(Ordering::Acquire));
+                assert_eq!(
+                    fixture.store.async_renewal_calls.load(Ordering::SeqCst),
+                    usize::from(after_renewal)
+                );
+                assert_eq!(
+                    fixture.store.renewals.load(Ordering::SeqCst),
+                    usize::from(after_renewal)
+                );
+                assert_eq!(elected_lease(&fixture.store, expected.task_id()), lease);
+                let current = fixture
+                    .store
+                    .inner
+                    .get_task_snapshot(expected.task_id())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(current.generation(), snapshot.generation());
+                assert!(final_tasks_match_exactly(current.task(), snapshot.task()).unwrap());
+                assert_eq!(fixture.store.sync_calls.load(Ordering::SeqCst), 0);
+                fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+                drop(guard);
+                assert_eq!(fixture.store.inner.active_task_count(), 0);
+            });
+        }
+    }
+}
+
+struct RenewalPolicy {
+    revoked: AtomicBool,
+    generation: Option<u64>,
+}
+
+impl TaskExecutionAuthorizer for RenewalPolicy {
+    fn authorize(&self, metadata: &FinalTaskAccessMetadata) -> McpResult<()> {
+        if self.revoked.load(Ordering::SeqCst)
+            || self
+                .generation
+                .is_some_and(|generation| generation != metadata.generation())
+        {
+            Err(McpError::invalid_request("private renewal policy denial"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn async_dispatch_renewal_continuity_and_fallback_keep_generation_fences() {
+    for (continuity, updated) in [(true, true), (false, false), (false, true)] {
+        run(|caller| async move {
+            let host = Cx::current().unwrap();
+            let fixture = Fixture::new();
+            let snapshot = fixture.seed("renewal-generation-fence", false);
+            let (guard, _handoff) = settlement_guard(&fixture, &caller, &snapshot, false).await;
+            let current = if updated {
+                let task = FinalTask::Working(
+                    transition_final_task_base(
+                        snapshot.task().base().clone(),
+                        FinalTaskStatus::Working,
+                        Some("same invocation, newer status".to_owned()),
+                    )
+                    .unwrap(),
+                );
+                fixture
+                    .store
+                    .inner
+                    .update_working_status_for_handoff_if_current(
+                        &snapshot,
+                        &guard.owner_id,
+                        guard.dispatch_fence.unwrap(),
+                        task.clone(),
+                        final_task_notification(&task),
+                    )
+                    .unwrap()
+                    .unwrap()
+            } else {
+                snapshot.clone()
+            };
+            fixture
+                .runtime
+                .install_execution_authorizer(Arc::new(RenewalPolicy {
+                    revoked: AtomicBool::new(false),
+                    generation: continuity.then_some(current.generation()),
+                }))
+                .unwrap();
+            fixture
+                .store
+                .omit_continuity
+                .store(!continuity, Ordering::SeqCst);
+            fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+            let metadata_calls = fixture.store.count(Step::Metadata);
+            let mut renewal = Box::pin(guard.renew_with_cx(&caller));
+            if continuity {
+                // A pending newer-generation proof must not be rejected using
+                // the original claim's now-stale policy input.
+                fixture.store.authorization_gates[0].close();
+                fixture.store.authorization_gates[1].close();
+                drive_until(&host, renewal.as_mut(), || {
+                    fixture.store.authorization_gates[0]
+                        .waiter
+                        .lock()
+                        .unwrap()
+                        .is_some()
+                })
+                .await;
+                assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 0);
+                fixture.store.authorization_gates[0].release();
+                drive_until(&host, renewal.as_mut(), || {
+                    fixture.store.authorization_gates[1]
+                        .waiter
+                        .lock()
+                        .unwrap()
+                        .is_some()
+                })
+                .await;
+                fixture.store.authorization_gates[1].release();
+            } else {
+                fixture.store.gate(Step::Metadata).close();
+                drive_until(&host, renewal.as_mut(), || {
+                    fixture.store.count(Step::Metadata) > metadata_calls
+                })
+                .await;
+                fixture.store.gate(Step::Metadata).release();
+            }
+            let accepted = continuity || !updated;
+            if accepted {
+                assert!(renewal.await.unwrap());
+            } else {
+                assert_eq!(
+                    renewal.await.unwrap_err().message,
+                    "Task execution is no longer authorized"
+                );
+            }
+            assert_eq!(
+                fixture.store.renewals.load(Ordering::SeqCst),
+                usize::from(accepted)
+            );
+            assert_eq!(
+                fixture.store.count(Step::Metadata) - metadata_calls,
+                if continuity {
+                    0
+                } else if accepted {
+                    2
+                } else {
+                    1
+                }
+            );
+            assert_eq!(fixture.store.sync_calls.load(Ordering::SeqCst), 0);
+            fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+            drop(guard);
+            assert_eq!(fixture.store.inner.active_task_count(), 0);
+        });
+    }
+}
+
+#[test]
+fn async_dispatch_renewal_pending_proof_never_admits_revoked_work() {
+    for after_renewal in [false, true] {
+        run(|caller| async move {
+            let host = Cx::current().unwrap();
+            let fixture = Fixture::new();
+            let policy = Arc::new(RenewalPolicy {
+                revoked: AtomicBool::new(false),
+                generation: None,
+            });
+            fixture
+                .runtime
+                .install_execution_authorizer(policy.clone())
+                .unwrap();
+            let snapshot = fixture.seed("renewal-authority-revoked", false);
+            let (guard, _handoff) = settlement_guard(&fixture, &caller, &snapshot, false).await;
+            let gate = &fixture.store.authorization_gates[usize::from(after_renewal)];
+            gate.close();
+            fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+            let mut renewal = Box::pin(guard.renew_with_cx(&caller));
+            drive_until(&host, renewal.as_mut(), || {
+                gate.waiter.lock().unwrap().is_some()
+            })
+            .await;
+            policy.revoked.store(true, Ordering::SeqCst);
+            std::future::poll_fn(|task| {
+                assert!(renewal.as_mut().poll(task).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(
+                fixture.store.async_renewal_calls.load(Ordering::SeqCst),
+                usize::from(after_renewal)
+            );
+            assert_eq!(
+                fixture.store.renewals.load(Ordering::SeqCst),
+                usize::from(after_renewal)
+            );
+            gate.release();
+            assert_eq!(
+                renewal.await.unwrap_err().message,
+                "Task execution is no longer authorized"
+            );
+            assert!(guard.execution_revoked.load(Ordering::Acquire));
+            assert_eq!(
+                fixture.store.async_renewal_calls.load(Ordering::SeqCst),
+                usize::from(after_renewal)
+            );
+            assert_eq!(fixture.store.sync_calls.load(Ordering::SeqCst), 0);
+            fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+            drop(guard);
+            assert_eq!(fixture.store.inner.active_task_count(), 0);
+        });
+    }
+}
+
+#[test]
+fn async_dispatch_renewal_policy_cannot_release_late_receipt() {
+    struct CancelOnProof {
+        store: Arc<AsyncRecoveryStore>,
+        caller: Cx,
+        expire: bool,
+    }
+    impl TaskExecutionAuthorizer for CancelOnProof {
+        fn authorize(&self, _: &FinalTaskAccessMetadata) -> McpResult<()> {
+            if self.store.authorization_calls.load(Ordering::SeqCst) >= 2 {
+                if self.expire {
+                    *self.store.clock.lock().unwrap() += StdDuration::from_secs(60);
+                } else {
+                    self.caller
+                        .cancel_with(asupersync::types::CancelKind::User, None);
+                }
+            }
+            Ok(())
+        }
+    }
+    for expire in [false, true] {
+        run(|caller| async move {
+            let fixture = Fixture::new();
+            let snapshot = fixture.seed("renewal-policy-late-receipt", false);
+            let (guard, _handoff) = settlement_guard(&fixture, &caller, &snapshot, false).await;
+            fixture
+                .runtime
+                .install_execution_authorizer(Arc::new(CancelOnProof {
+                    store: Arc::clone(&fixture.store),
+                    caller: caller.clone(),
+                    expire,
+                }))
+                .unwrap();
+            fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+            let result = guard.renew_with_cx(&caller).await;
+            if expire {
+                assert!(!result.unwrap());
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(fixture.store.renewals.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.store.sync_calls.load(Ordering::SeqCst), 0);
+            fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+            drop(guard);
+            assert_eq!(fixture.store.inner.active_task_count(), 0);
+        });
+    }
+}
+
+#[test]
+fn async_dispatch_renewal_silent_authorization_observes_terminal_bounds() {
+    for after_renewal in [false, true] {
+        for terminal in 0..3 {
+            run(|caller| async move {
+                let host = Cx::current().unwrap();
+                let fixture = Fixture::with_store(AsyncRecoveryStore::with_limits(
+                    FinalTaskExecutionLimits::new(
+                        StdDuration::from_millis(100),
+                        StdDuration::from_millis(100),
+                        3,
+                    )
+                    .unwrap(),
+                ));
+                let snapshot = fixture.seed("renewal-authority-bound", false);
+                let (guard, _handoff) = settlement_guard(&fixture, &caller, &snapshot, false).await;
+                let original_budget = guard.execution_budget;
+                let gate = &fixture.store.authorization_gates[usize::from(after_renewal)];
+                gate.close();
+                fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+                let mut renewal = Box::pin(guard.renew_with_cx(&caller));
+                drive_until(&host, renewal.as_mut(), || {
+                    gate.waiter.lock().unwrap().is_some()
+                })
+                .await;
+                if terminal == 2 {
+                    drop(renewal);
+                } else {
+                    let trigger_caller = caller.clone();
+                    let trigger_store = Arc::clone(&fixture.store);
+                    let mut trigger = host
+                        .spawn(move |cx| async move {
+                            asupersync::time::sleep(cx.now(), StdDuration::from_millis(1)).await;
+                            if terminal == 0 {
+                                trigger_caller
+                                    .cancel_with(asupersync::types::CancelKind::User, None);
+                            } else {
+                                *trigger_store.clock.lock().unwrap() +=
+                                    StdDuration::from_millis(100);
+                            }
+                        })
+                        .unwrap();
+                    // Storage never wakes: only the renewal's independent
+                    // checkpoint can observe these terminal conditions.
+                    let result =
+                        asupersync::time::timeout(host.now(), StdDuration::from_secs(1), renewal)
+                            .await
+                            .unwrap();
+                    if terminal == 1 {
+                        assert!(!result.unwrap());
+                    } else {
+                        assert!(result.is_err());
+                    }
+                    trigger.join(&host).await.unwrap();
+                }
+                assert_eq!(gate.abandoned.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    fixture.store.renewals.load(Ordering::SeqCst),
+                    usize::from(after_renewal)
+                );
+                assert_eq!(
+                    fixture.store.async_renewal_calls.load(Ordering::SeqCst),
+                    usize::from(after_renewal)
+                );
+                assert_eq!(guard.execution_budget, original_budget);
+                assert_eq!(fixture.store.sync_calls.load(Ordering::SeqCst), 0);
+                fixture.store.forbid_sync.store(false, Ordering::SeqCst);
+                drop(guard);
+                assert_eq!(fixture.store.inner.active_task_count(), 0);
+            });
+        }
+    }
+}
+
+#[test]
+fn async_dispatch_renewal_retains_provider_wake_during_authorization() {
+    struct CountWake(AtomicUsize);
+    impl std::task::Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    run(|caller| async move {
+        let fixture = Fixture::new();
+        let snapshot = fixture.seed("renewal-authority-wake", false);
+        let (guard, _handoff) = settlement_guard(&fixture, &caller, &snapshot, false).await;
+        *fixture.store.renewal_pause_for.lock().unwrap() =
+            Some(snapshot.task().base().task_id.clone());
+        fixture.store.renewal_gate.close();
+        fixture.store.authorization_gates[1].close();
+        fixture.store.forbid_sync.store(true, Ordering::SeqCst);
+        let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut task = std::task::Context::from_waker(&waker);
+        let mut renewal = super::FinalTaskLeaseRenewal::default();
+        assert!(renewal.poll(&caller, &guard, &mut task).is_pending());
+        assert!(
+            fixture.store.authorization_gates[1]
+                .waiter
+                .lock()
+                .unwrap()
+                .is_some()
+        );
+        fixture.store.renewal_gate.release();
+        fixture.store.authorization_gates[1].release();
+        wake.0.store(0, Ordering::SeqCst);
+        assert!(renewal.poll(&caller, &guard, &mut task).is_pending());
+        assert!(
+            wake.0.load(Ordering::SeqCst) > 0,
+            "the renewal wake must outlive the suspended post-poll proof"
+        );
+        assert!(matches!(
+            renewal.poll(&caller, &guard, &mut task),
+            Poll::Ready(Ok(true))
+        ));
+        assert_eq!(fixture.store.async_renewal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.renewals.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.sync_calls.load(Ordering::SeqCst), 0);
+        fixture.store.forbid_sync.store(false, Ordering::SeqCst);
         drop(guard);
         fixture.assert_recoverable(&snapshot, false);
     });
