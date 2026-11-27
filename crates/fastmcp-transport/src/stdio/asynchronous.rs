@@ -53,8 +53,40 @@ const INTERRUPTED_RETRY_LIMIT: u32 = 64;
 #[derive(Default)]
 pub(super) struct ReadState {
     buffer: Vec<u8>,
+    // Bytes before start have already been consumed. Keep coalesced frames in
+    // place until the current read chunk has been exhausted.
+    start: usize,
     scanned: usize,
     eof: bool,
+}
+
+impl ReadState {
+    /// Releases buffered bytes without changing the observed EOF state.
+    fn clear_buffer(&mut self) {
+        self.buffer = Vec::new();
+        self.start = 0;
+        self.scanned = 0;
+    }
+
+    /// Advances past a complete line and returns the nonblank document, if any.
+    fn take_line(&mut self, end: usize, next: usize) -> Option<Box<[u8]>> {
+        let start = self.start;
+        let line = &self.buffer[start..end];
+        let blank = line.iter().all(u8::is_ascii_whitespace);
+        if start == 0 && line.len() >= READ_CHUNK_SIZE {
+            // Transfer a large frame's allocation to ingress, or release it
+            // for a blank line. Only the suffix from the final read moves.
+            let mut frame = std::mem::take(&mut self.buffer);
+            self.buffer = frame.split_off(next);
+            self.start = 0;
+            self.scanned = 0;
+            frame.truncate(end);
+            return (!blank).then(|| frame.into_boxed_slice());
+        }
+        self.start = next;
+        self.scanned = next;
+        (!blank).then(|| Box::<[u8]>::from(line))
+    }
 }
 
 #[derive(Default)]
@@ -234,8 +266,7 @@ async fn await_io<T>(
 fn fail_read<R>(reader: &mut Option<R>, state: &mut ReadState, terminal: &Terminal) {
     terminal.close();
     reader.take();
-    state.buffer = Vec::new();
-    state.scanned = 0;
+    state.clear_buffer();
 }
 
 async fn receive<R: AsyncRead + Unpin>(
@@ -250,8 +281,7 @@ async fn receive<R: AsyncRead + Unpin>(
     loop {
         if terminal.is_closed() || reader.is_none() {
             reader.take();
-            state.buffer = Vec::new();
-            state.scanned = 0;
+            state.clear_buffer();
             return Err(TransportError::Closed);
         }
         // No dequeue or buffer mutation on cancellation: a live next receive
@@ -263,25 +293,21 @@ async fn receive<R: AsyncRead + Unpin>(
             .map(|offset| state.scanned + offset);
         if newline.is_some() || state.eof {
             let consumed = newline.map_or(state.buffer.len(), |position| position + 1);
-            let mut length = newline.unwrap_or(state.buffer.len());
-            if length > 0 && state.buffer[length - 1] == b'\r' {
-                length -= 1;
+            let mut end = newline.unwrap_or(state.buffer.len());
+            if end > state.start && state.buffer[end - 1] == b'\r' {
+                end -= 1;
             }
+            let length = end - state.start;
             if length > codec.max_message_size() {
                 fail_read(reader, state, terminal);
                 return Err(TransportError::Codec(CodecError::MessageTooLarge(length)));
             }
             if length == 0 && state.eof && newline.is_none() {
+                state.clear_buffer();
                 reader.take();
                 return Err(TransportError::Closed);
             }
-            let mut source = std::mem::take(&mut state.buffer);
-            state.buffer = source.split_off(consumed);
-            state.scanned = 0;
-            source.truncate(length);
-            if source.iter().all(u8::is_ascii_whitespace) {
-                chunks += 1;
-            } else {
+            if let Some(source) = state.take_line(end, consumed) {
                 match ReceivedTransportFrame::admit(source) {
                     Ok(frame) => return Ok(frame),
                     Err(error) => {
@@ -306,7 +332,13 @@ async fn receive<R: AsyncRead + Unpin>(
                     }
                 }
             }
+            chunks += 1;
         } else {
+            // Move the unfinished suffix only when it needs another read.
+            if state.start != 0 {
+                state.buffer.drain(..state.start);
+                state.start = 0;
+            }
             state.scanned = state.buffer.len();
             // Retain at most one maximum-size document and its CRLF delimiter.
             // An oversized peer is rejected without draining its suffix.
@@ -588,7 +620,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncStdioTransport<R, W> {
         let result = close_writer(cx, &mut self.writer, &self.terminal).await;
         if self.terminal.is_closed() {
             self.reader.take();
-            self.asynchronous.buffer = Vec::new();
+            self.asynchronous.clear_buffer();
         }
         result
     }
@@ -637,7 +669,7 @@ impl<R> Drop for AsyncStdioRecvHalf<R> {
         // Preserve the clean-EOF half-close: an already-owned response may
         // still need to drain. Abandoning live ingress (including a retained
         // frame prefix) must not leave its sibling asleep on backpressure.
-        if !self.state.eof || !self.state.buffer.is_empty() {
+        if !self.state.eof || self.state.start < self.state.buffer.len() {
             self.terminal.close();
         }
     }
@@ -1015,7 +1047,7 @@ mod tests {
         let source = br#"{"jsonrpc":"2.0","method":"test/eof","id":84}"#;
         // Returning a final unterminated document already observes clean EOF;
         // a caller need not perform one extra receive before dropping ingress.
-        for receive_closed in [false, true] {
+        for closed_reads in 0..=2 {
             let output = Output::new(usize::MAX);
             let (mut reader, mut writer) =
                 AsyncStdioTransport::from_io(source.as_slice(), TestWriter(Arc::clone(&output)))
@@ -1025,7 +1057,7 @@ mod tests {
                 ready(reader.recv_with_source_async(&cx)).unwrap().source(),
                 source
             );
-            if receive_closed {
+            for _ in 0..closed_reads {
                 assert!(matches!(
                     ready(reader.recv_async(&cx)),
                     Err(TransportError::Closed)
@@ -1036,6 +1068,82 @@ mod tests {
             ready(writer.send_async(&cx, &request(85))).unwrap();
             assert_eq!(newline_count(&output.bytes.lock().unwrap()), 1);
             assert!(!output.dropped.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn async_stdio_dropping_drained_blank_eof_preserves_pending_egress() {
+        let transport = AsyncStdioTransport::from_io(b"\r".as_slice(), Vec::<u8>::new());
+        let (mut reader, mut writer) = transport.into_split();
+        let cx = Cx::for_testing();
+        assert!(matches!(
+            ready(reader.recv_async(&cx)),
+            Err(TransportError::Closed)
+        ));
+        drop(reader);
+        ready(writer.send_async(&cx, &request(85))).unwrap();
+    }
+
+    #[test]
+    fn async_stdio_coalesced_frames_keep_the_unread_suffix_in_place() {
+        let source = br#"{"jsonrpc":"2.0","id":1,"result":{"n":1e1}}"#;
+        let mut batch = Vec::new();
+        for _ in 0..32 {
+            batch.extend_from_slice(b"\r\n");
+            batch.extend_from_slice(source);
+            batch.extend_from_slice(b"\r\n");
+        }
+        assert!(batch.len() < READ_CHUNK_SIZE);
+        let transport = AsyncStdioTransport::from_io(batch.as_slice(), Vec::<u8>::new());
+        let (mut reader, _writer) = transport.into_split();
+        let cx = Cx::for_testing();
+
+        for consumed in 1..=32 {
+            let frame = ready(reader.recv_with_source_async(&cx)).unwrap();
+            assert_eq!(frame.source(), source);
+            // One shared read, with no move/reallocation of its unread tail.
+            assert_eq!(reader.state.buffer.as_slice(), batch.as_slice());
+            assert_eq!(reader.state.start, consumed * (source.len() + 4));
+        }
+        assert!(matches!(
+            ready(reader.recv_async(&cx)),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[test]
+    fn async_stdio_large_blank_line_releases_its_buffer_before_idle_wait() {
+        let feed = Arc::new(Feed::default());
+        let mut blank = vec![b' '; READ_CHUNK_SIZE * 4];
+        blank.push(b'\n');
+        feed.push(&blank);
+        let mut transport =
+            AsyncStdioTransport::from_io(FeedReader(feed), Vec::<u8>::new());
+        let cx = Cx::for_testing();
+        {
+            let mut receive = pin!(transport.recv_async(&cx));
+            assert!(poll(receive.as_mut(), Waker::noop()).is_pending());
+        }
+        assert!(transport.asynchronous.buffer.capacity() <= READ_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn async_stdio_compacts_partial_lines_before_applying_the_wire_limit() {
+        let first = br#"{"jsonrpc":"2.0","id":1,"result":true}"#;
+        let prefix = br#"{"jsonrpc":"2.0","id":2,"result":""#;
+        let mut large = prefix.to_vec();
+        large.resize(READ_CHUNK_SIZE + 17, b'x');
+        large.extend_from_slice(b"\"}");
+        let bytes = [first.as_slice(), b"\n", &large, b"\r\n", first, b"\n"].concat();
+        let mut transport = AsyncStdioTransport::from_io(bytes.as_slice(), Vec::<u8>::new())
+            .with_max_message_size(large.len())
+            .unwrap();
+        let cx = Cx::for_testing();
+        for expected in [first.as_slice(), &large, first] {
+            assert_eq!(
+                ready(transport.recv_with_source_async(&cx)).unwrap().source(),
+                expected
+            );
         }
     }
 
