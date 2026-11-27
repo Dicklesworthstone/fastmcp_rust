@@ -100,7 +100,7 @@ impl FinalTaskOperation {
         self.is_registered() && ctx.is_tool_enabled(&self.tool_name)
     }
 
-    fn is_registered(&self) -> bool {
+    pub(super) fn is_registered(&self) -> bool {
         self.process.verify().is_ok() && self.registration.strong_count() != 0
     }
 
