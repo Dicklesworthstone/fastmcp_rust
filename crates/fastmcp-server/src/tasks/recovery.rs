@@ -273,36 +273,54 @@ impl FinalTaskRuntime {
             let caller = Cx::current()
                 .ok_or_else(|| McpError::internal_error("Task read has no installed caller"))?;
             let ctx = McpContext::new(caller, 0);
-            ctx.checkpoint()?;
-            let live = || ctx.ensure_live().map_err(|_| McpError::request_cancelled());
-            let stored = control::await_control_read(
-                &ctx,
-                self.store.get_task_snapshot_with_cx(ctx.cx(), task_id),
-                live,
-            )
-            .await?
-            .ok_or_else(|| McpError::invalid_params("Task not found"))?;
-            let mut snapshot = self.validate_loaded_task_snapshot(stored, Some(task_id))?;
-            if matches!(snapshot.task(), FinalTask::Working(_) | FinalTask::InputRequired { .. }) {
-                live()?;
-                let expired = control::await_control_read(
-                    &ctx,
-                    self.store.expire_task_execution_if_current_with_cx(ctx.cx(), &snapshot),
-                    live,
-                )
-                .await?;
-                if let Some(committed) = expired {
-                    snapshot = self.validate_execution_expiry_receipt(&snapshot, committed)?;
-                    self.emit_embedding_commit(&ctx, &snapshot).await;
-                }
-            }
-            live()?;
+            let snapshot = self.load_application_task_snapshot(&ctx, task_id).await?;
             Ok(fastmcp_protocol::CompleteTaskResult {
                 task: snapshot.into_task(),
                 meta: None,
                 additional: BTreeMap::new(),
             })
         })
+    }
+
+    pub(super) async fn load_application_task_snapshot(
+        &self,
+        ctx: &McpContext,
+        task_id: &FinalTaskId,
+    ) -> McpResult<FinalTaskSnapshot> {
+        ctx.checkpoint()?;
+        let live = || ctx.ensure_live().map_err(|_| McpError::request_cancelled());
+        let stored = control::await_control_read(
+            ctx,
+            self.store.get_task_snapshot_with_cx(ctx.cx(), task_id),
+            live,
+        )
+        .await?
+        .ok_or_else(|| McpError::invalid_params("Task not found"))?;
+        let snapshot = self.validate_loaded_task_snapshot(stored, Some(task_id))?;
+        self.expire_application_task_snapshot(ctx, snapshot).await
+    }
+
+    pub(super) async fn expire_application_task_snapshot(
+        &self,
+        ctx: &McpContext,
+        mut snapshot: FinalTaskSnapshot,
+    ) -> McpResult<FinalTaskSnapshot> {
+        let live = || ctx.ensure_live().map_err(|_| McpError::request_cancelled());
+        if matches!(snapshot.task(), FinalTask::Working(_) | FinalTask::InputRequired { .. }) {
+            live()?;
+            let expired = control::await_control_read(
+                ctx,
+                self.store.expire_task_execution_if_current_with_cx(ctx.cx(), &snapshot),
+                live,
+            )
+            .await?;
+            if let Some(committed) = expired {
+                snapshot = self.validate_execution_expiry_receipt(&snapshot, committed)?;
+                self.emit_embedding_commit(ctx, &snapshot).await;
+            }
+        }
+        live()?;
+        Ok(snapshot)
     }
 
     pub(super) fn recover_initial_work_excluding_with_cx<'a>(

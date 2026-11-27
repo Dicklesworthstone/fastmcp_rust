@@ -9,6 +9,43 @@ use super::*;
 use crate::extensions::TaskControlReceipt;
 use std::task::Poll;
 
+/// Caller-owned admission for one trusted application's atomic Task control.
+///
+/// This carries no incoming-request authorization. The application already
+/// owns its runtime, including protected Tasks. Stores retain the exact
+/// expected snapshot and call [`Self::checkpoint_before_write`] immediately
+/// before the first irreversible write after any suspension. That checkpoint
+/// transfers settlement responsibility to the original storage operation.
+/// The value cannot be constructed, cloned, or retained by application code.
+pub struct FinalTaskApplicationControlAdmission<'a> {
+    ctx: &'a McpContext,
+    expected: &'a FinalTaskSnapshot,
+    receipt: &'a TaskControlReceipt,
+}
+
+impl<'a> FinalTaskApplicationControlAdmission<'a> {
+    /// Returns the effective application caller for I/O and cancellation.
+    #[must_use]
+    pub fn context(&self) -> &'a McpContext {
+        self.ctx
+    }
+
+    /// Returns the exact generation and immutable authority to compare.
+    #[must_use]
+    pub fn expected(&self) -> &'a FinalTaskSnapshot {
+        self.expected
+    }
+
+    /// Rejects a cancelled or expired caller before admitting a write.
+    pub fn checkpoint_before_write(&self) -> McpResult<()> {
+        self.ctx
+            .ensure_live()
+            .map_err(|_| McpError::request_cancelled())?;
+        self.receipt.admit_write();
+        Ok(())
+    }
+}
+
 /// Request-owned authority for one exact terminal Task reclamation.
 ///
 /// The framework creates this admission only after authorizing the current
@@ -69,6 +106,227 @@ impl<'a> FinalTaskRetentionAdmission<'a> {
 }
 
 impl FinalTaskRuntime {
+    /// Accepts matching input through a trusted application's asynchronous store.
+    ///
+    /// Like [`Self::update_task`], this may control protected Tasks and is not
+    /// an incoming-request authorization API. It runs on the caller's existing
+    /// context without entering a service or requiring blocking-pool authority.
+    /// Cancellation releases a suspended prewrite wait; after write admission
+    /// the original receipt must settle. Validated committed input is accepted
+    /// even if cancellation or an observer failure arrives with that receipt.
+    pub fn update_task_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+        input_responses: &'a FinalTaskInputResponses,
+    ) -> impl Future<Output = McpResult<UpdateTaskResult>> + Send + 'a {
+        CallerContextFuture::new(cx, async move {
+            let caller = Cx::current()
+                .ok_or_else(|| McpError::internal_error("Task update has no installed caller"))?;
+            let ctx = McpContext::new(caller, 0);
+            let current = self.load_application_task_snapshot(&ctx, task_id).await?;
+            let Some((task, outstanding_responses)) =
+                prepare_task_input_update(&current, input_responses)?
+            else {
+                return Ok(UpdateTaskResult::default());
+            };
+            let notification = final_task_notification(&task);
+            self.validate_task_transition_write(&current, &task, &notification)?;
+            ctx.ensure_live()?;
+            let receipt = TaskControlReceipt::default();
+            let admission = FinalTaskApplicationControlAdmission {
+                ctx: &ctx,
+                expected: &current,
+                receipt: &receipt,
+            };
+            let pending = self
+                .store
+                .replace_task_and_append_input_for_application_with_context(
+                    admission,
+                    task.clone(),
+                    notification,
+                    outstanding_responses,
+                );
+            let committed = settle_application_control(&ctx, &receipt, pending)
+                .await?
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "Task state changed before the transition could be recorded",
+                    )
+                })?;
+            let committed = receipt.resolve_liveness(
+                self.validate_committed_transition(&current, &task, committed),
+                None,
+            )?;
+            if matches!(task, FinalTask::Working(_)) {
+                self.signal_task_service(task_id.clone());
+            }
+            self.emit_embedding_commit(&ctx, &committed).await;
+            Ok(UpdateTaskResult::default())
+        })
+    }
+
+    /// Records cooperative cancellation through a trusted asynchronous store.
+    ///
+    /// The original atomic receipt and retained cancellation intent are checked
+    /// before acknowledging success. A worker may consume intent only with a
+    /// newer terminal cancellation. If cancellation interrupts post-write
+    /// verification, the result explicitly requires state reconciliation;
+    /// it never suggests that the committed request was rolled back.
+    /// This controls the application's Tasks and must not authorize wire calls.
+    pub fn cancel_task_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+    ) -> impl Future<Output = McpResult<FinalCancelTaskResult>> + Send + 'a {
+        CallerContextFuture::new(cx, async move {
+            let caller = Cx::current().ok_or_else(|| {
+                McpError::internal_error("Task cancellation has no installed caller")
+            })?;
+            let ctx = McpContext::new(caller, 0);
+            let current = self.load_application_task_snapshot(&ctx, task_id).await?;
+            if final_task_is_terminal(current.task()) {
+                return Err(McpError::invalid_params(
+                    "terminal tasks cannot be cancelled",
+                ));
+            }
+            let task = FinalTask::Cancelled(transition_terminal_final_task_base(
+                current.task().base().clone(),
+                FinalTaskStatus::Cancelled,
+                None,
+            )?);
+            let notification = final_task_notification(&task);
+            self.validate_task_transition_write(&current, &task, &notification)?;
+            ctx.ensure_live()?;
+            let receipt = TaskControlReceipt::default();
+            let admission = FinalTaskApplicationControlAdmission {
+                ctx: &ctx,
+                expected: &current,
+                receipt: &receipt,
+            };
+            let pending = self
+                .store
+                .request_cancellation_and_clear_input_for_application_with_context(
+                    admission,
+                    task.clone(),
+                    notification,
+                );
+            let committed = settle_application_control(&ctx, &receipt, pending)
+                .await?
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "Task state changed before cancellation could be recorded",
+                    )
+                })?;
+            let committed = receipt.resolve_liveness(
+                self.validate_loaded_task_snapshot(committed, Some(task_id)),
+                None,
+            )?;
+            let terminal = receipt.resolve_liveness(
+                validate_control_cancellation_receipt(&current, &task, &committed),
+                None,
+            )?;
+            self.signal_task_service_cancellation(task_id.clone());
+            let publish = receipt.resolve_liveness(
+                self.verify_application_cancellation(&ctx, &committed, terminal)
+                    .await,
+                None,
+            )?;
+            if publish {
+                self.emit_embedding_commit(&ctx, &committed).await;
+            }
+            Ok(FinalCancelTaskResult::default())
+        })
+    }
+
+    /// Reads cancellation intent on a trusted application's existing caller.
+    ///
+    /// A suspended storage read wakes on caller cancellation or deadline expiry
+    /// without waiting for the provider and never returns a late intent value.
+    pub fn is_cancellation_requested_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+    ) -> impl Future<Output = McpResult<bool>> + Send + 'a {
+        CallerContextFuture::new(cx, async move {
+            let caller = Cx::current().ok_or_else(|| {
+                McpError::internal_error("Task intent read has no installed caller")
+            })?;
+            let ctx = McpContext::new(caller, 0);
+            ctx.checkpoint()?;
+            await_control_read(
+                &ctx,
+                self.store
+                    .is_cancellation_requested_with_cx(ctx.cx(), task_id),
+                || ctx.ensure_live().map_err(|_| McpError::request_cancelled()),
+            )
+            .await
+        })
+    }
+
+    async fn verify_application_cancellation(
+        &self,
+        ctx: &McpContext,
+        returned: &FinalTaskSnapshot,
+        terminal: bool,
+    ) -> McpResult<bool> {
+        let task_id = &returned.task().base().task_id;
+        // Read intent before the snapshot: a worker can consume it between
+        // reads only by committing the newer terminal cancellation below.
+        let intent = !terminal
+            && await_control_read(
+                ctx,
+                self.store
+                    .is_cancellation_requested_with_cx(ctx.cx(), task_id),
+                || ctx.ensure_live().map_err(|_| McpError::request_cancelled()),
+            )
+            .await?;
+        let current = await_control_read(
+            ctx,
+            self.store.get_task_snapshot_with_cx(ctx.cx(), task_id),
+            || ctx.ensure_live().map_err(|_| McpError::request_cancelled()),
+        )
+        .await?
+        .ok_or_else(|| McpError::invalid_params("Task not found"))?;
+        let current = self.validate_loaded_task_snapshot(current, Some(task_id))?;
+        if current.authenticated_principal() != returned.authenticated_principal()
+            || current.creation_generation() != returned.creation_generation()
+            || current.original_operation() != returned.original_operation()
+            || current.generation() < returned.generation()
+        {
+            return Err(McpError::internal_error(
+                "Final task store changed the task principal",
+            ));
+        }
+        // Only the original incarnation may be expired or published. A raw
+        // readback must pass these identity fences before it can cause writes.
+        let current = self.expire_application_task_snapshot(ctx, current).await?;
+        if current.generation() == returned.generation()
+            && final_tasks_match_exactly(current.task(), returned.task())?
+        {
+            if !terminal && !intent {
+                return Err(McpError::internal_error(
+                    "Final task store did not retain the active cancellation intent",
+                ));
+            }
+            return Ok(terminal);
+        }
+        if terminal
+            || current.generation() <= returned.generation()
+            || !matches!(current.task(), FinalTask::Cancelled(_))
+        {
+            return Err(McpError::internal_error(
+                "Final task store returned cancellation data that is not durably retained",
+            ));
+        }
+        validate_final_task_transition(returned.task(), current.task()).map_err(|_| {
+            McpError::internal_error(
+                "Final task store returned an invalid cooperative cancellation transition",
+            )
+        })?;
+        Ok(false)
+    }
+
     /// Inspects one terminal Task through the caller-owned asynchronous store.
     ///
     /// Administrative authority is checked before storage is invoked, on every
@@ -756,6 +1014,37 @@ impl FinalTaskRuntime {
             );
         }
     }
+}
+
+async fn settle_application_control(
+    ctx: &McpContext,
+    receipt: &TaskControlReceipt,
+    future: FinalTaskStoreFuture<'_, Option<FinalTaskSnapshot>>,
+) -> McpResult<Option<FinalTaskSnapshot>> {
+    let outcome = await_admitted_write(
+        ctx,
+        future,
+        || receipt.has_admitted_write(),
+        || ctx.ensure_live().map_err(|_| McpError::request_cancelled()),
+    )
+    .await;
+    let outcome = if receipt.has_admitted_write() {
+        receipt.resolve_liveness(outcome, None)?
+    } else {
+        let outcome = outcome?;
+        if outcome.is_some() {
+            return Err(McpError::internal_error(
+                "Task control backend returned a receipt without admitting the write",
+            ));
+        }
+        outcome
+    };
+    if outcome.is_none() {
+        receipt.no_commit();
+        ctx.ensure_live()
+            .map_err(|_| McpError::request_cancelled())?;
+    }
+    Ok(outcome)
 }
 
 /// A read may be abandoned when its request loses authority. Arm cancellation

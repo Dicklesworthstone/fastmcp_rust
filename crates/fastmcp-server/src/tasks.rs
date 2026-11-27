@@ -53,7 +53,7 @@ pub use authorization::{
     FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
     TaskExecutionAuthorizer,
 };
-pub use control::FinalTaskRetentionAdmission;
+pub use control::{FinalTaskApplicationControlAdmission, FinalTaskRetentionAdmission};
 pub use creation::FinalTaskCreationAdmission;
 pub use worker::FinalTaskWorkerAdmission;
 
@@ -1705,6 +1705,68 @@ pub trait FinalTaskStore: Send + Sync {
         Box::pin(async move {
             ctx.checkpoint()
                 .map_err(|_| McpError::request_cancelled())?;
+            self.is_cancellation_requested(task_id)
+        })
+    }
+
+    /// Atomically accepts input from a trusted embedding application.
+    ///
+    /// This is the application counterpart of the request-bound input hook.
+    /// Preserve the exact snapshot, original authority, notification and input
+    /// history under the same atomic comparison. Call the admission checkpoint
+    /// immediately before the first write, including after any suspension.
+    /// Once admitted, settle the original receipt; cancellation cannot prove
+    /// that an uncertain write was rolled back.
+    fn replace_task_and_append_input_for_application_with_context<'a>(
+        &'a self,
+        admission: FinalTaskApplicationControlAdmission<'a>,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+        input_responses: FinalTaskInputResponses,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            admission.checkpoint_before_write()?;
+            self.replace_task_and_append_input_if_current(
+                admission.expected(),
+                task,
+                notification,
+                input_responses,
+            )
+        })
+    }
+
+    /// Atomically records cancellation from a trusted embedding application.
+    ///
+    /// The returned snapshot must satisfy the exact same cancellation receipt
+    /// contract as the request-bound operation. Check the admission immediately
+    /// before writing and retain custody of a possibly committed write until
+    /// its original receipt settles. This grants no incoming-request authority.
+    fn request_cancellation_and_clear_input_for_application_with_context<'a>(
+        &'a self,
+        admission: FinalTaskApplicationControlAdmission<'a>,
+        cancelled_task: FinalTask,
+        cancelled_notification: FinalTaskStatusNotification,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            admission.checkpoint_before_write()?;
+            self.request_cancellation_and_clear_input_if_current(
+                admission.expected(),
+                cancelled_task,
+                cancelled_notification,
+            )
+        })
+    }
+
+    /// Reads retained cancellation intent on a trusted application's caller.
+    /// The default invokes bounded synchronous storage; I/O-backed stores may
+    /// suspend without blocking the application or acquiring service authority.
+    fn is_cancellation_requested_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+    ) -> FinalTaskStoreFuture<'a, bool> {
+        Box::pin(async move {
+            cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
             self.is_cancellation_requested(task_id)
         })
     }
@@ -9356,6 +9418,7 @@ impl FinalTaskRuntime {
 
     /// Applies matching typed input responses and returns the empty final acknowledgement.
     /// This is a trusted application mutation, not a request authorization API.
+    /// Use [`Self::update_task_with_cx`] for caller-owned asynchronous storage.
     pub fn update_task(
         &self,
         task_id: &FinalTaskId,
@@ -9381,6 +9444,7 @@ impl FinalTaskRuntime {
 
     /// Durably acknowledges cooperative `tasks/cancel` intent.
     /// This is a trusted application mutation, not a request authorization API.
+    /// Use [`Self::cancel_task_with_cx`] for caller-owned asynchronous storage.
     pub fn cancel_task(&self, task_id: &FinalTaskId) -> McpResult<FinalCancelTaskResult> {
         let current = self.load_task_snapshot(task_id)?;
         self.cancel_task_snapshot(&current)
@@ -9527,6 +9591,7 @@ impl FinalTaskRuntime {
     }
 
     /// Returns durable cancellation intent for a caller-owned task worker.
+    /// Use [`Self::is_cancellation_requested_with_cx`] for asynchronous storage.
     pub fn is_cancellation_requested(&self, task_id: &FinalTaskId) -> McpResult<bool> {
         self.store.is_cancellation_requested(task_id)
     }

@@ -210,6 +210,7 @@ use session::{
 pub use tasks::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
     FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskAccessMetadata,
+    FinalTaskApplicationControlAdmission,
     FinalTaskCreationAdmission, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
     FinalTaskInitialWork, FinalTaskInitialWorkClaim, FinalTaskNotificationEmitter,
     FinalTaskOperation, FinalTaskRetentionAdmission, FinalTaskRetentionAuthority,

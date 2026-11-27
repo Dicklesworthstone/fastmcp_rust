@@ -54,6 +54,8 @@ struct AsyncControlStore {
     write_gate: Gate,
     audit_gate: Gate,
     retention_receipt_gate: Gate,
+    application_receipt_gate: Gate,
+    application_intent_gate: Gate,
     metadata_calls: AtomicUsize,
     payload_calls: AtomicUsize,
     update_calls: AtomicUsize,
@@ -74,6 +76,11 @@ struct AsyncControlStore {
     audit_override: Mutex<Option<TaskRetentionAuditPage>>,
     substitute_retention_receipt: AtomicBool,
     fail_reclamation_after_write: AtomicBool,
+    omit_application_admission: AtomicBool,
+    substitute_application_receipt: AtomicBool,
+    fail_application_after_write: AtomicBool,
+    application_expiry_calls: AtomicUsize,
+    application_readback: Mutex<Option<FinalTaskSnapshot>>,
 }
 
 impl AsyncControlStore {
@@ -85,6 +92,8 @@ impl AsyncControlStore {
             write_gate: Gate::new(),
             audit_gate: Gate::new(),
             retention_receipt_gate: Gate::new(),
+            application_receipt_gate: Gate::new(),
+            application_intent_gate: Gate::new(),
             metadata_calls: AtomicUsize::new(0),
             payload_calls: AtomicUsize::new(0),
             update_calls: AtomicUsize::new(0),
@@ -105,6 +114,11 @@ impl AsyncControlStore {
             audit_override: Mutex::new(None),
             substitute_retention_receipt: AtomicBool::new(false),
             fail_reclamation_after_write: AtomicBool::new(false),
+            omit_application_admission: AtomicBool::new(false),
+            substitute_application_receipt: AtomicBool::new(false),
+            fail_application_after_write: AtomicBool::new(false),
+            application_expiry_calls: AtomicUsize::new(0),
+            application_readback: Mutex::new(None),
         }
     }
 
@@ -126,6 +140,141 @@ impl AsyncControlStore {
 }
 
 impl FinalTaskStore for AsyncControlStore {
+    fn get_task_snapshot_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        Box::pin(async move {
+            if let Some(snapshot) = self.application_readback.lock().unwrap().take() {
+                return Ok(Some(snapshot));
+            }
+            let ctx = McpContext::new(cx.clone(), 0);
+            self.get_task_snapshot_with_context(&ctx, task_id).await
+        })
+    }
+
+    fn get_task_access_metadata_with_cx<'a>(
+        &'a self,
+        cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskAccessMetadata>> {
+        Box::pin(async move {
+            let ctx = McpContext::new(cx.clone(), 0);
+            self.get_task_access_metadata_with_context(&ctx, task_id)
+                .await
+        })
+    }
+
+    fn expire_task_execution_if_current_with_cx<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        expected: &'a FinalTaskSnapshot,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        self.application_expiry_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { self.inner.expire_task_execution_if_current(expected) })
+    }
+
+    fn replace_task_and_append_input_for_application_with_context<'a>(
+        &'a self,
+        admission: FinalTaskApplicationControlAdmission<'a>,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+        input_responses: FinalTaskInputResponses,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        self.update_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            self.write_gate.wait().await;
+            if self.omit_application_admission.load(Ordering::SeqCst) {
+                return Ok(Some(admission.expected().clone()));
+            }
+            admission.checkpoint_before_write()?;
+            let committed = self.inner.replace_task_and_append_input_if_current(
+                admission.expected(),
+                task,
+                notification,
+                input_responses,
+            )?;
+            if committed.is_some() {
+                self.committed_writes.fetch_add(1, Ordering::SeqCst);
+                self.after_write();
+            }
+            self.application_receipt_gate.wait().await;
+            if self.fail_application_after_write.load(Ordering::SeqCst) {
+                return Err(McpError::internal_error(
+                    "test backend lost its commit acknowledgement",
+                ));
+            }
+            if self.cancel_write_with_error.load(Ordering::SeqCst) {
+                return Err(McpError::request_cancelled());
+            }
+            Ok(committed.map(|snapshot| {
+                if self.substitute_application_receipt.load(Ordering::SeqCst) {
+                    snapshot.with_authenticated_principal(Some(Sha256Digest::from_bytes([98; 32])))
+                } else {
+                    snapshot
+                }
+            }))
+        })
+    }
+
+    fn request_cancellation_and_clear_input_for_application_with_context<'a>(
+        &'a self,
+        admission: FinalTaskApplicationControlAdmission<'a>,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+    ) -> FinalTaskStoreFuture<'a, Option<FinalTaskSnapshot>> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            self.write_gate.wait().await;
+            if self.omit_application_admission.load(Ordering::SeqCst) {
+                return Ok(Some(admission.expected().clone()));
+            }
+            admission.checkpoint_before_write()?;
+            if self.lie_about_cancellation.load(Ordering::SeqCst) {
+                return Ok(Some(admission.expected().clone()));
+            }
+            let committed = self.inner.request_cancellation_and_clear_input_if_current(
+                admission.expected(),
+                task,
+                notification,
+            )?;
+            if committed.is_some() {
+                self.committed_writes.fetch_add(1, Ordering::SeqCst);
+                self.after_write();
+            }
+            self.application_receipt_gate.wait().await;
+            if self.fail_application_after_write.load(Ordering::SeqCst) {
+                return Err(McpError::internal_error(
+                    "test backend lost its commit acknowledgement",
+                ));
+            }
+            Ok(committed.map(|snapshot| {
+                if self.substitute_application_receipt.load(Ordering::SeqCst) {
+                    snapshot.with_authenticated_principal(Some(Sha256Digest::from_bytes([98; 32])))
+                } else {
+                    snapshot
+                }
+            }))
+        })
+    }
+
+    fn is_cancellation_requested_with_cx<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        task_id: &'a FinalTaskId,
+    ) -> FinalTaskStoreFuture<'a, bool> {
+        self.intent_reads.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            self.application_intent_gate.wait().await;
+            let hook = self.before_intent_read.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            self.inner.is_cancellation_requested(task_id)
+        })
+    }
+
     fn retention_administration_policy(&self) -> McpResult<TaskRetentionPolicy> {
         self.inner.retention_administration_policy()
     }
@@ -573,7 +722,7 @@ fn roots_response() -> FinalTaskInputResponses {
     serde_json::from_value(serde_json::json!({"roots":{"roots":[]}})).unwrap()
 }
 
-fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+fn poll_once<F: Future + ?Sized>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(Waker::noop()))
 }
 
@@ -1010,6 +1159,445 @@ fn async_control_update_and_terminal_cancel_publish_through_async_hooks() {
     assert!(matches!(fixture.snapshot().task(), FinalTask::Cancelled(_)));
     assert_eq!(fixture.notifications.load(Ordering::SeqCst), 2);
     assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 2);
+    fixture.store.assert_async_only();
+}
+
+fn application_control<'a>(
+    fixture: &'a Fixture,
+    responses: &'a FinalTaskInputResponses,
+    cancel: bool,
+) -> Pin<Box<dyn Future<Output = McpResult<()>> + Send + 'a>> {
+    Box::pin(async move {
+        if cancel {
+            fixture
+                .runtime
+                .cancel_task_with_cx(fixture.ctx.cx(), &fixture.task_id)
+                .await
+                .map(|_| ())
+        } else {
+            fixture
+                .runtime
+                .update_task_with_cx(fixture.ctx.cx(), &fixture.task_id, responses)
+                .await
+                .map(|_| ())
+        }
+    })
+}
+
+#[test]
+fn application_async_controls_preserve_protected_task_authority_and_publish() {
+    let fixture = Fixture::new(true);
+    let before = fixture.snapshot();
+    let responses = roots_response();
+    let mut update = Box::pin(fixture.runtime.update_task_with_cx(
+        fixture.ctx.cx(),
+        &fixture.task_id,
+        &responses,
+    ));
+    ready(poll_once(update.as_mut())).unwrap();
+    let after = fixture.snapshot();
+    assert!(matches!(after.task(), FinalTask::Working(_)));
+    assert_eq!(
+        after.authenticated_principal(),
+        before.authenticated_principal()
+    );
+    assert_eq!(after.original_operation(), before.original_operation());
+    assert_eq!(after.creation_generation(), before.creation_generation());
+    assert_eq!(fixture.notifications.load(Ordering::SeqCst), 1);
+    let mut cancel = Box::pin(
+        fixture
+            .runtime
+            .cancel_task_with_cx(fixture.ctx.cx(), &fixture.task_id),
+    );
+    ready(poll_once(cancel.as_mut())).unwrap();
+    assert!(matches!(fixture.snapshot().task(), FinalTask::Cancelled(_)));
+    assert_eq!(fixture.notifications.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 2);
+    fixture.store.assert_async_only();
+}
+
+#[test]
+fn application_async_controls_cancel_silent_prewrite_waits_without_mutation() {
+    for cancel in [false, true] {
+        for wait_on_payload in [false, true] {
+            let fixture = Fixture::new(true);
+            let before = fixture.snapshot();
+            if wait_on_payload {
+                fixture.store.payload_gate.close();
+            } else {
+                fixture.store.write_gate.close();
+            }
+            let responses = roots_response();
+            let mut operation = application_control(&fixture, &responses, cancel);
+            let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut poll = Context::from_waker(&waker);
+            assert!(operation.as_mut().poll(&mut poll).is_pending());
+            fixture
+                .ctx
+                .cx()
+                .cancel_with(asupersync::types::CancelKind::User, None);
+            assert!(wakes.0.load(Ordering::SeqCst) > 0);
+            let error = ready(operation.as_mut().poll(&mut poll)).unwrap_err();
+            assert_eq!(error.code, McpError::request_cancelled().code);
+            assert_eq!(fixture.snapshot().generation(), before.generation());
+            assert!(final_tasks_match_exactly(fixture.snapshot().task(), before.task()).unwrap());
+            assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
+            fixture.store.assert_async_only();
+        }
+    }
+}
+
+#[test]
+fn application_async_control_settles_the_original_admitted_receipt_after_cancellation() {
+    for cancel in [false, true] {
+        let fixture = Fixture::new(true);
+        fixture.store.application_receipt_gate.close();
+        let responses = roots_response();
+        let mut operation = application_control(&fixture, &responses, cancel);
+        assert!(poll_once(operation.as_mut()).is_pending());
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+        fixture
+            .ctx
+            .cx()
+            .cancel_with(asupersync::types::CancelKind::User, None);
+        assert!(
+            poll_once(operation.as_mut()).is_pending(),
+            "admitted storage retains receipt custody"
+        );
+        fixture.store.application_receipt_gate.release();
+        let result = ready(poll_once(operation.as_mut()));
+        if cancel {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, McpError::internal_error("").code);
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({"reason":"TaskStateUnknown"}))
+            );
+            assert!(matches!(fixture.snapshot().task(), FinalTask::Cancelled(_)));
+        } else {
+            result.expect("the exact committed input receipt survives cancellation");
+            fixture.assert_accepted_roots();
+        }
+        assert_eq!(
+            fixture.store.update_calls.load(Ordering::SeqCst),
+            usize::from(!cancel)
+        );
+        assert_eq!(
+            fixture.store.cancel_calls.load(Ordering::SeqCst),
+            usize::from(cancel)
+        );
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
+        fixture.store.assert_async_only();
+    }
+}
+
+#[test]
+fn application_async_controls_reject_unadmitted_or_substituted_commit_receipts() {
+    for cancel in [false, true] {
+        for unadmitted in [false, true] {
+            let fixture = Fixture::new(true);
+            let before = fixture.snapshot();
+            fixture
+                .store
+                .omit_application_admission
+                .store(unadmitted, Ordering::SeqCst);
+            fixture
+                .store
+                .substitute_application_receipt
+                .store(!unadmitted, Ordering::SeqCst);
+            let responses = roots_response();
+            let mut operation = application_control(&fixture, &responses, cancel);
+            let error = ready(poll_once(operation.as_mut())).unwrap_err();
+            assert_eq!(error.code, McpError::internal_error("").code);
+            assert_eq!(
+                fixture.store.committed_writes.load(Ordering::SeqCst),
+                usize::from(!unadmitted)
+            );
+            if unadmitted {
+                assert!(error.message.contains("without admitting the write"));
+                assert_eq!(fixture.snapshot().generation(), before.generation());
+            }
+            assert_eq!(
+                fixture.snapshot().authenticated_principal(),
+                before.authenticated_principal()
+            );
+            assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
+            fixture.store.assert_async_only();
+        }
+    }
+}
+
+#[test]
+fn application_async_control_rejects_unmatched_input_before_writing() {
+    let fixture = Fixture::new(true);
+    let before = fixture.snapshot();
+    let responses = serde_json::from_value(serde_json::json!({
+        "roots": {
+            "role":"assistant", "model":"final-model",
+            "content":{"type":"text","text":"wrong response kind"}
+        }
+    }))
+    .unwrap();
+    let mut operation = Box::pin(fixture.runtime.update_task_with_cx(
+        fixture.ctx.cx(),
+        &fixture.task_id,
+        &responses,
+    ));
+    assert_eq!(
+        ready(poll_once(operation.as_mut())).unwrap_err().code,
+        McpError::invalid_params("").code
+    );
+    assert_eq!(fixture.snapshot().generation(), before.generation());
+    assert_eq!(fixture.store.update_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
+    fixture.store.assert_async_only();
+}
+
+#[test]
+fn application_async_control_ignores_unknown_input_keys_without_mutation() {
+    let fixture = Fixture::new(true);
+    let before = fixture.snapshot();
+    let responses = serde_json::from_value(serde_json::json!({"other":{"roots":[]}})).unwrap();
+    let mut operation = Box::pin(fixture.runtime.update_task_with_cx(
+        fixture.ctx.cx(),
+        &fixture.task_id,
+        &responses,
+    ));
+    ready(poll_once(operation.as_mut())).unwrap();
+    assert_eq!(fixture.snapshot().generation(), before.generation());
+    assert_eq!(fixture.store.update_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
+    fixture.store.assert_async_only();
+}
+
+#[test]
+fn application_async_control_generic_failure_after_commit_requires_reconciliation() {
+    for cancel in [false, true] {
+        let fixture = Fixture::new(true);
+        fixture
+            .store
+            .fail_application_after_write
+            .store(true, Ordering::SeqCst);
+        let responses = roots_response();
+        let mut operation = application_control(&fixture, &responses, cancel);
+        let error = ready(poll_once(operation.as_mut())).unwrap_err();
+        assert!(
+            fixture.ctx.ensure_live().is_ok(),
+            "the provider failed with a live caller"
+        );
+        assert_eq!(error.code, McpError::internal_error("").code);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"reason":"TaskStateUnknown"}))
+        );
+        assert!(
+            error
+                .message
+                .contains("Reconcile Task state before retrying")
+        );
+        assert!(
+            !error.message.contains("test backend"),
+            "provider text remains masked"
+        );
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+        if cancel {
+            assert!(matches!(fixture.snapshot().task(), FinalTask::Cancelled(_)));
+        } else {
+            fixture.assert_accepted_roots();
+        }
+        assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
+        fixture.store.assert_async_only();
+    }
+}
+
+#[test]
+fn application_async_cancel_fences_readback_incarnation_before_execution_expiry() {
+    let now = Arc::new(Mutex::new(Instant::now()));
+    let clock = Arc::clone(&now);
+    let mut store = AsyncControlStore::new();
+    store.inner = InMemoryFinalTaskStore::with_clock_payload_and_execution_limits(
+        4,
+        InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,
+        FinalTaskExecutionLimits::new(
+            StdDuration::from_millis(100),
+            StdDuration::from_millis(100),
+            3,
+        )
+        .unwrap(),
+        Arc::new(move || *clock.lock().unwrap()),
+    )
+    .unwrap();
+    let fixture = Fixture::with_store(false, Arc::new(store));
+    fixture.elect_worker();
+    let expected = fixture.snapshot();
+    let foreign = expected
+        .clone()
+        .with_authenticated_principal(Some(Sha256Digest::from_bytes([98; 32])));
+    let store = Arc::clone(&fixture.store);
+    *fixture.store.after_write.lock().unwrap() = Some(Box::new(move || {
+        *now.lock().unwrap() += StdDuration::from_millis(100);
+        *store.application_readback.lock().unwrap() = Some(foreign);
+    }));
+    let mut operation = Box::pin(
+        fixture
+            .runtime
+            .cancel_task_with_cx(fixture.ctx.cx(), &fixture.task_id),
+    );
+    let error = ready(poll_once(operation.as_mut())).unwrap_err();
+    assert_eq!(
+        error.data,
+        Some(serde_json::json!({"reason":"TaskStateUnknown"}))
+    );
+    assert_eq!(
+        fixture
+            .store
+            .application_expiry_calls
+            .load(Ordering::SeqCst),
+        1,
+        "only the initial authorized snapshot reaches expiry, never the foreign readback"
+    );
+    assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.snapshot().authenticated_principal(),
+        expected.authenticated_principal()
+    );
+    fixture.store.assert_async_only();
+}
+
+#[test]
+fn application_async_cancel_requires_retained_intent_and_accepts_worker_consumption() {
+    for fabricate in [false, true] {
+        let fixture = Fixture::new(false);
+        let (expected, fence) = fixture.elect_worker();
+        fixture
+            .store
+            .lie_about_cancellation
+            .store(fabricate, Ordering::SeqCst);
+        if !fabricate {
+            let store = Arc::clone(&fixture.store);
+            *fixture.store.before_intent_read.lock().unwrap() = Some(Box::new(move || {
+                let cancelled = FinalTask::Cancelled(
+                    transition_terminal_final_task_base(
+                        expected.task().base().clone(),
+                        FinalTaskStatus::Cancelled,
+                        Some("worker observed application cancellation".to_owned()),
+                    )
+                    .unwrap(),
+                );
+                store
+                    .inner
+                    .replace_task_and_clear_input_for_handoff_if_current(
+                        &expected,
+                        "async-worker",
+                        fence,
+                        true,
+                        cancelled.clone(),
+                        final_task_notification(&cancelled),
+                    )
+                    .unwrap()
+                    .expect("elected worker records cancellation");
+            }));
+        }
+        let mut operation = Box::pin(
+            fixture
+                .runtime
+                .cancel_task_with_cx(fixture.ctx.cx(), &fixture.task_id),
+        );
+        let result = ready(poll_once(operation.as_mut()));
+        if fabricate {
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({"reason":"TaskStateUnknown"}))
+            );
+            assert!(matches!(fixture.snapshot().task(), FinalTask::Working(_)));
+            assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
+        } else {
+            result.unwrap();
+            assert!(matches!(fixture.snapshot().task(), FinalTask::Cancelled(_)));
+            assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 1);
+        }
+        assert!(
+            !fixture
+                .store
+                .inner
+                .is_cancellation_requested(&fixture.task_id)
+                .unwrap()
+        );
+        assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
+        fixture.store.assert_async_only();
+    }
+}
+
+#[test]
+fn application_async_intent_read_suspends_and_observes_caller_cancellation() {
+    for cancel in [false, true] {
+        let fixture = Fixture::new(false);
+        fixture.elect_worker();
+        fixture
+            .store
+            .inner
+            .request_cancellation(&fixture.task_id)
+            .unwrap();
+        fixture.store.application_intent_gate.close();
+        let mut operation = Box::pin(
+            fixture
+                .runtime
+                .is_cancellation_requested_with_cx(fixture.ctx.cx(), &fixture.task_id),
+        );
+        assert!(poll_once(operation.as_mut()).is_pending());
+        if cancel {
+            fixture
+                .ctx
+                .cx()
+                .cancel_with(asupersync::types::CancelKind::User, None);
+            assert_eq!(
+                ready(poll_once(operation.as_mut())).unwrap_err().code,
+                McpError::request_cancelled().code
+            );
+        } else {
+            fixture.store.application_intent_gate.release();
+            assert!(ready(poll_once(operation.as_mut())).unwrap());
+        }
+        assert_eq!(fixture.store.intent_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
+        fixture.store.assert_async_only();
+    }
+}
+
+#[test]
+fn application_async_controls_keep_restricted_caller_at_storage_and_notification() {
+    use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+    let fixture = Fixture::new(true);
+    let probes = Arc::new(AtomicUsize::new(0));
+    let storage_probes = Arc::clone(&probes);
+    *fixture.store.after_write.lock().unwrap() = Some(Box::new(move || {
+        assert!(!Cx::current().unwrap().capabilities().spawn);
+        storage_probes.fetch_add(1, Ordering::SeqCst);
+    }));
+    let notification_probes = Arc::clone(&probes);
+    let _observer = fixture
+        .runtime
+        .add_owned_notification_emitter(Arc::new(move |_, _| {
+            assert!(!Cx::current().unwrap().capabilities().spawn);
+            notification_probes.fetch_add(1, Ordering::SeqCst);
+        }));
+    let responses = roots_response();
+    let mut operation = {
+        let _restriction = Cx::push_restriction(CapSet::<false, true, true, true, true>::MASK);
+        Box::pin(fixture.runtime.update_task_with_cx(
+            fixture.ctx.cx(),
+            &fixture.task_id,
+            &responses,
+        ))
+    };
+    ready(poll_once(operation.as_mut())).unwrap();
+    assert_eq!(probes.load(Ordering::SeqCst), 2);
+    fixture.assert_accepted_roots();
     fixture.store.assert_async_only();
 }
 
@@ -1791,6 +2379,80 @@ fn advance_virtual_deadline(
         clock.advance(nanoseconds);
         timer.process_timers()
     })
+}
+
+#[test]
+fn application_async_original_deadline_releases_silent_prewrite_and_intent_waits() {
+    for operation in 0..3 {
+        let (host, clock_caller, clock, timer) = virtual_deadline_caller();
+        let caller = host.request_cx_with_budget(
+            Budget::INFINITE.with_deadline(clock_caller.now().saturating_add_nanos(1_000_000_000)),
+        );
+        let mut fixture = Fixture::new(true);
+        fixture.ctx = fixture.ctx.clone().with_request_cx(caller.clone());
+        let before = fixture.snapshot();
+        let retained = fixture.store.inner.retained_payload_bytes();
+        fixture.store.write_gate.close();
+        fixture.store.application_intent_gate.close();
+        let responses = roots_response();
+        let mut pending: Pin<Box<dyn Future<Output = McpResult<()>> + Send + '_>> =
+            if operation == 2 {
+                Box::pin(async {
+                    fixture
+                        .runtime
+                        .is_cancellation_requested_with_cx(fixture.ctx.cx(), &fixture.task_id)
+                        .await
+                        .map(|_| ())
+                })
+            } else {
+                application_control(&fixture, &responses, operation == 1)
+            };
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut poll = Context::from_waker(&waker);
+        assert!(pending.as_mut().poll(&mut poll).is_pending());
+        assert_eq!(
+            timer.pending_count(),
+            1,
+            "the original caller owns the deadline timer"
+        );
+        let before_deadline = wakes.0.load(Ordering::SeqCst);
+        assert_eq!(
+            advance_virtual_deadline(&host, &clock, &timer, 1_000_000_000),
+            1
+        );
+        assert!(
+            wakes.0.load(Ordering::SeqCst) > before_deadline,
+            "deadline expiry wakes the operation without storage progress"
+        );
+        let error = ready(pending.as_mut().poll(&mut poll)).unwrap_err();
+        assert_eq!(error.code, McpError::request_cancelled().code);
+        assert!(!error.message.contains("may have committed"));
+        assert!(
+            !caller.is_cancel_requested(),
+            "the deadline did not cancel the parent region"
+        );
+        assert!(!fixture.store.write_gate.open.load(Ordering::SeqCst));
+        assert!(
+            !fixture
+                .store
+                .application_intent_gate
+                .open
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(fixture.store.committed_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.store.inner.retained_payload_bytes(), retained);
+        assert_eq!(fixture.snapshot().generation(), before.generation());
+        assert!(final_tasks_match_exactly(fixture.snapshot().task(), before.task()).unwrap());
+        assert_eq!(fixture.notifications.load(Ordering::SeqCst), 0);
+        assert_eq!(timer.pending_count(), 0);
+        fixture.store.assert_async_only();
+        drop(pending);
+        drop(fixture);
+        drop(caller);
+        drop(clock_caller);
+        assert!(host.shutdown_timeout(StdDuration::from_secs(1)));
+    }
 }
 
 #[test]

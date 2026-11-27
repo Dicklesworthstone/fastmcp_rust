@@ -514,7 +514,8 @@ pub mod server {
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-        FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskCreationAdmission,
+        FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskApplicationControlAdmission,
+        FinalTaskCreationAdmission,
         FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork,
         FinalTaskNotificationEmitter, FinalTaskOperation, FinalTaskRetentionAdmission,
         FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
@@ -1024,6 +1025,7 @@ pub use fastmcp_server::{
 pub use fastmcp_server::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
     FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskAccessMetadata,
+    FinalTaskApplicationControlAdmission,
     FinalTaskCreationAdmission, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
     FinalTaskInitialWork, FinalTaskInitialWorkClaim, FinalTaskNotificationEmitter,
     FinalTaskOperation, FinalTaskRetentionAdmission, FinalTaskRetentionAuthority,
@@ -3782,7 +3784,8 @@ pub mod modern {
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-        FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskCreationAdmission,
+        FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskApplicationControlAdmission,
+        FinalTaskCreationAdmission,
         FinalTaskExecutionBudget, FinalTaskExecutionLimits, FinalTaskInitialWork,
         FinalTaskNotificationEmitter, FinalTaskOperation, FinalTaskRetentionAdmission,
         FinalTaskRetentionAuthority, FinalTaskRetentionDeadline, FinalTaskRuntime,
@@ -14657,6 +14660,7 @@ pub mod prelude {
     pub use crate::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
         FinalTask, FinalTaskAcceptedInput, FinalTaskAccessMetadata, FinalTaskCallToolResult,
+        FinalTaskApplicationControlAdmission,
         FinalTaskCreationAdmission, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
         FinalTaskHandle, FinalTaskId, FinalTaskInitialWork, FinalTaskInputResponses,
         FinalTaskNotificationEmitter, FinalTaskOperation, FinalTaskRetentionAdmission,
