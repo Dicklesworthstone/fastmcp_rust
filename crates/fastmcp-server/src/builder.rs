@@ -5985,6 +5985,69 @@ mod tests {
     }
 
     #[test]
+    fn cached_http_tool_call_still_requires_the_reviewed_parameter_mirror() {
+        use crate::{InboundRequestContext, InboundRequestTransport, ModernConnection};
+        use fastmcp_transport::http::HttpStatus;
+
+        let cache = Arc::new(
+            crate::caching::ResponseCachingMiddleware::new()
+                .include_tools(vec!["lookup".to_owned()]),
+        );
+        let server = ServerBuilder::new("cache-header-test", "1.0")
+            .middleware(Arc::clone(&cache))
+            .tool(reviewed(region_schema(serde_json::json!("string"))))
+            .build();
+        let request = fastmcp_protocol::JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "lookup",
+                "arguments": {"region": "west"},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            })),
+            1_i64,
+        );
+        let call = |values: &[&str]| {
+            let connection = ModernConnection::new_request_local();
+            let inbound = InboundRequestContext::with_modern_connection(
+                asupersync::Cx::for_testing(),
+                1,
+                InboundRequestTransport::Http,
+                &connection,
+            )
+            .with_http_parameter_headers(
+                values
+                    .iter()
+                    .map(|value| ("mcp-param-region".to_owned(), (*value).to_owned()))
+                    .collect(),
+            );
+            fastmcp_core::block_on(server.dispatch_http_with_protocol_policy(
+                ProtocolPolicy::ModernOnly,
+                &inbound,
+                &request,
+            ))
+        };
+
+        assert_eq!(call(&["west"]).status, HttpStatus::OK);
+        assert_eq!(cache.stats().entries, 1);
+        assert_eq!(call(&["west"]).status, HttpStatus::OK);
+        assert_eq!(cache.stats().hits, 1);
+        for fields in [&[][..], &["east"][..], &["west", "west"][..]] {
+            let response = call(fields);
+            assert_eq!(response.status, HttpStatus::BAD_REQUEST);
+            let rpc: fastmcp_protocol::JsonRpcResponse =
+                serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(
+                rpc.error.and_then(|err| err.code.as_i32()),
+                Some(fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE),
+            );
+        }
+        assert_eq!(call(&["west"]).status, HttpStatus::OK);
+    }
+
+    #[test]
     fn builder_refuses_an_invalid_annotation_naming_the_tool_and_reason() {
         // Identical to the positive except the annotated type is nullable.
         let refused = refused_registrations(ServerBuilder::new("srv", "1.0").tool(reviewed(

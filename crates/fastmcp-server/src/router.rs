@@ -6058,6 +6058,31 @@ impl Router {
         }
     }
 
+    pub(crate) fn validate_replayed_tool_headers(
+        &self,
+        ctx: &McpContext,
+        params: &FinalCallToolParams,
+        headers: &[(String, String)],
+    ) -> McpResult<()> {
+        if !ctx.is_tool_enabled(&params.name) {
+            return Err(McpError::new(
+                McpErrorCode::MethodNotFound,
+                format!("Tool '{}' is disabled for this session", params.name),
+            ));
+        }
+        let registration = self
+            .tools
+            .get(&params.name)
+            .and_then(|entry| entry.final_registration.as_ref())
+            .ok_or_else(|| McpError::invalid_params(format!("Unknown tool: {}", params.name)))?;
+        let empty_arguments = serde_json::Value::Object(serde_json::Map::new());
+        crate::http_admission::validate_tool_parameter_headers(
+            &registration.final_definition.input_schema,
+            params.arguments.as_value().unwrap_or(&empty_arguments),
+            headers,
+        )
+    }
+
     /// Handles one final MCP 2026-07-28 `tools/call` request.
     ///
     /// Legacy dispatch remains on [`Self::handle_tools_call`], including its

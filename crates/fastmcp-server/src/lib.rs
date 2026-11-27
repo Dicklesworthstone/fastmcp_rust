@@ -2216,12 +2216,33 @@ fn recover_request_trace_context(context: McpContext, request: &mut JsonRpcReque
     context.with_recovered_trace_context(trace, recovery)
 }
 
-/// Re-admits a middleware-produced final core response through the request's
-/// exact result algebra and returns its canonical wire representation.
-/// A response-cache hit may complete a final core method. Arbitrary
-/// middleware still cannot invent a typed final result. Only the sealed
-/// continuation replay journal may also answer with the router-minted
-/// `input_required` reply it captured, and only with a nonempty requestState.
+/// Admit ordinary middleware replies and sealed final-core replays. A replay
+/// bypasses router dispatch, so an HTTP tool call must still compare the
+/// current request's parameter mirrors with the registered tool's schema.
+fn admit_middleware_reply(
+    router: &Router,
+    ctx: &McpContext,
+    middleware: &dyn crate::Middleware,
+    request: Option<&CoreRequest>,
+    value: serde_json::Value,
+) -> McpResult<serde_json::Value> {
+    if let Some(request) = request {
+        if !middleware_may_complete_final_core_from_cache(ctx, middleware, &value) {
+            return Err(McpError::internal_error(
+                "middleware cannot short-circuit a final core response",
+            ));
+        }
+        if let CoreRequest::Final(FinalCoreRequest::ToolsCall(params)) = request
+            && let Some(headers) = ctx.http_parameter_headers()
+        {
+            router.validate_replayed_tool_headers(ctx, params, headers)?;
+        }
+    }
+    Ok(value)
+}
+
+/// Only cache middleware may replay complete results, and only the sealed
+/// continuation journal may replay a router-minted input request.
 fn middleware_may_complete_final_core_from_cache(
     ctx: &McpContext,
     middleware: &dyn crate::Middleware,
@@ -19474,18 +19495,13 @@ impl Server {
                 match catch_extension_unwind(|| middleware.on_request(&request_ctx, &request)) {
                     Ok(Ok(MiddlewareDecision::Continue)) => {}
                     Ok(Ok(MiddlewareDecision::Respond(value))) => {
-                        if final_core_request.is_some()
-                            && !middleware_may_complete_final_core_from_cache(
-                                &request_ctx,
-                                middleware.as_ref(),
-                                &value,
-                            )
-                        {
-                            return Err(McpError::internal_error(
-                                "middleware cannot short-circuit a final core response",
-                            ));
-                        }
-                        return Ok(value);
+                        return admit_middleware_reply(
+                            &self.router,
+                            &request_ctx,
+                            middleware.as_ref(),
+                            final_core_request.as_ref(),
+                            value,
+                        );
                     }
                     Ok(Err(error)) => return Err(error),
                     Err(_payload) => return Err(extension_panic_error("middleware_on_request")),
@@ -19890,21 +19906,13 @@ impl Server {
             match decision {
                 Ok(MiddlewareDecision::Continue) => {}
                 Ok(MiddlewareDecision::Respond(value)) => {
-                    middleware_result = Some(
-                        if final_core_request.is_some()
-                            && !middleware_may_complete_final_core_from_cache(
-                                &request_ctx,
-                                middleware.as_ref(),
-                                &value,
-                            )
-                        {
-                            Err(McpError::internal_error(
-                                "middleware cannot short-circuit a final core response",
-                            ))
-                        } else {
-                            Ok(value)
-                        },
-                    );
+                    middleware_result = Some(admit_middleware_reply(
+                        &self.router,
+                        &request_ctx,
+                        middleware.as_ref(),
+                        final_core_request.as_ref(),
+                        value,
+                    ));
                     break;
                 }
                 Err(error) => {
