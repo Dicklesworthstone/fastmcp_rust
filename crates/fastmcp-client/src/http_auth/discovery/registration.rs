@@ -322,7 +322,7 @@ impl NativeClientRegistration {
         // A hostile endpoint must not launder an initial secret into the
         // reusable configuration's public client_id or its Debug output.
         if self.initial_credential.as_ref().is_some_and(|credential| {
-            credential.is_reflected_by_value(&serde_json::Value::String(metadata.client_id.clone()))
+            credential.is_reflected_in(&serde_json::Value::String(metadata.client_id.clone()))
         }) {
             return Err(OAuthRegistrationError::ResponseRejected);
         }

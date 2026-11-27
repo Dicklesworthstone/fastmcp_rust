@@ -363,6 +363,12 @@ impl BoundBearerCredential {
                 .is_some_and(|data| Self::is_reflected_by_value(data, token))
     }
 
+    /// Detects a peer reflecting this credential into a JSON value it returned,
+    /// such as a registration response's `client_id`.
+    pub(crate) fn is_reflected_in(&self, value: &serde_json::Value) -> bool {
+        Self::is_reflected_by_value(value, self.token.as_str())
+    }
+
     fn is_reflected_by_value(value: &serde_json::Value, token: &str) -> bool {
         match value {
             serde_json::Value::String(text) => text.contains(token),
