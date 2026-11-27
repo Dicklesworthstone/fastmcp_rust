@@ -1129,3 +1129,358 @@ mod core_proxy_subscriptions {
         });
     }
 }
+
+// The process-owned entrypoint exits on completion. Exercise it in isolated
+// copies of this integration-test executable; changing fd 0/1 or their flags
+// in the parent would race unrelated tests.
+mod process_stdio {
+    use super::*;
+    use std::io::Write;
+    use std::process::{Command, Output, Stdio};
+    use std::time::Instant;
+
+    use rustix::fs::{OFlags, fcntl_getfl};
+
+    const CHILD_MODE: &str = "FASTMCP_NATIVE_PROCESS_STDIO_TEST_MODE";
+    const STARTED: &str = "NATIVE_PROCESS_STDIO_STARTUP_COMPLETE";
+    const STOPPED: &str = "NATIVE_PROCESS_STDIO_SHUTDOWN_COMPLETE";
+
+    fn child(mode: &str) -> ! {
+        let negative = matches!(mode, "missing-reactor" | "stdout-owned");
+        let synchronous_lifespan = negative || mode == "nonpipe";
+        let cancelling = matches!(mode, "cancel-silent" | "cancel-partial");
+        let mut builder = RuntimeBuilder::current_thread()
+            .blocking_threads(0, if synchronous_lifespan { 4 } else { 0 });
+        if mode == "missing-reactor" {
+            builder = builder.enable_platform_reactor(false);
+        } else {
+            builder = builder.with_reactor(create_reactor().unwrap());
+        }
+        let runtime = builder.build().unwrap();
+        runtime.block_on(async move {
+            let cx = Cx::current().expect("the child uses its application-owned runtime");
+            let _stdout_owner =
+                (mode == "stdout-owned").then(|| NativePipeWriter::from_stdout(&cx).unwrap());
+            let policy = match mode {
+                #[cfg(feature = "legacy-2024-11-05")]
+                "auto-modern" | "auto-legacy" => ProtocolPolicy::Auto,
+                #[cfg(feature = "legacy-2024-11-05")]
+                "legacy" => ProtocolPolicy::LegacyOnly,
+                _ => ProtocolPolicy::ModernOnly,
+            };
+            let builder = Server::new("native-process-stdio", "1")
+                .protocol_policy(policy)
+                .unwrap()
+                .tool(PipeTool(Arc::new(Probe::default())));
+            let server = if synchronous_lifespan {
+                // A mistaken fallback in either negative case has a usable
+                // blocking pool and can run these hooks. It cannot pass merely
+                // because the old pump rejects async lifespan configuration.
+                builder
+                    .on_startup(|| -> McpResult<()> {
+                        eprintln!("{STARTED}");
+                        Ok(())
+                    })
+                    .on_shutdown(|| eprintln!("{STOPPED}"))
+                    .build()
+            } else {
+                let cancellation_target = cx.clone();
+                builder
+                    .on_startup_async(move |startup| async move {
+                        assert!(startup.blocking_pool_handle().is_none());
+                        // A real suspension proves the default entrypoint
+                        // awaits the caller-owned hook before dispatching.
+                        asupersync::time::sleep(startup.now(), Duration::from_millis(10)).await;
+                        eprintln!("{STARTED}");
+                        if cancelling {
+                            startup
+                                .spawn(move |timer| async move {
+                                    asupersync::time::sleep(timer.now(), Duration::from_millis(30))
+                                        .await;
+                                    cancellation_target.set_cancel_requested(true);
+                                })
+                                .unwrap();
+                        }
+                        Ok(())
+                    })
+                    .on_shutdown_async(|shutdown| async move {
+                        assert!(shutdown.blocking_pool_handle().is_none());
+                        asupersync::time::sleep(shutdown.now(), Duration::from_millis(10)).await;
+                        eprintln!("{STOPPED}");
+                        Ok(())
+                    })
+                    .build()
+            };
+            server.run_stdio_with_cx(&cx).await
+        })
+    }
+
+    fn enter_child_if_requested() {
+        if let Ok(mode) = std::env::var(CHILD_MODE) {
+            child(&mode);
+        }
+    }
+
+    fn invoke(test_name: &str, mode: &str, input: &[u8], keep_input_open: bool) -> Output {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test_name, "--nocapture", "--quiet"])
+            .env(CHILD_MODE, mode)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (observer, mut input_writer, original_flags) = if mode == "nonpipe" {
+            command.stdin(Stdio::null());
+            (None, None, None)
+        } else {
+            let (reader, writer) = std::io::pipe().unwrap();
+            // Retain an alias of the same open-file description without
+            // reading it. The child's native claim temporarily sets NONBLOCK
+            // here, so this observes rollback even when the child exits.
+            let observer = reader.try_clone().unwrap();
+            let flags = fcntl_getfl(&observer).unwrap();
+            assert!(!flags.contains(OFlags::NONBLOCK));
+            command.stdin(Stdio::from(reader));
+            (Some(observer), Some(writer), Some(flags))
+        };
+        let mut process = command
+            .spawn()
+            .expect("spawn isolated process stdio server");
+        if let Some(writer) = input_writer.as_mut() {
+            writer.write_all(input).unwrap();
+        }
+        if !keep_input_open {
+            drop(input_writer.take());
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let timed_out = loop {
+            if process.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                process.kill().expect("terminate this test's stalled child");
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let output = process.wait_with_output().unwrap();
+        assert!(
+            !timed_out,
+            "{mode}: process did not settle: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        if let Some(observer) = observer {
+            assert_eq!(
+                fcntl_getfl(&observer).unwrap(),
+                original_flags.unwrap(),
+                "{mode}: process stdin flags were not restored before exit",
+            );
+        }
+        output
+    }
+
+    fn frames(output: &Output) -> Vec<serde_json::Value> {
+        // Libtest prints its own prelude before entering the child test. The
+        // server exits without a test-result trailer. Ignore only prelude and
+        // blank lines; every line after the first JSON frame must be NDJSON.
+        let stdout = std::str::from_utf8(&output.stdout).unwrap();
+        let mut found = false;
+        stdout
+            .lines()
+            .filter(|line| {
+                if line.trim().is_empty() {
+                    return false;
+                }
+                if !found && line.starts_with('{') {
+                    found = true;
+                }
+                found
+            })
+            .map(|line| serde_json::from_str(line).expect("server output must be complete JSON"))
+            .collect()
+    }
+
+    fn input_frames(legacy: bool) -> Vec<u8> {
+        let messages = if legacy {
+            vec![
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 100, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "native-process-test", "version": "1"}
+                    }
+                }),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 101, "method": "tools/list", "params": {}
+                }),
+            ]
+        } else {
+            vec![
+                serde_json::to_value(request(100, "server/discover", serde_json::json!({})))
+                    .unwrap(),
+                serde_json::to_value(request(101, "tools/list", serde_json::json!({}))).unwrap(),
+                serde_json::to_value(request(
+                    102,
+                    "tools/call",
+                    serde_json::json!({
+                        "name": "pipe_probe",
+                        "arguments": {"hold": false, "value": "native-process-async"},
+                    }),
+                ))
+                .unwrap(),
+            ]
+        };
+        let mut bytes = Vec::new();
+        for message in messages {
+            serde_json::to_writer(&mut bytes, &message).unwrap();
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    fn assert_lifespan(output: &Output, expected: bool) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.matches(STARTED).count(),
+            usize::from(expected),
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.matches(STOPPED).count(),
+            usize::from(expected),
+            "{stderr}"
+        );
+        if expected {
+            assert!(stderr.find(STARTED).unwrap() < stderr.find(STOPPED).unwrap());
+        }
+    }
+
+    #[test]
+    fn default_process_stdio_serves_async_lifespans_without_blocking_workers() {
+        enter_child_if_requested();
+        for mode in [
+            "modern",
+            #[cfg(feature = "legacy-2024-11-05")]
+            "auto-modern",
+            #[cfg(feature = "legacy-2024-11-05")]
+            "auto-legacy",
+            #[cfg(feature = "legacy-2024-11-05")]
+            "legacy",
+        ] {
+            let legacy = matches!(mode, "auto-legacy" | "legacy");
+            let output = invoke(
+                "process_stdio::default_process_stdio_serves_async_lifespans_without_blocking_workers",
+                mode,
+                &input_frames(legacy),
+                false,
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let frames = frames(&output);
+            assert_eq!(
+                frames.len(),
+                if legacy { 2 } else { 3 },
+                "{mode}: {frames:?}"
+            );
+            for id in [100, 101] {
+                let response = frames.iter().find(|frame| frame["id"] == id).unwrap();
+                assert!(response.get("error").is_none(), "{mode}: {response}");
+            }
+            let first = frames.iter().find(|frame| frame["id"] == 100).unwrap();
+            if legacy {
+                assert_eq!(first["result"]["protocolVersion"], "2024-11-05");
+            } else {
+                assert_eq!(first["result"]["resultType"], "complete");
+                assert_eq!(
+                    first["result"]["supportedVersions"],
+                    serde_json::json!([FINAL_PROTOCOL_VERSION]),
+                );
+            }
+            let listed = frames.iter().find(|frame| frame["id"] == 101).unwrap();
+            let tools = listed["result"]["tools"].as_array().unwrap();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0]["name"], "pipe_probe");
+            if !legacy {
+                let called = frames.iter().find(|frame| frame["id"] == 102).unwrap();
+                assert!(called.get("error").is_none(), "{mode}: {called}");
+                assert_eq!(
+                    called["result"]["content"][0]["text"],
+                    "native-process-async",
+                );
+            }
+            assert_lifespan(&output, true);
+        }
+    }
+
+    #[test]
+    fn default_process_stdio_cancels_silent_and_incomplete_native_input() {
+        enter_child_if_requested();
+        for (mode, input) in [
+            ("cancel-silent", b"".as_slice()),
+            ("cancel-partial", b"{\"jsonrpc\":\"2.0\"".as_slice()),
+        ] {
+            let output = invoke(
+                "process_stdio::default_process_stdio_cancels_silent_and_incomplete_native_input",
+                mode,
+                input,
+                true,
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(frames(&output).is_empty());
+            assert_lifespan(&output, true);
+        }
+    }
+
+    #[test]
+    fn default_process_stdio_never_falls_back_after_native_admission_failure() {
+        enter_child_if_requested();
+        for mode in ["missing-reactor", "stdout-owned"] {
+            let output = invoke(
+                "process_stdio::default_process_stdio_never_falls_back_after_native_admission_failure",
+                mode,
+                &input_frames(false),
+                false,
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                frames(&output).is_empty(),
+                "{mode}: unexpected protocol output"
+            );
+            assert_lifespan(&output, false);
+        }
+    }
+
+    #[test]
+    fn default_process_stdio_retains_nonpipe_compatibility() {
+        enter_child_if_requested();
+        let output = invoke(
+            "process_stdio::default_process_stdio_retains_nonpipe_compatibility",
+            "nonpipe",
+            &[],
+            false,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(frames(&output).is_empty());
+        assert_lifespan(&output, true);
+    }
+}
