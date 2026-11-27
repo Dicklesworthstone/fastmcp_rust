@@ -10463,6 +10463,12 @@ fn public_http_roots_greeting(
 
 /// Starts one ModernOnly facade whose only tool is live final sampling.
 fn spawn_modern_sampling_http_server() -> HttpServerFixture {
+    spawn_modern_sampling_http_server_with_middleware(None)
+}
+
+fn spawn_modern_sampling_http_server_with_middleware(
+    middleware: Option<Arc<dyn Middleware>>,
+) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -10476,15 +10482,18 @@ fn spawn_modern_sampling_http_server() -> HttpServerFixture {
                 cx.set_cancel_requested(true);
                 return Err("sampling HTTP server control receiver went away".to_owned());
             }
-            let server = modern::ServerBuilder::new("facade-http-sampling", "1.0.0")
+            let builder = modern::ServerBuilder::new("facade-http-sampling", "1.0.0")
                 .tool(PublicHttpSamplingTool)
                 .tool(PublicHttpRootsTool)
                 .tool(PublicHttpUrlElicitationTool)
                 .resource(PublicHttpElicitationResource)
                 .prompt(PublicHttpElicitationPrompt)
                 .resource(PublicHttpRootsGateResource)
-                .prompt(PublicHttpRootsGreetingPrompt)
-                .build();
+                .prompt(PublicHttpRootsGreetingPrompt);
+            let server = match middleware {
+                Some(middleware) => builder.middleware(middleware).build(),
+                None => builder.build(),
+            };
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
                 Err(error) => {
@@ -10757,6 +10766,474 @@ fn e2e_public_http_typed_verbs_resume_stateless_elicitation_with_the_clients_ans
         declined,
         json!([{"type": "text", "text": "url-elicit:decline"}])
     );
+    server.shutdown();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PublicHttpAsyncMrtrVerb {
+    Tool,
+    Resource,
+    Prompt,
+}
+
+impl PublicHttpAsyncMrtrVerb {
+    const ALL: [Self; 3] = [Self::Tool, Self::Resource, Self::Prompt];
+
+    fn method(self) -> &'static str {
+        match self {
+            Self::Tool => "tools/call",
+            Self::Resource => "resources/read",
+            Self::Prompt => "prompts/get",
+        }
+    }
+
+    fn answer(self) -> fastmcp_rust::MrtrInputResponses {
+        let answer = match self {
+            Self::Tool => json!({"action": "accept"}),
+            Self::Resource | Self::Prompt => {
+                json!({"action": "accept", "content": {"approved": true}})
+            }
+        };
+        BTreeMap::from([("approval".to_owned(), answer)])
+    }
+}
+
+struct PublicHttpAsyncMrtrAudit {
+    requests: Arc<std::sync::Mutex<Vec<JsonRpcRequest>>>,
+}
+
+impl Middleware for PublicHttpAsyncMrtrAudit {
+    fn on_request(
+        &self,
+        _ctx: &McpContext,
+        request: &JsonRpcRequest,
+    ) -> McpResult<MiddlewareDecision> {
+        if matches!(
+            request.method.as_str(),
+            "tools/call" | "resources/read" | "prompts/get"
+        ) {
+            let mut requests = self.requests.lock().expect("request audit is not poisoned");
+            assert!(requests.len() < 32, "MRTR request audit stays bounded");
+            requests.push(request.clone());
+        }
+        Ok(MiddlewareDecision::Continue)
+    }
+
+    fn on_response(
+        &self,
+        _ctx: &McpContext,
+        request: &JsonRpcRequest,
+        mut response: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        if response["resultType"] == "complete"
+            && matches!(
+                request.method.as_str(),
+                "tools/call" | "resources/read" | "prompts/get"
+            )
+        {
+            response["_meta"]["example.test/async-mrtr"] = json!(request.method);
+            response["asyncResponderEnvelope"] = json!({"retained": true});
+        }
+        Ok(response)
+    }
+}
+
+fn public_http_async_mrtr_client(cx: &Cx, server: &HttpServerFixture) -> modern::HttpClient {
+    let mut capabilities = ClientCapabilities::default();
+    capabilities.elicitation = serde_json::from_value(json!({"form": {}, "url": {}}))
+        .expect("both elicitation modes are advertised before connecting");
+    let mut client = runtime_block_on_bounded(
+        cx,
+        modern::ClientBuilder::new()
+            .client_info("public-async-http-responder", "1.0.0")
+            .capabilities(capabilities)
+            .connect_http_with_cx(cx, public_http_target(server.address(), "/mcp")),
+    )
+    .expect("the asynchronous-responder facade connects to the real modern server");
+    client
+        .set_log_level(modern::LoggingLevel::Notice)
+        .expect("request metadata retains the caller's logging floor");
+    client
+}
+
+async fn invoke_public_http_async_mrtr<F>(
+    client: &mut modern::HttpClient,
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    verb: PublicHttpAsyncMrtrVerb,
+    respond: F,
+) -> Result<FinalCoreResult, modern::HttpClientError>
+where
+    F: for<'a> FnMut(
+        &'a Cx,
+        &'a fastmcp_rust::InputRequiredResult,
+    ) -> fastmcp_rust::MrtrResponderFuture<'a>,
+{
+    let deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    let limits = SseLimits::new(65_536, 1 << 20, 64).expect("finite HTTP response limits");
+    match verb {
+        PublicHttpAsyncMrtrVerb::Tool => {
+            client
+                .call_tool_with_async_mrtr_retry(
+                    cx,
+                    cancellation,
+                    deadline,
+                    PUBLIC_HTTP_URL_ELICITATION_TOOL_NAME,
+                    json!({"correlation": "public-async-http-responder"}),
+                    limits,
+                    1 << 20,
+                    respond,
+                )
+                .await
+        }
+        PublicHttpAsyncMrtrVerb::Resource => {
+            client
+                .read_resource_with_async_mrtr_retry(
+                    cx,
+                    cancellation,
+                    deadline,
+                    PUBLIC_HTTP_ELICITATION_RESOURCE_URI,
+                    limits,
+                    1 << 20,
+                    respond,
+                )
+                .await
+        }
+        PublicHttpAsyncMrtrVerb::Prompt => {
+            client
+                .get_prompt_with_async_mrtr_retry(
+                    cx,
+                    cancellation,
+                    deadline,
+                    PUBLIC_HTTP_ELICITATION_PROMPT_NAME,
+                    HashMap::new(),
+                    limits,
+                    1 << 20,
+                    respond,
+                )
+                .await
+        }
+    }
+}
+
+fn public_http_async_mrtr_answer<'a>(
+    cx: &'a Cx,
+    input: &'a fastmcp_rust::InputRequiredResult,
+    answer: fastmcp_rust::MrtrInputResponses,
+) -> fastmcp_rust::MrtrResponderFuture<'a> {
+    Box::pin(async move {
+        asupersync::runtime::yield_now().await;
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        assert_live_input_required(input, "approval", "asynchronous facade responder");
+        Ok(answer)
+    })
+}
+
+fn public_http_async_mrtr_refusal<'a>(
+    _cx: &'a Cx,
+    _input: &'a fastmcp_rust::InputRequiredResult,
+) -> fastmcp_rust::MrtrResponderFuture<'a> {
+    Box::pin(async { Err(McpError::invalid_request("responder refused approval")) })
+}
+
+struct PublicHttpAsyncMrtrResponderDrop(Arc<AtomicUsize>);
+
+impl Drop for PublicHttpAsyncMrtrResponderDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn public_http_async_mrtr_pending<'a>(
+    cx: &'a Cx,
+    input: &'a fastmcp_rust::InputRequiredResult,
+    entered: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
+) -> fastmcp_rust::MrtrResponderFuture<'a> {
+    Box::pin(async move {
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        assert_live_input_required(input, "approval", "pending facade responder");
+        let _drop = PublicHttpAsyncMrtrResponderDrop(dropped);
+        entered.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<McpResult<fastmcp_rust::MrtrInputResponses>>().await
+    })
+}
+
+fn assert_public_http_async_mrtr_error(
+    outcome: Result<FinalCoreResult, modern::HttpClientError>,
+    expected: McpErrorCode,
+) {
+    match outcome {
+        Err(modern::HttpClientError::CoreResult(error))
+        | Err(modern::HttpClientError::Connection(ClientHttpConnectionError::Mrtr(
+            fastmcp_rust::http_executor::ModernHttpMrtrError::Driver(error),
+        ))) => assert_eq!(error.code, expected),
+        other => panic!("expected {expected:?} from the public HTTP responder, got {other:?}"),
+    }
+}
+
+#[test]
+fn e2e_public_http_async_mrtr_facade_preserves_all_terminal_envelopes() {
+    let cx = public_http_caller();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = spawn_modern_sampling_http_server_with_middleware(Some(Arc::new(
+        PublicHttpAsyncMrtrAudit {
+            requests: Arc::clone(&requests),
+        },
+    )));
+    let mut client = public_http_async_mrtr_client(&cx, &server);
+    let cancellation = McpRequestCancellation::new();
+    let callbacks = AtomicUsize::new(0);
+
+    for verb in PublicHttpAsyncMrtrVerb::ALL {
+        let result = runtime_block_on_bounded(
+            &cx,
+            invoke_public_http_async_mrtr(
+                &mut client,
+                &cx,
+                &cancellation,
+                verb,
+                |callback_cx, input| {
+                    callbacks.fetch_add(1, Ordering::SeqCst);
+                    public_http_async_mrtr_answer(callback_cx, input, verb.answer())
+                },
+            ),
+        )
+        .expect("the public HTTP facade awaits input and returns the terminal envelope");
+        assert_eq!(result.method(), verb.method());
+        let encoded = CoreResult::Final(result)
+            .encode()
+            .expect("the complete result envelope remains encodable");
+        let result: serde_json::Value =
+            serde_json::from_str(&encoded).expect("the terminal envelope is valid JSON");
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["_meta"]["example.test/async-mrtr"], verb.method());
+        assert_eq!(result["asyncResponderEnvelope"], json!({"retained": true}));
+        match verb {
+            PublicHttpAsyncMrtrVerb::Tool => {
+                assert_eq!(result["content"][0]["text"], "url-elicit:accept");
+                assert_ne!(result["isError"], true);
+            }
+            PublicHttpAsyncMrtrVerb::Resource => {
+                assert_eq!(result["contents"][0]["uri"], PUBLIC_HTTP_ELICITATION_RESOURCE_URI);
+                assert_eq!(result["contents"][0]["text"], "form-elicit:true");
+                assert_eq!(result["ttlMs"], 7);
+                assert_eq!(result["cacheScope"], "private");
+            }
+            PublicHttpAsyncMrtrVerb::Prompt => {
+                assert_eq!(result["messages"][0]["content"]["text"], "form-elicit:true");
+                assert_eq!(result["description"], "typed form elicitation prompt result");
+            }
+        }
+    }
+    assert_eq!(callbacks.load(Ordering::SeqCst), 3);
+
+    {
+        let requests = requests.lock().expect("request audit is not poisoned");
+        assert_eq!(requests.len(), 6, "each operation sends one initial request and retry");
+        for (pair, verb) in requests.chunks_exact(2).zip(PublicHttpAsyncMrtrVerb::ALL) {
+            assert_eq!(pair[0].method, verb.method());
+            assert_eq!(pair[1].method, verb.method());
+            assert!(pair[0].id.is_some());
+            assert_ne!(pair[0].id, pair[1].id, "each continuation uses a fresh ID");
+            let initial = pair[0].params.as_ref().expect("initial parameters");
+            let mut continued = pair[1].params.clone().expect("continuation parameters");
+            let object = continued.as_object_mut().expect("object parameters");
+            assert!(object.remove("requestState").is_some());
+            assert_eq!(object.remove("inputResponses"), Some(json!(verb.answer())));
+            assert_eq!(&continued, initial, "continuations retain the complete original request");
+            assert_eq!(
+                initial["_meta"][fastmcp_protocol::FINAL_LOG_LEVEL_META_KEY],
+                "notice"
+            );
+        }
+    }
+    assert!(cx.checkpoint().is_ok());
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_async_mrtr_facade_pre_cancelled_operations_publish_nothing() {
+    let cx = public_http_caller();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = spawn_modern_sampling_http_server_with_middleware(Some(Arc::new(
+        PublicHttpAsyncMrtrAudit {
+            requests: Arc::clone(&requests),
+        },
+    )));
+    let mut client = public_http_async_mrtr_client(&cx, &server);
+    let cancellation = McpRequestCancellation::new();
+    cancellation.cancel();
+    let callbacks = AtomicUsize::new(0);
+
+    for verb in PublicHttpAsyncMrtrVerb::ALL {
+        let outcome = runtime_block_on_bounded(
+            &cx,
+            invoke_public_http_async_mrtr(
+                &mut client,
+                &cx,
+                &cancellation,
+                verb,
+                |callback_cx, input| {
+                    callbacks.fetch_add(1, Ordering::SeqCst);
+                    public_http_async_mrtr_answer(callback_cx, input, verb.answer())
+                },
+            ),
+        );
+        assert_public_http_async_mrtr_error(outcome, McpErrorCode::RequestCancelled);
+    }
+    assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+    assert!(requests.lock().unwrap().is_empty());
+    assert!(cx.checkpoint().is_ok(), "operation cancellation leaves the caller alive");
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_async_mrtr_facade_rejects_invalid_answers_without_continuation() {
+    let cx = public_http_caller();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = spawn_modern_sampling_http_server_with_middleware(Some(Arc::new(
+        PublicHttpAsyncMrtrAudit {
+            requests: Arc::clone(&requests),
+        },
+    )));
+    let mut client = public_http_async_mrtr_client(&cx, &server);
+    let cancellation = McpRequestCancellation::new();
+
+    // Keep the successful responses and vary only one unsolicited metadata key.
+    // An input response map cannot rewrite the original request's metadata.
+    for (index, verb) in PublicHttpAsyncMrtrVerb::ALL.into_iter().enumerate() {
+        let mut answer = verb.answer();
+        answer.insert("_meta".to_owned(), json!({"clientInfo": {"name": "changed"}}));
+        let outcome = runtime_block_on_bounded(
+            &cx,
+            invoke_public_http_async_mrtr(
+                &mut client,
+                &cx,
+                &cancellation,
+                verb,
+                |callback_cx, input| {
+                    public_http_async_mrtr_answer(callback_cx, input, answer.clone())
+                },
+            ),
+        );
+        assert_public_http_async_mrtr_error(outcome, McpErrorCode::InvalidParams);
+        assert_eq!(requests.lock().unwrap().len(), index + 1);
+    }
+
+    let outcome = runtime_block_on_bounded(
+        &cx,
+        invoke_public_http_async_mrtr(
+            &mut client,
+            &cx,
+            &cancellation,
+            PublicHttpAsyncMrtrVerb::Tool,
+            public_http_async_mrtr_refusal,
+        ),
+    );
+    assert_public_http_async_mrtr_error(outcome, McpErrorCode::InvalidRequest);
+    assert_eq!(requests.lock().unwrap().len(), 4);
+
+    let outcome = runtime_block_on_bounded(
+        &cx,
+        invoke_public_http_async_mrtr(
+            &mut client,
+            &cx,
+            &cancellation,
+            PublicHttpAsyncMrtrVerb::Tool,
+            |callback_cx, input| {
+                public_http_async_mrtr_answer(
+                    callback_cx,
+                    input,
+                    PublicHttpAsyncMrtrVerb::Tool.answer(),
+                )
+            },
+        ),
+    )
+    .expect("a refused responder leaves the client usable for an independent operation");
+    assert!(matches!(outcome, FinalCoreResult::ToolsCall { .. }));
+    assert_eq!(requests.lock().unwrap().len(), 6);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_async_mrtr_facade_cancels_and_drops_pending_responders() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let cx = public_http_caller();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = spawn_modern_sampling_http_server_with_middleware(Some(Arc::new(
+        PublicHttpAsyncMrtrAudit {
+            requests: Arc::clone(&requests),
+        },
+    )));
+    let mut client = public_http_async_mrtr_client(&cx, &server);
+
+    for cancel in [true, false] {
+        let cancellation = McpRequestCancellation::new();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        runtime_block_on_bounded(&cx, async {
+            let responder_entered = Arc::clone(&entered);
+            let responder_dropped = Arc::clone(&dropped);
+            let mut operation = std::pin::pin!(invoke_public_http_async_mrtr(
+                &mut client,
+                &cx,
+                &cancellation,
+                PublicHttpAsyncMrtrVerb::Tool,
+                move |callback_cx, input| {
+                    public_http_async_mrtr_pending(
+                        callback_cx,
+                        input,
+                        Arc::clone(&responder_entered),
+                        Arc::clone(&responder_dropped),
+                    )
+                },
+            ));
+            std::future::poll_fn(|task| {
+                assert!(operation.as_mut().poll(task).is_pending());
+                if entered.load(Ordering::SeqCst) == 1 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            if cancel {
+                cancellation.cancel();
+                assert_public_http_async_mrtr_error(
+                    operation.await,
+                    McpErrorCode::RequestCancelled,
+                );
+            }
+        });
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(cx.checkpoint().is_ok(), "the application context remains usable");
+    }
+    assert_eq!(requests.lock().unwrap().len(), 2, "neither responder publishes a retry");
+
+    let cancellation = McpRequestCancellation::new();
+    let outcome = runtime_block_on_bounded(
+        &cx,
+        invoke_public_http_async_mrtr(
+            &mut client,
+            &cx,
+            &cancellation,
+            PublicHttpAsyncMrtrVerb::Tool,
+            |callback_cx, input| {
+                public_http_async_mrtr_answer(
+                    callback_cx,
+                    input,
+                    PublicHttpAsyncMrtrVerb::Tool.answer(),
+                )
+            },
+        ),
+    )
+    .expect("cancelling or dropping a responder releases the client's mutable borrow");
+    assert!(matches!(outcome, FinalCoreResult::ToolsCall { .. }));
+    assert_eq!(requests.lock().unwrap().len(), 4);
     server.shutdown();
 }
 

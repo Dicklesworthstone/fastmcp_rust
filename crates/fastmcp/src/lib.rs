@@ -9084,6 +9084,115 @@ pub mod modern {
                 .await
         }
 
+        /// Calls a tool through modern HTTP with a caller-owned asynchronous
+        /// responder for every admitted input-required round.
+        ///
+        /// The responder may borrow the caller context and input batch while
+        /// awaiting user approval or another asynchronous operation. Advertise
+        /// its capabilities before connecting the client.
+        ///
+        /// The earlier of `deadline` and the configured absolute timeout bounds
+        /// every request and callback together. Cancellation or dropping this
+        /// future drops a pending responder before another continuation is sent.
+        /// Continuations use fresh request IDs and preserve the original method,
+        /// arguments and metadata. This operation never requests Tasks.
+        ///
+        /// The returned terminal result retains its complete envelope, including
+        /// metadata and admitted open members.
+        pub async fn call_tool_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            sse_limits: SseLimits,
+            maximum_response_bytes: usize,
+            respond: F,
+        ) -> Result<FinalCoreResult, HttpClientError>
+        where
+            F: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+        {
+            self.inner
+                .call_tool_with_async_mrtr_retry(
+                    cx,
+                    cancellation,
+                    deadline,
+                    name,
+                    arguments,
+                    sse_limits,
+                    maximum_response_bytes,
+                    respond,
+                )
+                .await
+        }
+
+        /// Reads a resource through modern HTTP with a caller-owned
+        /// asynchronous responder.
+        ///
+        /// See [`Self::call_tool_with_async_mrtr_retry`] for the shared deadline,
+        /// cancellation and continuation semantics. The terminal result retains
+        /// its cache hints, metadata and admitted open members.
+        pub async fn read_resource_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            uri: &str,
+            sse_limits: SseLimits,
+            maximum_response_bytes: usize,
+            respond: F,
+        ) -> Result<FinalCoreResult, HttpClientError>
+        where
+            F: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+        {
+            self.inner
+                .read_resource_with_async_mrtr_retry(
+                    cx,
+                    cancellation,
+                    deadline,
+                    uri,
+                    sse_limits,
+                    maximum_response_bytes,
+                    respond,
+                )
+                .await
+        }
+
+        /// Gets a prompt through modern HTTP with a caller-owned
+        /// asynchronous responder.
+        ///
+        /// See [`Self::call_tool_with_async_mrtr_retry`] for the shared deadline,
+        /// cancellation and continuation semantics. The original prompt name
+        /// and arguments are preserved on every continuation.
+        pub async fn get_prompt_with_async_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            sse_limits: SseLimits,
+            maximum_response_bytes: usize,
+            respond: F,
+        ) -> Result<FinalCoreResult, HttpClientError>
+        where
+            F: for<'a> FnMut(&'a Cx, &'a InputRequiredResult) -> MrtrResponderFuture<'a>,
+        {
+            self.inner
+                .get_prompt_with_async_mrtr_retry(
+                    cx,
+                    cancellation,
+                    deadline,
+                    name,
+                    arguments,
+                    sse_limits,
+                    maximum_response_bytes,
+                    respond,
+                )
+                .await
+        }
+
         /// Opens a live final subscriptions listener.
         ///
         /// The listener owns this client's final-result cache borrow until it is
