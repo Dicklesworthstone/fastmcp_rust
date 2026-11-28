@@ -49,8 +49,7 @@ use fastmcp_core::{
     PromptMessageItem, PromptMessageRole, SessionState, sha256_bounded,
 };
 use fastmcp_protocol::common_types::{
-    AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, MAX_CURSOR_BYTES,
-    OpenMetadata, RawIcon,
+    AbsoluteUri, Annotations, EmbeddedResourceContents, MAX_CURSOR_BYTES, OpenMetadata, RawIcon,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID;

@@ -1458,7 +1458,7 @@ impl JsonRpcError {
     /// immutable, transport-specific negotiation policy.
     #[must_use]
     pub fn is_recognized_modern_protocol_error(&self) -> bool {
-        matches!(self.code.as_i32(), Some(-32_020 | -32_021 | -32_022))
+        matches!(self.code.as_i32(), Some(-32_022..=-32_020))
     }
 }
 

@@ -1851,7 +1851,7 @@ fn created_task_clones_share_the_first_selected_client() {
         let receipt = fastmcp_protocol::CreateTaskResult {
             task: attached_handle.task().clone(),
             meta: None,
-            additional: Default::default(),
+            additional: std::collections::BTreeMap::default(),
         };
         let mut handle = FinalTaskHandle::from_created(&receipt).unwrap();
         let mut cloned_before_selection = handle.clone();

@@ -1014,7 +1014,9 @@ mod tests {
                     .wake_by_ref();
                 assert!(poll(future.as_mut(), Waker::noop()).is_pending());
             }
-            observed.iter().for_each(|probe| probe.finish());
+            for probe in &observed {
+                probe.finish();
+            }
             let mut result = poll(future.as_mut(), Waker::noop());
             if matches!(kind, BoundedOperation::All) {
                 assert!(result.is_pending());

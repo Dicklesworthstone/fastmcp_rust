@@ -223,9 +223,7 @@ async fn run_region(
                 if has_startup && !worker_signal.startup_entered.load(Ordering::Acquire) {
                     return Ok(());
                 }
-                let shutdown_result =
-                    run_hook(&worker_cx, &worker_signal, shutdown, true, timeout).await;
-                shutdown_result
+                run_hook(&worker_cx, &worker_signal, shutdown, true, timeout).await
             })
             .map_err(|_| lifecycle_error("could not schedule its application task"))
         });

@@ -552,7 +552,7 @@ struct Fixture {
     handoff: FinalTaskSupervisorHandoff,
     guard: Option<FinalTaskExecutionGuard>,
     notifications: Arc<Mutex<Vec<FinalTask>>>,
-    _registration: Arc<()>,
+    registration: Arc<()>,
 }
 
 impl Fixture {
@@ -675,7 +675,7 @@ impl Fixture {
             handoff,
             guard: Some(guard),
             notifications,
-            _registration: registration,
+            registration,
         }
     }
 
@@ -1559,7 +1559,7 @@ fn async_worker_pending_continuity_checks_local_lifetime_without_policy() {
                         .execution_revoked
                         .store(true, TaskServiceOrdering::Release),
                     "registration" => {
-                        drop(std::mem::replace(&mut fixture._registration, Arc::new(())));
+                        drop(std::mem::replace(&mut fixture.registration, Arc::new(())));
                     }
                     _ => unreachable!(),
                 }
